@@ -1,14 +1,29 @@
 """건국대학교 RSS 피드 수집 및 파싱 모듈"""
 
+import asyncio
 import json
+import logging
 import re
 import ssl
+import tempfile
 from dataclasses import dataclass, asdict
 from datetime import datetime, timedelta
 from pathlib import Path
 
+import aiohttp
 import feedparser
 import urllib.request
+from bs4 import BeautifulSoup
+
+logger = logging.getLogger("monitor.feeds")
+
+# 건국대 서버 SSL 인증서 문제 우회용 컨텍스트
+_ssl_ctx = ssl.create_default_context()
+_ssl_ctx.check_hostname = False
+_ssl_ctx.verify_mode = ssl.CERT_NONE
+
+# 동시 크롤링 제한 (서버 부하 방지)
+_SCRAPE_CONCURRENCY = 5
 
 
 @dataclass
@@ -57,17 +72,13 @@ def fetch_feed(board_name: str, board_id: int, config: dict) -> list[Article]:
     base_url = config["settings"]["base_url"]
     url = config["settings"]["rss_url_template"].format(board_id=board_id)
 
-    # 건국대 서버 SSL 인증서 문제 우회
-    ctx = ssl.create_default_context()
-    ctx.check_hostname = False
-    ctx.verify_mode = ssl.CERT_NONE
     try:
         req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-        with urllib.request.urlopen(req, context=ctx) as resp:
+        with urllib.request.urlopen(req, context=_ssl_ctx) as resp:
             xml_data = resp.read()
         feed = feedparser.parse(xml_data)
     except Exception as e:
-        print(f"[피드 오류] {board_name} ({board_id}): {e}")
+        logger.error("%s (%d) 피드 수집 실패: %s", board_name, board_id, e)
         return []
 
     articles = []
@@ -108,16 +119,19 @@ def fetch_all_feeds(config: dict) -> list[Article]:
 
 
 def load_state(state_path: str) -> dict:
-    """state.json 로드. 없으면 초기 상태 반환"""
+    """state.json 로드. 손상되었거나 없으면 초기 상태 반환"""
     path = Path(state_path)
     if path.exists():
-        with open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except (json.JSONDecodeError, ValueError) as e:
+            logger.warning("state.json 파싱 실패, 초기화합니다: %s", e)
     return {"seen_ids": {}, "last_run": None}
 
 
 def save_state(state: dict, state_path: str):
-    """state.json 저장 + 90일 지난 ID 자동 정리"""
+    """state.json 원자적 저장 + 90일 지난 ID 자동 정리"""
     cutoff = (datetime.now() - timedelta(days=90)).isoformat()
     state["seen_ids"] = {
         k: v for k, v in state["seen_ids"].items()
@@ -125,8 +139,18 @@ def save_state(state: dict, state_path: str):
     }
     state["last_run"] = datetime.now().isoformat()
 
-    with open(state_path, "w", encoding="utf-8") as f:
-        json.dump(state, f, ensure_ascii=False, indent=2)
+    # 원자적 쓰기: 임시 파일에 먼저 쓴 후 이동 (중간 실패 시 기존 파일 보존)
+    path = Path(state_path)
+    try:
+        fd, tmp_path = tempfile.mkstemp(dir=path.parent, suffix=".tmp")
+        with open(fd, "w", encoding="utf-8") as f:
+            json.dump(state, f, ensure_ascii=False, indent=2)
+        Path(tmp_path).replace(path)
+    except Exception:
+        # 원자적 쓰기 실패 시 직접 쓰기로 폴백
+        logger.warning("원자적 쓰기 실패, 직접 저장합니다.")
+        with open(state_path, "w", encoding="utf-8") as f:
+            json.dump(state, f, ensure_ascii=False, indent=2)
 
 
 def filter_new_articles(articles: list[Article], state: dict) -> list[Article]:
@@ -135,45 +159,48 @@ def filter_new_articles(articles: list[Article], state: dict) -> list[Article]:
     return [a for a in articles if a.id not in seen]
 
 
-def fetch_article_body(url: str) -> str:
-    """게시물 웹페이지에서 본문 텍스트를 크롤링하여 반환 (최대 500자)"""
-    ctx = ssl.create_default_context()
-    ctx.check_hostname = False
-    ctx.verify_mode = ssl.CERT_NONE
+def _extract_body_with_soup(html: str) -> str:
+    """BeautifulSoup으로 본문 텍스트를 안정적으로 추출 (최대 500자)"""
+    soup = BeautifulSoup(html, "html.parser")
+    content_div = soup.find(class_="hwp_editor_board_content")
+    if not content_div:
+        return ""
+    text = content_div.get_text(separator=" ", strip=True)
+    return text[:500]
+
+
+async def _fetch_article_body_async(session: aiohttp.ClientSession, url: str) -> str:
+    """aiohttp로 단일 공지 본문을 비동기 크롤링"""
     try:
-        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-        with urllib.request.urlopen(req, context=ctx, timeout=10) as resp:
-            html = resp.read().decode("utf-8")
-        # hwp_editor_board_content 영역에서 본문 추출
-        idx = html.find("hwp_editor_board_content")
-        if idx < 0:
-            return ""
-        # 해당 div의 끝까지 추출 (최대 5000자 범위)
-        snippet = html[idx:idx + 5000]
-        # HTML 태그 제거
-        text = re.sub(r"<[^>]+>", " ", snippet)
-        text = re.sub(r"\s+", " ", text).strip()
-        # 클래스명 부분 제거
-        if text.startswith("hwp_editor_board_content"):
-            text = text[len("hwp_editor_board_content"):].strip()
-            # data 속성 부분 제거
-            if text.startswith('"'):
-                idx2 = text.find(">")
-                if idx2 >= 0:
-                    text = text[idx2 + 1:].strip()
-        return text[:500]
+        async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+            html = await resp.text()
+        return _extract_body_with_soup(html)
     except Exception as e:
-        print(f"[본문 크롤링 오류] {url}: {e}")
+        logger.debug("본문 크롤링 실패 %s: %s", url, e)
         return ""
 
 
-def enrich_articles_with_body(articles: list[Article]):
-    """새 공지들의 본문을 크롤링하여 description에 추가"""
-    for a in articles:
-        if a.link:
-            body = fetch_article_body(a.link)
-            if body:
-                a.description = body
+async def enrich_articles_with_body(articles: list[Article]):
+    """새 공지들의 본문을 비동기 병렬로 크롤링하여 description에 추가"""
+    sem = asyncio.Semaphore(_SCRAPE_CONCURRENCY)
+    ssl_ctx = ssl.create_default_context()
+    ssl_ctx.check_hostname = False
+    ssl_ctx.verify_mode = ssl.CERT_NONE
+    connector = aiohttp.TCPConnector(ssl=ssl_ctx)
+
+    async with aiohttp.ClientSession(
+        connector=connector,
+        headers={"User-Agent": "Mozilla/5.0"},
+    ) as session:
+
+        async def _fetch(article: Article):
+            async with sem:
+                if article.link:
+                    body = await _fetch_article_body_async(session, article.link)
+                    if body:
+                        article.description = body
+
+        await asyncio.gather(*[_fetch(a) for a in articles])
 
 
 def mark_as_seen(articles: list[Article], state: dict):

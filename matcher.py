@@ -1,12 +1,16 @@
 """Gemini API 기반 공지 관련도 분석 모듈"""
 
 import json
+import logging
 import os
 import time
 
 from google import genai
+from google.genai import types
 
 from feeds import Article
+
+logger = logging.getLogger("monitor.matcher")
 
 
 def build_profile_text(config: dict) -> str:
@@ -76,16 +80,19 @@ def analyze_with_gemini(articles: list[Article], config: dict) -> list[dict]:
             response = client.models.generate_content(
                 model=model_name,
                 contents=prompt,
+                config=types.GenerateContentConfig(
+                    response_mime_type="application/json",
+                ),
             )
             text = response.text.strip()
-            # JSON 블록이 ```json ... ``` 로 감싸져 있을 수 있음
+            # response_mime_type 설정으로 순수 JSON이 오지만, 안전하게 처리
             if text.startswith("```"):
                 text = text.split("\n", 1)[1].rsplit("```", 1)[0].strip()
             return json.loads(text)
         except Exception as e:
-            print(f"[Gemini API 오류] 시도 {attempt + 1}/2: {e}")
+            logger.warning("Gemini API 오류 (시도 %d/2): %s", attempt + 1, e)
             if attempt == 0:
-                print("[재시도] 5초 후 재시도합니다...")
+                logger.info("5초 후 재시도합니다...")
                 time.sleep(5)
 
     return []
@@ -135,7 +142,7 @@ def match_articles(articles: list[Article], config: dict) -> list[tuple[Article,
 
     # 실패 시 키워드 폴백
     if not results:
-        print("[INFO] Gemini 분석 실패, 키워드 매칭으로 대체합니다.")
+        logger.info("Gemini 분석 실패, 키워드 매칭으로 대체합니다.")
         results = keyword_fallback(articles, config)
 
     # 결과를 Article과 매칭
