@@ -36,6 +36,12 @@ def build_no_new_message() -> str:
     return f"{today} 새로운 공지가 없습니다."
 
 
+def build_no_relevant_message(total_new: int) -> str:
+    """새 공지는 있지만 관련 공지가 없을 때 메시지"""
+    today = datetime.now().strftime("%Y-%m-%d")
+    return f"{today} 새 공지 {total_new}건 확인, 관련 공지 없음"
+
+
 def split_message(text: str) -> list[str]:
     """텔레그램 메시지 길이 제한에 맞게 분할"""
     if len(text) <= MAX_MESSAGE_LENGTH:
@@ -83,4 +89,10 @@ async def notify_relevant(
 async def notify_no_new():
     """새 공지 없음 알림"""
     text = build_no_new_message()
+    await send_telegram(text)
+
+
+async def notify_no_relevant(total_new: int):
+    """새 공지는 있지만 관련 공지 없음 알림"""
+    text = build_no_relevant_message(total_new)
     await send_telegram(text)

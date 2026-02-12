@@ -8,7 +8,7 @@ import yaml
 
 from feeds import fetch_all_feeds, filter_new_articles, load_state, save_state, mark_as_seen, enrich_articles_with_body
 from matcher import match_articles
-from notifier import notify_relevant, notify_no_new
+from notifier import notify_relevant, notify_no_new, notify_no_relevant
 
 
 def load_config() -> dict:
@@ -58,7 +58,9 @@ async def run():
         await notify_relevant(matched, len(new_articles))
         print("[알림] 전송 완료")
     else:
-        print("[결과] 관련 공지가 없습니다. 알림을 보내지 않습니다.")
+        print("[알림] 관련 공지 없음 알림 전송 중...")
+        await notify_no_relevant(len(new_articles))
+        print("[알림] 전송 완료")
 
     # 7. 상태 업데이트
     mark_as_seen(all_articles, state)
