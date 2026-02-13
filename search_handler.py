@@ -14,7 +14,7 @@ from pathlib import Path
 from telegram import Bot
 
 from main import load_config
-from feeds import fetch_all_feeds, Article
+from feeds import fetch_all_feeds, load_articles_cache, Article
 
 SEARCH_STATE_FILE = Path(__file__).parent / "search_state.json"
 
@@ -190,11 +190,15 @@ async def run():
         if not query or query.startswith("/"):
             continue
 
-        # 처음 검색 시 RSS 피드 한 번만 수집
+        # 캐시에서 공지 로드 (RSS 재수집 없이 즉시 검색)
         if articles is None:
-            print("[검색] RSS 피드 수집 중...")
-            articles = fetch_all_feeds(config)
-            print(f"[검색] {len(articles)}건 수집 완료")
+            articles = load_articles_cache()
+            if articles:
+                print(f"[검색] 캐시에서 {len(articles)}건 로드")
+            else:
+                print("[검색] 캐시 없음, RSS 피드 수집 중...")
+                articles = fetch_all_feeds(config)
+                print(f"[검색] {len(articles)}건 수집 완료")
 
         # 검색 실행
         print(f"[검색] 쿼리: {query}")

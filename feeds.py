@@ -181,3 +181,28 @@ def mark_as_seen(articles: list[Article], state: dict):
     now = datetime.now().isoformat()
     for a in articles:
         state["seen_ids"][a.id] = now
+
+
+ARTICLES_CACHE_FILE = Path(__file__).parent / "articles_cache.json"
+
+
+def save_articles_cache(articles: list[Article]):
+    """공지 목록을 캐시 파일에 저장"""
+    data = {
+        "cached_at": datetime.now().isoformat(),
+        "articles": [asdict(a) for a in articles],
+    }
+    with open(ARTICLES_CACHE_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+
+def load_articles_cache() -> list[Article] | None:
+    """캐시된 공지 목록 로드. 없으면 None 반환"""
+    if not ARTICLES_CACHE_FILE.exists():
+        return None
+    try:
+        with open(ARTICLES_CACHE_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return [Article(**a) for a in data["articles"]]
+    except Exception:
+        return None

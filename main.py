@@ -8,7 +8,7 @@ from pathlib import Path
 
 import yaml
 
-from feeds import fetch_all_feeds, filter_new_articles, load_state, save_state, mark_as_seen, enrich_articles_with_body
+from feeds import fetch_all_feeds, filter_new_articles, load_state, save_state, mark_as_seen, enrich_articles_with_body, save_articles_cache
 from matcher import match_articles
 from notifier import notify_relevant, notify_no_new
 
@@ -47,6 +47,10 @@ async def run():
     print("[피드] RSS 피드 수집 중...")
     all_articles = fetch_all_feeds(config)
     print(f"[피드] 총 {len(all_articles)}건 수집")
+
+    # 3-1. 검색용 캐시 저장
+    save_articles_cache(all_articles)
+    print(f"[캐시] 공지 {len(all_articles)}건 캐시 저장")
 
     # 4. 새 공지 필터링
     new_articles = filter_new_articles(all_articles, state)
