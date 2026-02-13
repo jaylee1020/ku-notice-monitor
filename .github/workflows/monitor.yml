@@ -2,8 +2,8 @@ name: 건국대 공지 모니터링
 
 on:
   schedule:
-    # 매일 KST 오전 9시 (UTC 0시) 실행
-    - cron: '0 0 * * *'
+    # 매시간 실행
+    - cron: '0 * * * *'
   workflow_dispatch: # 수동 실행 가능
 
 jobs:

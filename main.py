@@ -58,7 +58,6 @@ async def run():
 
     if not new_articles:
         print("[결과] 새로운 공지가 없습니다.")
-        await notify_no_new()
         save_state(state, str(state_path))
         return
 
