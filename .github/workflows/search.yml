@@ -2,8 +2,8 @@ name: 텔레그램 검색 응답
 
 on:
   schedule:
-    # 5분 간격 실행 (public repo → Actions 무제한)
-    - cron: '*/5 * * * *'
+    # 30분 간격 실행
+    - cron: '*/30 * * * *'
   workflow_dispatch:
 
 jobs:
