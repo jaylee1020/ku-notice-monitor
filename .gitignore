@@ -3,4 +3,3 @@ __pycache__/
 .env
 logs/
 .claude/
-search_state.json

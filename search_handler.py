@@ -169,6 +169,7 @@ async def run():
 
     for update in updates:
         state["last_update_id"] = update.update_id
+        save_search_state(state)
 
         if not update.message or not update.message.text:
             continue
@@ -203,7 +204,6 @@ async def run():
         await bot.send_message(chat_id=chat_id, text=response)
         print(f"[검색] 응답 전송 ({len(results)}건)")
 
-    save_search_state(state)
     print("[검색] 완료")
 
 
