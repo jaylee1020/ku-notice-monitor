@@ -8,7 +8,7 @@
     <key>ProgramArguments</key>
     <array>
         <string>/usr/bin/python3</string>
-        <string>/Users/ijuyeong/Desktop/학교 아카이브/main.py</string>
+        <string>{{PROJECT_DIR}}/main.py</string>
     </array>
     <key>StartCalendarInterval</key>
     <dict>
@@ -18,11 +18,11 @@
         <integer>0</integer>
     </dict>
     <key>WorkingDirectory</key>
-    <string>/Users/ijuyeong/Desktop/학교 아카이브</string>
+    <string>{{PROJECT_DIR}}</string>
     <key>StandardOutPath</key>
-    <string>/Users/ijuyeong/Desktop/학교 아카이브/logs/stdout.log</string>
+    <string>{{PROJECT_DIR}}/logs/stdout.log</string>
     <key>StandardErrorPath</key>
-    <string>/Users/ijuyeong/Desktop/학교 아카이브/logs/stderr.log</string>
+    <string>{{PROJECT_DIR}}/logs/stderr.log</string>
     <key>EnvironmentVariables</key>
     <dict>
         <key>GEMINI_API_KEY</key>

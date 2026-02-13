@@ -82,6 +82,11 @@ def analyze_with_gemini(articles: list[Article], config: dict) -> list[dict]:
             if text.startswith("```"):
                 text = text.split("\n", 1)[1].rsplit("```", 1)[0].strip()
             return json.loads(text)
+        except json.JSONDecodeError as e:
+            print(f"[Gemini 응답 파싱 오류] 시도 {attempt + 1}/2: {e}")
+            if attempt == 0:
+                print("[재시도] 5초 후 재시도합니다...")
+                time.sleep(5)
         except Exception as e:
             print(f"[Gemini API 오류] 시도 {attempt + 1}/2: {e}")
             if attempt == 0:

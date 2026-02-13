@@ -38,7 +38,13 @@ def split_message(text: str) -> list[str]:
     messages = []
     current = ""
     for line in text.split("\n"):
-        if len(current) + len(line) + 1 > MAX_MESSAGE_LENGTH:
+        if len(line) > MAX_MESSAGE_LENGTH:
+            if current:
+                messages.append(current)
+                current = ""
+            for i in range(0, len(line), MAX_MESSAGE_LENGTH):
+                messages.append(line[i:i + MAX_MESSAGE_LENGTH])
+        elif len(current) + len(line) + 1 > MAX_MESSAGE_LENGTH:
             messages.append(current)
             current = line
         else:

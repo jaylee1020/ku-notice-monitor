@@ -14,6 +14,7 @@ from telegram import Bot
 
 from main import load_config
 from feeds import fetch_all_feeds, load_articles_cache, Article
+from notifier import split_message
 
 SEARCH_STATE_FILE = Path(__file__).parent / "search_state.json"
 
@@ -32,7 +33,7 @@ HELP_TEXT = """건국대 공지 검색 봇 사용법
 def load_search_state() -> dict:
     if SEARCH_STATE_FILE.exists():
         try:
-            with open(SEARCH_STATE_FILE, "r") as f:
+            with open(SEARCH_STATE_FILE, "r", encoding="utf-8") as f:
                 return json.load(f)
         except (json.JSONDecodeError, KeyError) as e:
             print(f"[검색 상태 오류] search_state.json 손상, 초기화합니다: {e}")
@@ -40,7 +41,7 @@ def load_search_state() -> dict:
 
 
 def save_search_state(state: dict):
-    with open(SEARCH_STATE_FILE, "w") as f:
+    with open(SEARCH_STATE_FILE, "w", encoding="utf-8") as f:
         json.dump(state, f, ensure_ascii=False, indent=2)
 
 
@@ -221,7 +222,8 @@ async def run():
         results, gemini_used = search_articles(query, articles)
         response = format_search_response(query, results, gemini_used)
         try:
-            await bot.send_message(chat_id=chat_id, text=response)
+            for part in split_message(response):
+                await bot.send_message(chat_id=chat_id, text=part)
         except Exception as e:
             print(f"[검색] 응답 전송 실패: {e}")
             continue

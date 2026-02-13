@@ -68,7 +68,7 @@ def fetch_feed(board_name: str, board_id: int, config: dict) -> list[Article]:
     ctx = _create_ssl_context()
     try:
         req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-        with urllib.request.urlopen(req, context=ctx) as resp:
+        with urllib.request.urlopen(req, context=ctx, timeout=15) as resp:
             xml_data = resp.read()
         feed = feedparser.parse(xml_data)
     except Exception as e:
