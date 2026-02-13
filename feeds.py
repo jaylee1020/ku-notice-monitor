@@ -11,6 +11,14 @@ import feedparser
 import urllib.request
 
 
+def _create_ssl_context() -> ssl.SSLContext:
+    """건국대 서버 SSL 인증서 문제 우회용 컨텍스트"""
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    return ctx
+
+
 @dataclass
 class Article:
     id: str
@@ -57,10 +65,7 @@ def fetch_feed(board_name: str, board_id: int, config: dict) -> list[Article]:
     base_url = config["settings"]["base_url"]
     url = config["settings"]["rss_url_template"].format(board_id=board_id)
 
-    # 건국대 서버 SSL 인증서 문제 우회
-    ctx = ssl.create_default_context()
-    ctx.check_hostname = False
-    ctx.verify_mode = ssl.CERT_NONE
+    ctx = _create_ssl_context()
     try:
         req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
         with urllib.request.urlopen(req, context=ctx) as resp:
@@ -137,9 +142,7 @@ def filter_new_articles(articles: list[Article], state: dict) -> list[Article]:
 
 def fetch_article_body(url: str) -> str:
     """게시물 웹페이지에서 본문 텍스트를 크롤링하여 반환 (최대 500자)"""
-    ctx = ssl.create_default_context()
-    ctx.check_hostname = False
-    ctx.verify_mode = ssl.CERT_NONE
+    ctx = _create_ssl_context()
     try:
         req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
         with urllib.request.urlopen(req, context=ctx, timeout=10) as resp:
@@ -204,5 +207,6 @@ def load_articles_cache() -> list[Article] | None:
         with open(ARTICLES_CACHE_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
         return [Article(**a) for a in data["articles"]]
-    except Exception:
+    except Exception as e:
+        print(f"[캐시 로드 오류] articles_cache.json 로드 실패: {e}")
         return None

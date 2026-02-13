@@ -30,12 +30,6 @@ def build_relevant_message(
     return header + "\n".join(items)
 
 
-def build_no_new_message() -> str:
-    """새 공지가 없을 때 메시지"""
-    today = datetime.now().strftime("%Y-%m-%d")
-    return f"{today} 새로운 공지가 없습니다."
-
-
 def split_message(text: str) -> list[str]:
     """텔레그램 메시지 길이 제한에 맞게 분할"""
     if len(text) <= MAX_MESSAGE_LENGTH:
@@ -68,7 +62,10 @@ async def send_telegram(text: str):
 
     bot = Bot(token=token)
     for msg in split_message(text):
-        await bot.send_message(chat_id=chat_id, text=msg)
+        try:
+            await bot.send_message(chat_id=chat_id, text=msg)
+        except Exception as e:
+            print(f"[텔레그램 전송 오류] {e}")
 
 
 async def notify_relevant(
@@ -80,7 +77,3 @@ async def notify_relevant(
     await send_telegram(text)
 
 
-async def notify_no_new():
-    """새 공지 없음 알림"""
-    text = build_no_new_message()
-    await send_telegram(text)
