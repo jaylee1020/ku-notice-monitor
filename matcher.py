@@ -35,10 +35,11 @@ def build_profile_text(config: dict) -> str:
 
 def build_prompt(articles: list[Article], profile_text: str) -> str:
     """Gemini에게 보낼 배치 프롬프트 생성"""
-    article_list = ""
+    article_lines = []
     for i, a in enumerate(articles, 1):
         desc = a.description[:300] if a.description else "설명 없음"
-        article_list += f"{i}. [{a.board_name}] {a.title} - {desc}\n"
+        article_lines.append(f"{i}. [{a.board_name}] {a.title} - {desc}")
+    article_list = "\n".join(article_lines) + "\n" if article_lines else ""
 
     return f"""당신은 한국 대학생을 위한 공지사항 관련도 분류기입니다.
 

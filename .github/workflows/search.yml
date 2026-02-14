@@ -45,4 +45,5 @@ jobs:
             git add search_state.json
           fi
           git diff --staged --quiet || git commit -m "Update search_state.json [skip ci]"
+          git pull --rebase origin main || true
           git push

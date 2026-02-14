@@ -166,10 +166,11 @@ def search_with_gemini(query: str, articles: list[Article]) -> list[Article]:
     except ImportError:
         return []
 
-    article_list = ""
+    article_lines = []
     for i, a in enumerate(articles, 1):
         desc = (a.description[:200] if a.description else "")
-        article_list += f"{i}. [{a.board_name}] {a.title} - {desc}\n"
+        article_lines.append(f"{i}. [{a.board_name}] {a.title} - {desc}")
+    article_list = "\n".join(article_lines) + "\n" if article_lines else ""
 
     prompt = f"""사용자가 건국대학교 공지사항에서 \"{query}\"에 대해 검색했습니다.
 
@@ -220,17 +221,17 @@ def format_search_response(query: str, results: list[Article], gemini_used: bool
         return f"'{query}' 관련 공지를 찾지 못했습니다."
 
     method = "AI" if gemini_used else "키워드"
-    msg = f"'{query}' 검색 결과 {len(results)}건 ({method} 검색):\n"
+    parts = [f"'{query}' 검색 결과 {len(results)}건 ({method} 검색):"]
 
     for i, a in enumerate(results[:10], 1):
         reason = getattr(a, "_search_reason", "")
         reason_line = f"  → {reason}\n" if reason else ""
-        msg += f"\n{i}. [{a.board_name}] {a.title}\n{reason_line}{a.link}\n"
+        parts.append(f"\n{i}. [{a.board_name}] {a.title}\n{reason_line}{a.link}")
 
     if len(results) > 10:
-        msg += f"\n... 외 {len(results) - 10}건"
+        parts.append(f"\n... 외 {len(results) - 10}건")
 
-    return msg
+    return "\n".join(parts)
 
 
 async def run():
@@ -314,6 +315,14 @@ async def run():
     # 루프 종료 후 최종 상태 저장 (스킵된 업데이트의 offset 반영)
     state["processed_update_ids"] = list(processed_update_ids)
     save_search_state(state)
+
+    # 처리 완료된 업데이트를 Telegram 서버에서 확인(confirm)
+    # offset+1로 getUpdates를 호출하면 이전 업데이트가 서버에서 제거됨
+    # → search_state.json 저장/push 실패 시에도 같은 메시지를 다시 받지 않음
+    max_id = state.get("last_update_id", 0)
+    if max_id:
+        await bot.get_updates(offset=max_id + 1, timeout=0)
+        print(f"[검색] Telegram offset 확인 완료: {max_id + 1}")
 
     print("[검색] 완료")
 
