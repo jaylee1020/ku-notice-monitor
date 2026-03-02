@@ -21,7 +21,9 @@ def build_profile_text(config: dict) -> str:
 
     lines: list[str] = []
     if p.get("major"):
-        lines.append(f"학과: {p['major']}")
+        lines.append(f"현재 학과: {p['major']}")
+    if p.get("previous_major"):
+        lines.append(f"이전 학과: {p['previous_major']}")
     if p.get("year"):
         lines.append(f"학년: {p['year']}학년")
     if p.get("campus"):
