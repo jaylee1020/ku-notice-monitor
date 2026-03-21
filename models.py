@@ -1,6 +1,6 @@
 """공지사항 데이터 모델"""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 
 @dataclass
@@ -16,6 +16,7 @@ class Article:
     view_count: int
     is_pinned: bool
     attachment_count: int
+    images: list[str] = field(default_factory=list)
 
     @property
     def key(self) -> str:

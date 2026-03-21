@@ -5,6 +5,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 from feeds import (
+    _extract_image_urls,
     _to_int,
     extract_article_id,
     is_empty_feed_item,
@@ -174,6 +175,46 @@ def test_save_state_no_tmp_left(tmp_path):
     save_state(state, path)
     tmp_files = list(tmp_path.glob("*.tmp"))
     assert len(tmp_files) == 0
+
+
+# --- _extract_image_urls ---
+
+
+def test_extract_image_urls_basic():
+    from bs4 import BeautifulSoup
+
+    html = '<div><img src="/images/notice.jpg"><img src="https://example.com/photo.png"></div>'
+    div = BeautifulSoup(html, "html.parser").find("div")
+    urls = _extract_image_urls(div, "https://www.konkuk.ac.kr")
+    assert urls == ["https://www.konkuk.ac.kr/images/notice.jpg", "https://example.com/photo.png"]
+
+
+def test_extract_image_urls_empty():
+    from bs4 import BeautifulSoup
+
+    html = "<div><p>텍스트만 있는 공지</p></div>"
+    div = BeautifulSoup(html, "html.parser").find("div")
+    urls = _extract_image_urls(div, "https://www.konkuk.ac.kr")
+    assert urls == []
+
+
+def test_extract_image_urls_respects_max_limit():
+    from bs4 import BeautifulSoup
+
+    imgs = "".join(f'<img src="https://example.com/img{i}.jpg">' for i in range(10))
+    html = f"<div>{imgs}</div>"
+    div = BeautifulSoup(html, "html.parser").find("div")
+    urls = _extract_image_urls(div, "https://www.konkuk.ac.kr")
+    assert len(urls) == 3  # MAX_IMAGES_PER_ARTICLE
+
+
+def test_extract_image_urls_skips_empty_src():
+    from bs4 import BeautifulSoup
+
+    html = '<div><img src=""><img><img src="https://example.com/valid.jpg"></div>'
+    div = BeautifulSoup(html, "html.parser").find("div")
+    urls = _extract_image_urls(div, "https://www.konkuk.ac.kr")
+    assert urls == ["https://example.com/valid.jpg"]
 
 
 def test_filter_new_articles_migrates_legacy_id_key(make_article):

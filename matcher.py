@@ -1,12 +1,16 @@
-"""Gemini API 기반 공지 관련도 분석 모듈"""
+"""Gemini API 기반 공지 관련도 분석 모듈 (텍스트 + 이미지 멀티모달)"""
 
 import json
 import logging
+import mimetypes
 import os
 
+import aiohttp
 from google import genai
+from google.genai import types
 from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
 
+from constants import IMAGE_DOWNLOAD_TIMEOUT
 from models import Article
 
 logger = logging.getLogger(__name__)
@@ -57,9 +61,18 @@ def build_profile_text(config: dict) -> str:
 def build_prompt(articles: list[Article], profile_text: str) -> str:
     """Gemini에게 보낼 배치 프롬프트 생성"""
     article_list = ""
+    has_images = any(a.images for a in articles)
     for i, a in enumerate(articles, 1):
         desc = a.description[:300] if a.description else "설명 없음"
-        article_list += f"{i}. [{a.board_name}] {a.title} - {desc}\n"
+        image_note = f" (이미지 {len(a.images)}장 첨부)" if a.images else ""
+        article_list += f"{i}. [{a.board_name}] {a.title} - {desc}{image_note}\n"
+
+    image_instruction = ""
+    if has_images:
+        image_instruction = (
+            "\n일부 공지에는 이미지가 첨부되어 있습니다. "
+            "이미지의 내용도 함께 분석하여 관련도를 평가해주세요.\n"
+        )
 
     return f"""당신은 한국 대학생을 위한 공지사항 관련도 분류기입니다.
 
@@ -72,12 +85,74 @@ def build_prompt(articles: list[Article], profile_text: str) -> str:
 - 3점: 관련 있을 수 있음 (일반 학생에게 유용한 정보)
 - 2점: 낮은 관련도 (특정 대상만 해당)
 - 1점: 관련 없음
-
+{image_instruction}
 반드시 아래 JSON 형식으로만 응답해주세요. 다른 텍스트는 포함하지 마세요:
 [{{"index": 1, "score": 5, "reason": "사유"}}, ...]
 
 공지사항 목록:
 {article_list}"""
+
+
+def _guess_mime_type(url: str) -> str:
+    """URL에서 MIME 타입을 추측. 기본값은 image/jpeg."""
+    mime, _ = mimetypes.guess_type(url.split("?")[0])
+    if mime and mime.startswith("image/"):
+        return mime
+    return "image/jpeg"
+
+
+async def _download_images(articles: list[Article]) -> dict[str, list[types.Part]]:
+    """공지별 이미지를 다운로드하여 Gemini Part 객체로 변환. 키는 article.key."""
+    image_parts: dict[str, list[types.Part]] = {}
+
+    # 다운로드할 이미지가 있는 공지만 필터링
+    download_tasks: list[tuple[str, str]] = []
+    for a in articles:
+        for url in a.images:
+            download_tasks.append((a.key, url))
+
+    if not download_tasks:
+        return image_parts
+
+    async with aiohttp.ClientSession() as session:
+        for article_key, url in download_tasks:
+            try:
+                async with session.get(
+                    url,
+                    timeout=aiohttp.ClientTimeout(total=IMAGE_DOWNLOAD_TIMEOUT),
+                ) as resp:
+                    if resp.status != 200:
+                        logger.debug("이미지 다운로드 실패 (status=%d): %s", resp.status, url)
+                        continue
+                    data = await resp.read()
+
+                mime_type = _guess_mime_type(url)
+                part = types.Part.from_bytes(data=data, mime_type=mime_type)
+                image_parts.setdefault(article_key, []).append(part)
+                logger.debug("이미지 다운로드 성공: %s (%d bytes)", url, len(data))
+            except Exception as e:
+                logger.debug("이미지 다운로드 예외: %s - %s", url, e)
+
+    return image_parts
+
+
+def _build_multimodal_contents(
+    prompt: str,
+    articles: list[Article],
+    image_parts: dict[str, list[types.Part]],
+) -> list:
+    """텍스트 프롬프트와 이미지를 결합하여 멀티모달 contents 생성"""
+    if not image_parts:
+        return [prompt]
+
+    contents: list = [prompt]
+    for i, a in enumerate(articles, 1):
+        parts = image_parts.get(a.key, [])
+        if parts:
+            contents.append(types.Part.from_text(text=f"\n--- 공지 {i}번 첨부 이미지 ---"))
+            contents.extend(parts)
+
+    return contents
 
 
 @retry(
@@ -86,11 +161,11 @@ def build_prompt(articles: list[Article], profile_text: str) -> str:
     wait=wait_exponential(multiplier=1, min=2, max=16),
     reraise=True,
 )
-def _call_gemini_api(client: genai.Client, model_name: str, prompt: str) -> list[dict]:
+def _call_gemini_api(client: genai.Client, model_name: str, contents: list | str) -> list[dict]:
     """Gemini API 호출 (tenacity로 최대 3회 지수 백오프 재시도)"""
     response = client.models.generate_content(
         model=model_name,
-        contents=prompt,
+        contents=contents,
     )
     text = response.text.strip()
     if text.startswith("```"):
@@ -98,8 +173,8 @@ def _call_gemini_api(client: genai.Client, model_name: str, prompt: str) -> list
     return json.loads(text)
 
 
-def analyze_with_gemini(articles: list[Article], config: dict) -> list[dict]:
-    """Gemini API로 공지 관련도 분석. 실패 시 빈 리스트 반환."""
+async def analyze_with_gemini(articles: list[Article], config: dict) -> list[dict]:
+    """Gemini API로 공지 관련도 분석 (이미지 포함 멀티모달). 실패 시 빈 리스트 반환."""
     api_key = os.environ.get("GEMINI_API_KEY", "")
     if not api_key:
         logger.warning("GEMINI_API_KEY가 설정되지 않았습니다. 키워드 매칭으로 대체됩니다.")
@@ -110,8 +185,16 @@ def analyze_with_gemini(articles: list[Article], config: dict) -> list[dict]:
     profile_text = build_profile_text(config)
     prompt = build_prompt(articles, profile_text)
 
+    # 이미지가 있는 공지의 이미지를 다운로드
+    image_parts = await _download_images(articles)
+    if image_parts:
+        image_count = sum(len(parts) for parts in image_parts.values())
+        logger.info("이미지 %d장 다운로드 완료, 멀티모달 분석 진행", image_count)
+
+    contents = _build_multimodal_contents(prompt, articles, image_parts)
+
     try:
-        results = _call_gemini_api(client, model_name, prompt)
+        results = _call_gemini_api(client, model_name, contents)
         logger.info("Gemini 분석 완료: %d건", len(results))
         return results
     except Exception as e:
@@ -173,7 +256,7 @@ def _extract_matched(
     return matched, valid_count
 
 
-def match_articles(articles: list[Article], config: dict) -> tuple[list[tuple[Article, int, str]], str]:
+async def match_articles(articles: list[Article], config: dict) -> tuple[list[tuple[Article, int, str]], str]:
     """
     공지 관련도 분석 후 (Article, score, reason) 튜플 리스트와 분석 방법을 반환.
     threshold 이상인 공지만 포함, 점수 높은 순 정렬.
@@ -184,7 +267,7 @@ def match_articles(articles: list[Article], config: dict) -> tuple[list[tuple[Ar
 
     threshold: int = config["gemini"].get("relevance_threshold", 3)
 
-    results = analyze_with_gemini(articles, config)
+    results = await analyze_with_gemini(articles, config)
     if results:
         method = "gemini"
     else:

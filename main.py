@@ -159,7 +159,7 @@ async def run() -> None:
     await enrich_articles_with_body(new_articles, config)
 
     logger.info("Gemini로 관련도 분석 중...")
-    matched, method = match_articles(new_articles, config)
+    matched, method = await match_articles(new_articles, config)
     stats["matched_articles"] = len(matched)
     stats["method"] = method
     logger.info("관련 공지: %d건", len(matched))

@@ -16,6 +16,7 @@ from constants import (
     EMPTY_FEED_SENTINEL,
     FEED_FETCH_TIMEOUT,
     MAX_ARTICLE_BODY_LENGTH,
+    MAX_IMAGES_PER_ARTICLE,
 )
 from models import Article
 
@@ -151,12 +152,28 @@ async def fetch_all_feeds(config: dict) -> list[Article]:
     return all_articles
 
 
+def _extract_image_urls(content_div, base_url: str) -> list[str]:
+    """콘텐츠 div에서 이미지 URL을 추출 (최대 MAX_IMAGES_PER_ARTICLE개)"""
+    image_urls: list[str] = []
+    for img in content_div.find_all("img"):
+        src = img.get("src", "")
+        if not src:
+            continue
+        url = normalize_link(src, base_url) if src.startswith("/") else src
+        if url.startswith("http"):
+            image_urls.append(url)
+        if len(image_urls) >= MAX_IMAGES_PER_ARTICLE:
+            break
+    return image_urls
+
+
 async def _fetch_article_body_async(
     session: aiohttp.ClientSession,
     url: str,
     ssl_context: ssl.SSLContext,
-) -> str:
-    """게시물 웹페이지에서 본문 텍스트를 비동기로 크롤링 (최대 500자)"""
+    base_url: str,
+) -> tuple[str, list[str]]:
+    """게시물 웹페이지에서 본문 텍스트와 이미지 URL을 비동기로 크롤링"""
     from bs4 import BeautifulSoup
 
     try:
@@ -167,38 +184,46 @@ async def _fetch_article_body_async(
         soup = BeautifulSoup(html, "lxml")
         content_div = soup.find("div", class_=BOARD_CONTENT_CLASS)
         if not content_div:
-            return ""
+            return "", []
 
         text = content_div.get_text(separator=" ", strip=True)
         text = re.sub(r"\s+", " ", text).strip()
-        return text[:MAX_ARTICLE_BODY_LENGTH]
+
+        image_urls = _extract_image_urls(content_div, base_url)
+
+        return text[:MAX_ARTICLE_BODY_LENGTH], image_urls
     except Exception as e:
         logger.warning("본문 크롤링 실패 - %s: %s", url, e)
-        return ""
+        return "", []
 
 
 async def enrich_articles_with_body(articles: list[Article], config: dict) -> None:
-    """새 공지들의 본문을 비동기 병렬로 크롤링하여 description에 추가"""
+    """새 공지들의 본문과 이미지를 비동기 병렬로 크롤링하여 Article에 추가"""
     if not articles:
         return
 
     ssl_verify = config.get("settings", {}).get("ssl_verify", False)
     ssl_context = _make_ssl_context(ssl_verify)
+    base_url = config["settings"]["base_url"]
 
     async with aiohttp.ClientSession(headers=_DEFAULT_HEADERS) as session:
         tasks = [
-            _fetch_article_body_async(session, a.link, ssl_context)
+            _fetch_article_body_async(session, a.link, ssl_context, base_url)
             for a in articles
             if a.link
         ]
-        bodies = await asyncio.gather(*tasks, return_exceptions=True)
+        results = await asyncio.gather(*tasks, return_exceptions=True)
 
     link_articles = [a for a in articles if a.link]
-    for article, body in zip(link_articles, bodies):
-        if isinstance(body, Exception):
-            logger.warning("본문 크롤링 예외 - %s: %s", article.link, body)
-        elif body:
-            article.description = body
+    for article, result in zip(link_articles, results):
+        if isinstance(result, Exception):
+            logger.warning("본문 크롤링 예외 - %s: %s", article.link, result)
+        else:
+            body, image_urls = result
+            if body:
+                article.description = body
+            if image_urls:
+                article.images = image_urls
 
 
 async def check_ssl_health(config: dict) -> bool:

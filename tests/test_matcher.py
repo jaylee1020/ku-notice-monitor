@@ -1,8 +1,9 @@
 """matcher.py 단위 테스트"""
 
-from unittest.mock import patch
+import asyncio
+from unittest.mock import AsyncMock, patch
 
-from matcher import build_profile_text, build_prompt, keyword_fallback, match_articles
+from matcher import _guess_mime_type, build_profile_text, build_prompt, keyword_fallback, match_articles
 
 # --- build_profile_text ---
 
@@ -33,6 +34,38 @@ def test_build_prompt_contains_articles(make_article):
     assert "장학공지" in prompt
     assert "테스트 프로필" in prompt
     assert "JSON" in prompt
+
+
+def test_build_prompt_with_images(make_article):
+    articles = [make_article(title="포스터 공지", images=["https://example.com/img.jpg"])]
+    prompt = build_prompt(articles, "테스트 프로필")
+    assert "이미지 1장 첨부" in prompt
+    assert "이미지의 내용도 함께 분석" in prompt
+
+
+def test_build_prompt_without_images(make_article):
+    articles = [make_article(title="텍스트 공지")]
+    prompt = build_prompt(articles, "테스트 프로필")
+    assert "이미지" not in prompt
+
+
+# --- _guess_mime_type ---
+
+
+def test_guess_mime_type_jpeg():
+    assert _guess_mime_type("https://example.com/photo.jpg") == "image/jpeg"
+
+
+def test_guess_mime_type_png():
+    assert _guess_mime_type("https://example.com/photo.png") == "image/png"
+
+
+def test_guess_mime_type_unknown_defaults_jpeg():
+    assert _guess_mime_type("https://example.com/image") == "image/jpeg"
+
+
+def test_guess_mime_type_with_query_params():
+    assert _guess_mime_type("https://example.com/photo.png?w=100") == "image/png"
 
 
 # --- keyword_fallback ---
@@ -70,8 +103,8 @@ def test_match_articles_gemini_success(make_article):
         {"index": 1, "score": 5, "reason": "장학 관련"},
         {"index": 2, "score": 1, "reason": "무관"},
     ]
-    with patch("matcher.analyze_with_gemini", return_value=mock_results):
-        matched, method = match_articles(articles, config)
+    with patch("matcher.analyze_with_gemini", new_callable=AsyncMock, return_value=mock_results):
+        matched, method = asyncio.get_event_loop().run_until_complete(match_articles(articles, config))
     assert len(matched) == 1
     assert matched[0][1] == 5
     assert method == "gemini"
@@ -84,14 +117,16 @@ def test_match_articles_gemini_fail_falls_back(make_article):
         "profile": {},
         "keywords": {"high": ["장학"], "medium": []},
     }
-    with patch("matcher.analyze_with_gemini", return_value=[]):
-        matched, method = match_articles(articles, config)
+    with patch("matcher.analyze_with_gemini", new_callable=AsyncMock, return_value=[]):
+        matched, method = asyncio.get_event_loop().run_until_complete(match_articles(articles, config))
     assert method == "keyword"
     assert len(matched) == 1
 
 
 def test_match_articles_empty():
-    matched, method = match_articles([], {"gemini": {"relevance_threshold": 3}})
+    matched, method = asyncio.get_event_loop().run_until_complete(
+        match_articles([], {"gemini": {"relevance_threshold": 3}})
+    )
     assert matched == []
     assert method == "none"
 
@@ -104,8 +139,8 @@ def test_match_articles_gemini_string_score_and_invalid_entries(make_article):
         {"index": "x", "score": 5, "reason": "잘못된 index"},
         {"index": 1, "score": "bad", "reason": "잘못된 score"},
     ]
-    with patch("matcher.analyze_with_gemini", return_value=mock_results):
-        matched, method = match_articles(articles, config)
+    with patch("matcher.analyze_with_gemini", new_callable=AsyncMock, return_value=mock_results):
+        matched, method = asyncio.get_event_loop().run_until_complete(match_articles(articles, config))
 
     assert method == "gemini"
     assert len(matched) == 1
@@ -120,8 +155,8 @@ def test_match_articles_gemini_invalid_results_fallback_to_keyword(make_article)
         "keywords": {"high": ["장학"], "medium": []},
     }
     mock_results = [{"index": "x", "score": "bad", "reason": "형식 오류"}]
-    with patch("matcher.analyze_with_gemini", return_value=mock_results):
-        matched, method = match_articles(articles, config)
+    with patch("matcher.analyze_with_gemini", new_callable=AsyncMock, return_value=mock_results):
+        matched, method = asyncio.get_event_loop().run_until_complete(match_articles(articles, config))
 
     assert method == "keyword"
     assert len(matched) == 1
