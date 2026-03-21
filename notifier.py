@@ -7,7 +7,7 @@ from datetime import datetime
 from telegram import Bot
 
 from constants import MAX_TELEGRAM_MESSAGE_LENGTH
-from feeds import Article
+from models import Article
 
 logger = logging.getLogger(__name__)
 

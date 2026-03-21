@@ -7,7 +7,7 @@ import os
 from google import genai
 from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
 
-from feeds import Article
+from models import Article
 
 logger = logging.getLogger(__name__)
 
@@ -148,6 +148,31 @@ def keyword_fallback(articles: list[Article], config: dict) -> list[dict]:
     return results
 
 
+def _extract_matched(
+    results: list[dict],
+    articles: list[Article],
+    threshold: int,
+) -> tuple[list[tuple[Article, int, str]], int]:
+    """분석 결과에서 threshold 이상인 공지를 추출. (매칭 리스트, 유효 결과 수) 반환."""
+    matched: list[tuple[Article, int, str]] = []
+    valid_count = 0
+
+    for r in results:
+        idx_raw = _parse_index(r.get("index"))
+        score = _parse_score(r.get("score"))
+        if idx_raw is None or score is None:
+            logger.debug("잘못된 분석 결과를 건너뜁니다: %s", r)
+            continue
+
+        valid_count += 1
+        idx = idx_raw - 1
+        if 0 <= idx < len(articles) and score >= threshold:
+            reason = str(r.get("reason", ""))
+            matched.append((articles[idx], score, reason))
+
+    return matched, valid_count
+
+
 def match_articles(articles: list[Article], config: dict) -> tuple[list[tuple[Article, int, str]], str]:
     """
     공지 관련도 분석 후 (Article, score, reason) 튜플 리스트와 분석 방법을 반환.
@@ -160,7 +185,6 @@ def match_articles(articles: list[Article], config: dict) -> tuple[list[tuple[Ar
     threshold: int = config["gemini"].get("relevance_threshold", 3)
 
     results = analyze_with_gemini(articles, config)
-
     if results:
         method = "gemini"
     else:
@@ -168,36 +192,14 @@ def match_articles(articles: list[Article], config: dict) -> tuple[list[tuple[Ar
         results = keyword_fallback(articles, config)
         method = "keyword"
 
-    matched: list[tuple[Article, int, str]] = []
-    valid_result_count = 0
-    for r in results:
-        idx_raw = _parse_index(r.get("index"))
-        score = _parse_score(r.get("score"))
-        if idx_raw is None or score is None:
-            logger.debug("잘못된 Gemini 결과를 건너뜁니다: %s", r)
-            continue
-
-        valid_result_count += 1
-        idx = idx_raw - 1
-        if 0 <= idx < len(articles) and score >= threshold:
-            reason = str(r.get("reason", ""))
-            matched.append((articles[idx], score, reason))
+    matched, valid_count = _extract_matched(results, articles, threshold)
 
     # Gemini 응답이 있었지만 유효 결과가 하나도 없으면 키워드 매칭으로 재시도
-    if method == "gemini" and valid_result_count == 0:
+    if method == "gemini" and valid_count == 0:
         logger.info("Gemini 결과 형식이 유효하지 않아 키워드 매칭으로 대체합니다.")
-        fallback_results = keyword_fallback(articles, config)
+        results = keyword_fallback(articles, config)
         method = "keyword"
-        matched = []
-        for r in fallback_results:
-            idx_raw = _parse_index(r.get("index"))
-            score = _parse_score(r.get("score"))
-            if idx_raw is None or score is None:
-                continue
-            idx = idx_raw - 1
-            if 0 <= idx < len(articles) and score >= threshold:
-                reason = str(r.get("reason", ""))
-                matched.append((articles[idx], score, reason))
+        matched, _ = _extract_matched(results, articles, threshold)
 
     matched.sort(key=lambda x: x[1], reverse=True)
     return matched, method
