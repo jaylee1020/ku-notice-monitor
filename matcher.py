@@ -1,5 +1,6 @@
 """Gemini API 기반 공지 관련도 분석 모듈 (텍스트 + 이미지 멀티모달)"""
 
+import asyncio
 import json
 import logging
 import mimetypes
@@ -101,37 +102,53 @@ def _guess_mime_type(url: str) -> str:
     return "image/jpeg"
 
 
-async def _download_images(articles: list[Article]) -> dict[str, list[types.Part]]:
-    """공지별 이미지를 다운로드하여 Gemini Part 객체로 변환. 키는 article.key."""
-    image_parts: dict[str, list[types.Part]] = {}
+async def _download_one_image(
+    session: aiohttp.ClientSession,
+    article_key: str,
+    url: str,
+) -> tuple[str, types.Part] | None:
+    """단일 이미지를 다운로드하여 (article_key, Part) 반환. 실패 시 None."""
+    try:
+        async with session.get(
+            url,
+            timeout=aiohttp.ClientTimeout(total=IMAGE_DOWNLOAD_TIMEOUT),
+        ) as resp:
+            if resp.status != 200:
+                logger.debug("이미지 다운로드 실패 (status=%d): %s", resp.status, url)
+                return None
+            data = await resp.read()
 
-    # 다운로드할 이미지가 있는 공지만 필터링
-    download_tasks: list[tuple[str, str]] = []
+        mime_type = _guess_mime_type(url)
+        part = types.Part.from_bytes(data=data, mime_type=mime_type)
+        logger.debug("이미지 다운로드 성공: %s (%d bytes)", url, len(data))
+        return article_key, part
+    except Exception as e:
+        logger.debug("이미지 다운로드 예외: %s - %s", url, e)
+        return None
+
+
+async def _download_images(articles: list[Article]) -> dict[str, list[types.Part]]:
+    """공지별 이미지를 병렬 다운로드하여 Gemini Part 객체로 변환. 키는 article.key."""
+    tasks_info: list[tuple[str, str]] = []
     for a in articles:
         for url in a.images:
-            download_tasks.append((a.key, url))
+            tasks_info.append((a.key, url))
 
-    if not download_tasks:
-        return image_parts
+    if not tasks_info:
+        return {}
 
     async with aiohttp.ClientSession() as session:
-        for article_key, url in download_tasks:
-            try:
-                async with session.get(
-                    url,
-                    timeout=aiohttp.ClientTimeout(total=IMAGE_DOWNLOAD_TIMEOUT),
-                ) as resp:
-                    if resp.status != 200:
-                        logger.debug("이미지 다운로드 실패 (status=%d): %s", resp.status, url)
-                        continue
-                    data = await resp.read()
+        results = await asyncio.gather(
+            *(_download_one_image(session, key, url) for key, url in tasks_info),
+            return_exceptions=True,
+        )
 
-                mime_type = _guess_mime_type(url)
-                part = types.Part.from_bytes(data=data, mime_type=mime_type)
-                image_parts.setdefault(article_key, []).append(part)
-                logger.debug("이미지 다운로드 성공: %s (%d bytes)", url, len(data))
-            except Exception as e:
-                logger.debug("이미지 다운로드 예외: %s - %s", url, e)
+    image_parts: dict[str, list[types.Part]] = {}
+    for result in results:
+        if isinstance(result, Exception) or result is None:
+            continue
+        article_key, part = result
+        image_parts.setdefault(article_key, []).append(part)
 
     return image_parts
 
@@ -194,7 +211,7 @@ async def analyze_with_gemini(articles: list[Article], config: dict) -> list[dic
     contents = _build_multimodal_contents(prompt, articles, image_parts)
 
     try:
-        results = _call_gemini_api(client, model_name, contents)
+        results = await asyncio.to_thread(_call_gemini_api, client, model_name, contents)
         logger.info("Gemini 분석 완료: %d건", len(results))
         return results
     except Exception as e:
