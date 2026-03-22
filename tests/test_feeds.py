@@ -5,36 +5,19 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 from feeds import (
-    Article,
+    _extract_image_urls,
     _to_int,
     extract_article_id,
-    filter_new_articles,
     is_empty_feed_item,
-    load_state,
-    mark_as_seen,
     normalize_link,
     parse_pub_date,
+)
+from state import (
+    filter_new_articles,
+    load_state,
+    mark_as_seen,
     save_state,
 )
-
-
-def _make_article(**overrides) -> Article:
-    defaults = dict(
-        id="1",
-        title="테스트",
-        link="https://example.com",
-        pub_date="",
-        author="",
-        description="",
-        board_name="테스트게시판",
-        board_id=234,
-        view_count=0,
-        is_pinned=False,
-        attachment_count=0,
-    )
-    defaults.update(overrides)
-    return Article(**defaults)
-
 
 # --- parse_pub_date ---
 
@@ -115,16 +98,16 @@ def test_to_int_custom_default():
 # --- filter_new_articles ---
 
 
-def test_filter_new_articles_filters_seen():
-    articles = [_make_article(id="1"), _make_article(id="2"), _make_article(id="3")]
+def test_filter_new_articles_filters_seen(make_article):
+    articles = [make_article(id="1"), make_article(id="2"), make_article(id="3")]
     state = {"seen_ids": {"234:1": "2026-01-01T00:00:00", "234:3": "2026-01-01T00:00:00"}}
     result = filter_new_articles(articles, state)
     assert len(result) == 1
     assert result[0].id == "2"
 
 
-def test_filter_new_articles_empty_state():
-    articles = [_make_article(id="1")]
+def test_filter_new_articles_empty_state(make_article):
+    articles = [make_article(id="1")]
     state = {"seen_ids": {}}
     assert len(filter_new_articles(articles, state)) == 1
 
@@ -132,8 +115,8 @@ def test_filter_new_articles_empty_state():
 # --- mark_as_seen ---
 
 
-def test_mark_as_seen():
-    articles = [_make_article(id="10"), _make_article(id="20")]
+def test_mark_as_seen(make_article):
+    articles = [make_article(id="10"), make_article(id="20")]
     state = {"seen_ids": {}}
     mark_as_seen(articles, state)
     assert "234:10" in state["seen_ids"]
@@ -194,8 +177,48 @@ def test_save_state_no_tmp_left(tmp_path):
     assert len(tmp_files) == 0
 
 
-def test_filter_new_articles_migrates_legacy_id_key():
-    articles = [_make_article(id="1", board_id=243)]
+# --- _extract_image_urls ---
+
+
+def test_extract_image_urls_basic():
+    from bs4 import BeautifulSoup
+
+    html = '<div><img src="/images/notice.jpg"><img src="https://example.com/photo.png"></div>'
+    div = BeautifulSoup(html, "html.parser").find("div")
+    urls = _extract_image_urls(div, "https://www.konkuk.ac.kr")
+    assert urls == ["https://www.konkuk.ac.kr/images/notice.jpg", "https://example.com/photo.png"]
+
+
+def test_extract_image_urls_empty():
+    from bs4 import BeautifulSoup
+
+    html = "<div><p>텍스트만 있는 공지</p></div>"
+    div = BeautifulSoup(html, "html.parser").find("div")
+    urls = _extract_image_urls(div, "https://www.konkuk.ac.kr")
+    assert urls == []
+
+
+def test_extract_image_urls_respects_max_limit():
+    from bs4 import BeautifulSoup
+
+    imgs = "".join(f'<img src="https://example.com/img{i}.jpg">' for i in range(10))
+    html = f"<div>{imgs}</div>"
+    div = BeautifulSoup(html, "html.parser").find("div")
+    urls = _extract_image_urls(div, "https://www.konkuk.ac.kr")
+    assert len(urls) == 3  # MAX_IMAGES_PER_ARTICLE
+
+
+def test_extract_image_urls_skips_empty_src():
+    from bs4 import BeautifulSoup
+
+    html = '<div><img src=""><img><img src="https://example.com/valid.jpg"></div>'
+    div = BeautifulSoup(html, "html.parser").find("div")
+    urls = _extract_image_urls(div, "https://www.konkuk.ac.kr")
+    assert urls == ["https://example.com/valid.jpg"]
+
+
+def test_filter_new_articles_migrates_legacy_id_key(make_article):
+    articles = [make_article(id="1", board_id=243)]
     state = {"seen_ids": {"1": "2026-01-01T00:00:00"}}
     result = filter_new_articles(articles, state)
     assert result == []

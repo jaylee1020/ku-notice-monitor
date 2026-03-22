@@ -10,17 +10,10 @@ from pathlib import Path
 
 import yaml
 
-from feeds import (
-    check_ssl_health,
-    enrich_articles_with_body,
-    fetch_all_feeds,
-    filter_new_articles,
-    load_state,
-    mark_as_seen,
-    save_state,
-)
+from feeds import check_ssl_health, enrich_articles_with_body, fetch_all_feeds
 from matcher import match_articles
 from notifier import notify_error, notify_no_new, notify_no_relevant, notify_relevant
+from state import filter_new_articles, load_state, mark_as_seen, save_state
 
 
 def setup_logging() -> None:
@@ -113,6 +106,13 @@ def _log_run_summary(stats: dict) -> None:
     )
 
 
+def _finalize_state(state: dict, state_path: str, all_articles, stats: dict) -> None:
+    """상태 저장 및 실행 통계 기록"""
+    mark_as_seen(all_articles, state)
+    state["last_run_stats"] = stats
+    save_state(state, state_path)
+
+
 async def run() -> None:
     logger = logging.getLogger(__name__)
     logger.info("=== 건국대 공지 모니터링 시작 ===")
@@ -129,8 +129,8 @@ async def run() -> None:
     config = load_config()
     validate_config(config)
 
-    state_path = Path(__file__).parent / config["settings"]["state_file"]
-    state = load_state(str(state_path))
+    state_path = str(Path(__file__).parent / config["settings"]["state_file"])
+    state = load_state(state_path)
     logger.info("기존 확인 공지: %d건", len(state.get("seen_ids", {})))
 
     ssl_verify = config.get("settings", {}).get("ssl_verify", False)
@@ -151,9 +151,7 @@ async def run() -> None:
     if not new_articles:
         logger.info("새로운 공지가 없습니다.")
         await notify_no_new()
-        mark_as_seen(all_articles, state)
-        state["last_run_stats"] = stats
-        save_state(state, str(state_path))
+        _finalize_state(state, state_path, all_articles, stats)
         _log_run_summary(stats)
         return
 
@@ -161,7 +159,7 @@ async def run() -> None:
     await enrich_articles_with_body(new_articles, config)
 
     logger.info("Gemini로 관련도 분석 중...")
-    matched, method = match_articles(new_articles, config)
+    matched, method = await match_articles(new_articles, config)
     stats["matched_articles"] = len(matched)
     stats["method"] = method
     logger.info("관련 공지: %d건", len(matched))
@@ -169,15 +167,12 @@ async def run() -> None:
     if matched:
         logger.info("텔레그램으로 관련 공지 전송 중...")
         await notify_relevant(matched, len(new_articles))
-        logger.info("전송 완료")
     else:
         logger.info("관련 공지 없음 알림 전송 중...")
         await notify_no_relevant(len(new_articles))
-        logger.info("전송 완료")
+    logger.info("전송 완료")
 
-    mark_as_seen(all_articles, state)
-    state["last_run_stats"] = stats
-    save_state(state, str(state_path))
+    _finalize_state(state, state_path, all_articles, stats)
     logger.info("상태 저장 완료 (총 %d건 기록)", len(state["seen_ids"]))
     _log_run_summary(stats)
     logger.info("=== 완료 ===")
