@@ -11,7 +11,7 @@ from google import genai
 from google.genai import types
 from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
 
-from constants import IMAGE_DOWNLOAD_TIMEOUT
+from constants import GEMINI_BATCH_SIZE, IMAGE_DOWNLOAD_TIMEOUT, MAX_CONCURRENT_IMAGE_DOWNLOADS
 from models import Article
 
 logger = logging.getLogger(__name__)
@@ -106,25 +106,27 @@ async def _download_one_image(
     session: aiohttp.ClientSession,
     article_key: str,
     url: str,
+    semaphore: asyncio.Semaphore,
 ) -> tuple[str, types.Part] | None:
     """단일 이미지를 다운로드하여 (article_key, Part) 반환. 실패 시 None."""
-    try:
-        async with session.get(
-            url,
-            timeout=aiohttp.ClientTimeout(total=IMAGE_DOWNLOAD_TIMEOUT),
-        ) as resp:
-            if resp.status != 200:
-                logger.debug("이미지 다운로드 실패 (status=%d): %s", resp.status, url)
-                return None
-            data = await resp.read()
+    async with semaphore:
+        try:
+            async with session.get(
+                url,
+                timeout=aiohttp.ClientTimeout(total=IMAGE_DOWNLOAD_TIMEOUT),
+            ) as resp:
+                if resp.status != 200:
+                    logger.debug("이미지 다운로드 실패 (status=%d): %s", resp.status, url)
+                    return None
+                data = await resp.read()
 
-        mime_type = _guess_mime_type(url)
-        part = types.Part.from_bytes(data=data, mime_type=mime_type)
-        logger.debug("이미지 다운로드 성공: %s (%d bytes)", url, len(data))
-        return article_key, part
-    except Exception as e:
-        logger.debug("이미지 다운로드 예외: %s - %s", url, e)
-        return None
+            mime_type = _guess_mime_type(url)
+            part = types.Part.from_bytes(data=data, mime_type=mime_type)
+            logger.debug("이미지 다운로드 성공: %s (%d bytes)", url, len(data))
+            return article_key, part
+        except Exception as e:
+            logger.debug("이미지 다운로드 예외: %s - %s", url, e)
+            return None
 
 
 async def _download_images(articles: list[Article]) -> dict[str, list[types.Part]]:
@@ -137,9 +139,11 @@ async def _download_images(articles: list[Article]) -> dict[str, list[types.Part
     if not tasks_info:
         return {}
 
+    semaphore = asyncio.Semaphore(MAX_CONCURRENT_IMAGE_DOWNLOADS)
+
     async with aiohttp.ClientSession() as session:
         results = await asyncio.gather(
-            *(_download_one_image(session, key, url) for key, url in tasks_info),
+            *(_download_one_image(session, key, url, semaphore) for key, url in tasks_info),
             return_exceptions=True,
         )
 
@@ -172,6 +176,26 @@ def _build_multimodal_contents(
     return contents
 
 
+def _parse_gemini_json(text: str) -> list[dict]:
+    """Gemini 응답에서 JSON을 추출하고 필수 필드를 검증"""
+    text = text.strip()
+    if text.startswith("```"):
+        text = text.split("\n", 1)[1].rsplit("```", 1)[0].strip()
+
+    results = json.loads(text)
+
+    if not isinstance(results, list):
+        raise ValueError(f"응답이 JSON 배열이 아닙니다: {type(results)}")
+
+    for r in results:
+        if not isinstance(r, dict):
+            raise ValueError(f"배열 원소가 객체가 아닙니다: {type(r)}")
+        if "index" not in r or "score" not in r:
+            raise ValueError(f"필수 필드(index, score) 누락: {r}")
+
+    return results
+
+
 @retry(
     retry=retry_if_exception_type(Exception),
     stop=stop_after_attempt(3),
@@ -184,14 +208,30 @@ def _call_gemini_api(client: genai.Client, model_name: str, contents: list | str
         model=model_name,
         contents=contents,
     )
-    text = response.text.strip()
-    if text.startswith("```"):
-        text = text.split("\n", 1)[1].rsplit("```", 1)[0].strip()
-    return json.loads(text)
+    return _parse_gemini_json(response.text)
+
+
+async def _analyze_batch(
+    client: genai.Client,
+    model_name: str,
+    articles: list[Article],
+    config: dict,
+) -> list[dict]:
+    """단일 배치의 공지를 분석"""
+    profile_text = build_profile_text(config)
+    prompt = build_prompt(articles, profile_text)
+
+    image_parts = await _download_images(articles)
+    if image_parts:
+        image_count = sum(len(parts) for parts in image_parts.values())
+        logger.info("이미지 %d장 다운로드 완료, 멀티모달 분석 진행", image_count)
+
+    contents = _build_multimodal_contents(prompt, articles, image_parts)
+    return await asyncio.to_thread(_call_gemini_api, client, model_name, contents)
 
 
 async def analyze_with_gemini(articles: list[Article], config: dict) -> list[dict]:
-    """Gemini API로 공지 관련도 분석 (이미지 포함 멀티모달). 실패 시 빈 리스트 반환."""
+    """Gemini API로 공지 관련도 분석 (배치 분할 + 이미지 포함 멀티모달). 실패 시 빈 리스트 반환."""
     api_key = os.environ.get("GEMINI_API_KEY", "")
     if not api_key:
         logger.warning("GEMINI_API_KEY가 설정되지 않았습니다. 키워드 매칭으로 대체됩니다.")
@@ -199,24 +239,27 @@ async def analyze_with_gemini(articles: list[Article], config: dict) -> list[dic
 
     client = genai.Client(api_key=api_key)
     model_name = config["gemini"]["model"]
-    profile_text = build_profile_text(config)
-    prompt = build_prompt(articles, profile_text)
 
-    # 이미지가 있는 공지의 이미지를 다운로드
-    image_parts = await _download_images(articles)
-    if image_parts:
-        image_count = sum(len(parts) for parts in image_parts.values())
-        logger.info("이미지 %d장 다운로드 완료, 멀티모달 분석 진행", image_count)
+    all_results: list[dict] = []
+    for batch_start in range(0, len(articles), GEMINI_BATCH_SIZE):
+        batch = articles[batch_start:batch_start + GEMINI_BATCH_SIZE]
+        try:
+            batch_results = await _analyze_batch(client, model_name, batch, config)
+            # 배치 내 index를 전체 index로 보정
+            for r in batch_results:
+                idx = _parse_index(r.get("index"))
+                if idx is not None:
+                    r["index"] = idx + batch_start
+            all_results.extend(batch_results)
+            logger.info("Gemini 배치 분석 완료: %d/%d건", batch_start + len(batch), len(articles))
+        except Exception as e:
+            logger.error(
+                "Gemini API 배치 호출 최종 실패 (offset=%d, 3회 시도): %s",
+                batch_start, e, exc_info=True,
+            )
+            return []
 
-    contents = _build_multimodal_contents(prompt, articles, image_parts)
-
-    try:
-        results = await asyncio.to_thread(_call_gemini_api, client, model_name, contents)
-        logger.info("Gemini 분석 완료: %d건", len(results))
-        return results
-    except Exception as e:
-        logger.error("Gemini API 호출 최종 실패 (3회 시도): %s", e)
-        return []
+    return all_results
 
 
 def keyword_fallback(articles: list[Article], config: dict) -> list[dict]:

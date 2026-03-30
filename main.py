@@ -55,6 +55,15 @@ def load_config() -> dict:
     config["profile"] = _load_json_env("PROFILE_JSON", config.get("profile", {}))
     config["keywords"] = _load_json_env("KEYWORDS_JSON", config.get("keywords", {}))
 
+    logger = logging.getLogger(__name__)
+    enabled_feeds = [n for n, fc in config["feeds"].items() if fc.get("enabled", True)]
+    logger.info(
+        "설정 로드 완료: 활성 피드 %d개, Gemini 모델: %s, 관련도 임계값: %d",
+        len(enabled_feeds),
+        config["gemini"]["model"],
+        config["gemini"].get("relevance_threshold", 3),
+    )
+
     return config
 
 
@@ -133,7 +142,7 @@ async def run() -> None:
     state = load_state(state_path)
     logger.info("기존 확인 공지: %d건", len(state.get("seen_ids", {})))
 
-    ssl_verify = config.get("settings", {}).get("ssl_verify", False)
+    ssl_verify = config.get("settings", {}).get("ssl_verify", True)
     if not ssl_verify:
         await check_ssl_health(config)
 

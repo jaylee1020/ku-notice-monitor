@@ -63,7 +63,7 @@ settings:
   state_file: "state.json"
   base_url: "https://www.konkuk.ac.kr"
   rss_url_template: "https://www.konkuk.ac.kr/bbs/konkuk/{board_id}/rssList.do"
-  # 건국대 서버 SSL 인증서 문제로 인해 기본값은 false입니다.
-  # 인증서 문제가 해결된 경우 true로 변경하면 보안이 강화됩니다.
+  # SSL 인증서 검증 (보안을 위해 기본 활성화)
+  # 건국대 서버 인증서 문제가 있을 경우 false로 변경하세요.
   # ssl_verify가 false인 경우, 매 실행 시 SSL 상태를 자동 점검하고 로그에 기록합니다.
-  ssl_verify: false
+  ssl_verify: true

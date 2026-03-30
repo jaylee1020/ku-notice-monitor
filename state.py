@@ -66,26 +66,20 @@ def save_state(state: dict, state_path: str) -> None:
     logger.debug("상태 저장 완료: %s", state_path)
 
 
+def migrate_legacy_ids(articles: list[Article], seen: dict[str, str]) -> None:
+    """구형 포맷(id 단독) → 신규 포맷(board_id:id)으로 마이그레이션"""
+    for article in articles:
+        if article.id in seen and article.key not in seen:
+            seen[article.key] = seen.pop(article.id)
+
+
 def filter_new_articles(articles: list[Article], state: dict) -> list[Article]:
     """이미 확인한 공지를 제외하고 새 공지만 반환"""
     seen = state.get("seen_ids", {})
-    new_articles: list[Article] = []
 
-    for article in articles:
-        key = article.key
+    migrate_legacy_ids(articles, seen)
 
-        if key in seen:
-            continue
-
-        # 구형 포맷(id 단독) → 신규 포맷(board_id:id)으로 마이그레이션
-        if article.id in seen:
-            seen[key] = seen[article.id]
-            seen.pop(article.id, None)
-            continue
-
-        new_articles.append(article)
-
-    return new_articles
+    return [a for a in articles if a.key not in seen]
 
 
 def mark_as_seen(articles: list[Article], state: dict) -> None:

@@ -9,6 +9,7 @@ from datetime import datetime
 import aiohttp
 import certifi
 import feedparser
+from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
 
 from constants import (
     ARTICLE_BODY_TIMEOUT,
@@ -92,6 +93,12 @@ def _parse_entry(entry, board_name: str, board_id: int, base_url: str) -> Articl
     )
 
 
+@retry(
+    retry=retry_if_exception_type((aiohttp.ClientError, asyncio.TimeoutError)),
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=1, min=2, max=10),
+    reraise=True,
+)
 async def _fetch_feed_async(
     session: aiohttp.ClientSession,
     board_name: str,
@@ -100,23 +107,19 @@ async def _fetch_feed_async(
     config: dict,
     ssl_context: ssl.SSLContext,
 ) -> list[Article]:
-    """단일 RSS 피드를 비동기로 수집하고 Article 리스트로 반환"""
+    """단일 RSS 피드를 비동기로 수집하고 Article 리스트로 반환 (최대 3회 재시도)"""
     base_url = config["settings"]["base_url"]
     url = feed_config.get("rss_url") or config["settings"]["rss_url_template"].format(board_id=board_id)
 
-    try:
-        async with session.get(url, ssl=ssl_context, timeout=aiohttp.ClientTimeout(total=FEED_FETCH_TIMEOUT)) as resp:
-            resp.raise_for_status()
-            xml_data = await resp.read()
+    async with session.get(url, ssl=ssl_context, timeout=aiohttp.ClientTimeout(total=FEED_FETCH_TIMEOUT)) as resp:
+        resp.raise_for_status()
+        xml_data = await resp.read()
 
-        if b"<rss" not in xml_data.lower():
-            logger.warning("RSS 형식이 아닌 응답 - %s (board_id=%d, url=%s)", board_name, board_id, url)
-            return []
-
-        feed = feedparser.parse(xml_data)
-    except Exception as e:
-        logger.error("피드 수집 실패 - %s (board_id=%d): %s", board_name, board_id, e)
+    if b"<rss" not in xml_data.lower():
+        logger.warning("RSS 형식이 아닌 응답 - %s (board_id=%d, url=%s)", board_name, board_id, url)
         return []
+
+    feed = feedparser.parse(xml_data)
 
     articles = [
         article
@@ -129,7 +132,7 @@ async def _fetch_feed_async(
 
 async def fetch_all_feeds(config: dict) -> list[Article]:
     """모든 활성화된 피드에서 게시물을 비동기로 병렬 수집"""
-    ssl_verify = config.get("settings", {}).get("ssl_verify", False)
+    ssl_verify = config.get("settings", {}).get("ssl_verify", True)
     if not ssl_verify:
         logger.warning("SSL 인증서 검증 비활성화 상태. ssl_verify: true로 변경하면 보안이 강화됩니다.")
     ssl_context = _make_ssl_context(ssl_verify)
@@ -145,7 +148,7 @@ async def fetch_all_feeds(config: dict) -> list[Article]:
     all_articles: list[Article] = []
     for result in results:
         if isinstance(result, Exception):
-            logger.error("피드 수집 중 예외 발생: %s", result)
+            logger.error("피드 수집 중 예외 발생: %s", result, exc_info=True)
         else:
             all_articles.extend(result)
 
@@ -202,7 +205,7 @@ async def enrich_articles_with_body(articles: list[Article], config: dict) -> No
     if not articles:
         return
 
-    ssl_verify = config.get("settings", {}).get("ssl_verify", False)
+    ssl_verify = config.get("settings", {}).get("ssl_verify", True)
     ssl_context = _make_ssl_context(ssl_verify)
     base_url = config["settings"]["base_url"]
 

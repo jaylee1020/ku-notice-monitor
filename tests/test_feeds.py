@@ -4,6 +4,8 @@ import json
 from datetime import datetime, timedelta
 from pathlib import Path
 
+import pytest
+
 from feeds import (
     _extract_image_urls,
     _to_int,
@@ -16,35 +18,31 @@ from state import (
     filter_new_articles,
     load_state,
     mark_as_seen,
+    migrate_legacy_ids,
     save_state,
 )
 
 # --- parse_pub_date ---
 
 
-def test_parse_pub_date_with_milliseconds():
-    result = parse_pub_date("2026-03-01 10:30:00.123")
-    assert result == datetime(2026, 3, 1, 10, 30, 0)
-
-
-def test_parse_pub_date_without_milliseconds():
-    result = parse_pub_date("2026-03-01 10:30:00")
-    assert result == datetime(2026, 3, 1, 10, 30, 0)
+@pytest.mark.parametrize("date_str,expected", [
+    ("2026-03-01 10:30:00.123", datetime(2026, 3, 1, 10, 30, 0)),
+    ("2026-03-01 10:30:00", datetime(2026, 3, 1, 10, 30, 0)),
+])
+def test_parse_pub_date(date_str, expected):
+    assert parse_pub_date(date_str) == expected
 
 
 # --- extract_article_id ---
 
 
-def test_extract_article_id_valid():
-    assert extract_article_id("/bbs/konkuk/234/1166860/artclView.do") == "1166860"
-
-
-def test_extract_article_id_different_board():
-    assert extract_article_id("/bbs/konkuk/999/1234567/artclView.do") == "1234567"
-
-
-def test_extract_article_id_invalid_returns_link():
-    assert extract_article_id("https://example.com/page") == "https://example.com/page"
+@pytest.mark.parametrize("link,expected", [
+    ("/bbs/konkuk/234/1166860/artclView.do", "1166860"),
+    ("/bbs/konkuk/999/1234567/artclView.do", "1234567"),
+    ("https://example.com/page", "https://example.com/page"),
+])
+def test_extract_article_id(link, expected):
+    assert extract_article_id(link) == expected
 
 
 # --- normalize_link ---
@@ -79,20 +77,14 @@ def test_is_empty_feed_item_false():
 # --- _to_int ---
 
 
-def test_to_int_valid():
-    assert _to_int("42") == 42
-
-
-def test_to_int_none():
-    assert _to_int(None) == 0
-
-
-def test_to_int_invalid_string():
-    assert _to_int("abc") == 0
-
-
-def test_to_int_custom_default():
-    assert _to_int("abc", default=-1) == -1
+@pytest.mark.parametrize("value,default,expected", [
+    ("42", 0, 42),
+    (None, 0, 0),
+    ("abc", 0, 0),
+    ("abc", -1, -1),
+])
+def test_to_int(value, default, expected):
+    assert _to_int(value, default) == expected
 
 
 # --- filter_new_articles ---
@@ -121,6 +113,24 @@ def test_mark_as_seen(make_article):
     mark_as_seen(articles, state)
     assert "234:10" in state["seen_ids"]
     assert "234:20" in state["seen_ids"]
+
+
+# --- migrate_legacy_ids ---
+
+
+def test_migrate_legacy_ids(make_article):
+    articles = [make_article(id="1", board_id=243)]
+    seen = {"1": "2026-01-01T00:00:00"}
+    migrate_legacy_ids(articles, seen)
+    assert "243:1" in seen
+    assert "1" not in seen
+
+
+def test_migrate_legacy_ids_skips_already_migrated(make_article):
+    articles = [make_article(id="1", board_id=243)]
+    seen = {"243:1": "2026-01-01T00:00:00"}
+    migrate_legacy_ids(articles, seen)
+    assert "243:1" in seen
 
 
 # --- load_state ---

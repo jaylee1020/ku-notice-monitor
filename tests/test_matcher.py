@@ -3,7 +3,16 @@
 import asyncio
 from unittest.mock import AsyncMock, patch
 
-from matcher import _guess_mime_type, build_profile_text, build_prompt, keyword_fallback, match_articles
+import pytest
+
+from matcher import (
+    _guess_mime_type,
+    _parse_gemini_json,
+    build_profile_text,
+    build_prompt,
+    keyword_fallback,
+    match_articles,
+)
 
 # --- build_profile_text ---
 
@@ -52,20 +61,45 @@ def test_build_prompt_without_images(make_article):
 # --- _guess_mime_type ---
 
 
-def test_guess_mime_type_jpeg():
-    assert _guess_mime_type("https://example.com/photo.jpg") == "image/jpeg"
+@pytest.mark.parametrize("url,expected", [
+    ("https://example.com/photo.jpg", "image/jpeg"),
+    ("https://example.com/photo.png", "image/png"),
+    ("https://example.com/image", "image/jpeg"),
+    ("https://example.com/photo.png?w=100", "image/png"),
+])
+def test_guess_mime_type(url, expected):
+    assert _guess_mime_type(url) == expected
 
 
-def test_guess_mime_type_png():
-    assert _guess_mime_type("https://example.com/photo.png") == "image/png"
+# --- _parse_gemini_json ---
 
 
-def test_guess_mime_type_unknown_defaults_jpeg():
-    assert _guess_mime_type("https://example.com/image") == "image/jpeg"
+def test_parse_gemini_json_clean():
+    text = '[{"index": 1, "score": 5, "reason": "test"}]'
+    result = _parse_gemini_json(text)
+    assert len(result) == 1
+    assert result[0]["score"] == 5
 
 
-def test_guess_mime_type_with_query_params():
-    assert _guess_mime_type("https://example.com/photo.png?w=100") == "image/png"
+def test_parse_gemini_json_with_code_fence():
+    text = '```json\n[{"index": 1, "score": 3, "reason": "test"}]\n```'
+    result = _parse_gemini_json(text)
+    assert len(result) == 1
+
+
+def test_parse_gemini_json_not_array():
+    with pytest.raises(ValueError, match="JSON 배열"):
+        _parse_gemini_json('{"index": 1}')
+
+
+def test_parse_gemini_json_missing_fields():
+    with pytest.raises(ValueError, match="필수 필드"):
+        _parse_gemini_json('[{"index": 1}]')
+
+
+def test_parse_gemini_json_invalid_json():
+    with pytest.raises(Exception):
+        _parse_gemini_json("not json at all")
 
 
 # --- keyword_fallback ---
