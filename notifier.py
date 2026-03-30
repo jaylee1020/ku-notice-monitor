@@ -27,6 +27,9 @@ def build_relevant_message(
             f"→ {reason}\n"
             f"{article.link}"
         )
+        if article.attachments:
+            filenames = ", ".join(att.filename for att in article.attachments)
+            item += f"\n📎 {filenames}"
         items.append(item)
 
     return header + "\n".join(items)

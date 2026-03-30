@@ -20,6 +20,21 @@ def test_build_relevant_message(make_article):
     assert "10" in msg
 
 
+def test_build_relevant_message_with_attachments(make_article):
+    from models import Attachment
+
+    att1 = Attachment(filename="안내문.hwp", url="https://example.com/1/download.do")
+    att2 = Attachment(filename="양식.pdf", url="https://example.com/2/download.do")
+    matched = [(
+        make_article(title="장학금", board_name="장학공지", link="https://example.com", attachments=[att1, att2]),
+        5,
+        "장학 관련",
+    )]
+    msg = build_relevant_message(matched, 5)
+    assert "안내문.hwp" in msg
+    assert "양식.pdf" in msg
+
+
 # --- build_no_new_message ---
 
 

@@ -18,7 +18,7 @@ for mod_name in [
     if mod_name not in sys.modules:
         sys.modules[mod_name] = MagicMock()
 
-from models import Article  # noqa: E402
+from models import Article, Attachment  # noqa: E402
 
 
 @pytest.fixture
@@ -40,4 +40,12 @@ def make_article():
         )
         defaults.update(overrides)
         return Article(**defaults)
+    return _make
+
+
+@pytest.fixture
+def make_attachment():
+    """Attachment 팩토리 픽스처."""
+    def _make(filename: str = "test.pdf", url: str = "https://example.com/download.do") -> Attachment:
+        return Attachment(filename=filename, url=url)
     return _make

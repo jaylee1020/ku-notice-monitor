@@ -6,6 +6,7 @@ from unittest.mock import AsyncMock, patch
 import pytest
 
 from matcher import (
+    _guess_attachment_mime_type,
     _guess_mime_type,
     _parse_gemini_json,
     build_profile_text,
@@ -13,6 +14,7 @@ from matcher import (
     keyword_fallback,
     match_articles,
 )
+from models import Attachment
 
 # --- build_profile_text ---
 
@@ -48,14 +50,35 @@ def test_build_prompt_contains_articles(make_article):
 def test_build_prompt_with_images(make_article):
     articles = [make_article(title="포스터 공지", images=["https://example.com/img.jpg"])]
     prompt = build_prompt(articles, "테스트 프로필")
-    assert "이미지 1장 첨부" in prompt
-    assert "이미지의 내용도 함께 분석" in prompt
+    assert "이미지 1장" in prompt
+    assert "첨부된 파일의 내용도 함께 분석" in prompt
 
 
-def test_build_prompt_without_images(make_article):
+def test_build_prompt_without_media(make_article):
     articles = [make_article(title="텍스트 공지")]
     prompt = build_prompt(articles, "테스트 프로필")
     assert "이미지" not in prompt
+    assert "첨부파일" not in prompt
+
+
+def test_build_prompt_with_attachments(make_article):
+    att = Attachment(filename="장학금안내.hwp", url="https://example.com/download.do")
+    articles = [make_article(title="장학금 공지", attachments=[att])]
+    prompt = build_prompt(articles, "테스트 프로필")
+    assert "장학금안내.hwp" in prompt
+    assert "첨부된 파일의 내용도 함께 분석" in prompt
+
+
+def test_build_prompt_with_images_and_attachments(make_article):
+    att = Attachment(filename="양식.pdf", url="https://example.com/download.do")
+    articles = [make_article(
+        title="공지",
+        images=["https://example.com/img.jpg"],
+        attachments=[att],
+    )]
+    prompt = build_prompt(articles, "테스트 프로필")
+    assert "이미지 1장" in prompt
+    assert "양식.pdf" in prompt
 
 
 # --- _guess_mime_type ---
@@ -125,6 +148,28 @@ def test_keyword_fallback_no_match(make_article):
     config = {"keywords": {"high": ["장학"], "medium": ["취업"]}}
     results = keyword_fallback(articles, config)
     assert results[0]["score"] == 1
+
+
+def test_keyword_fallback_matches_attachment_filename(make_article):
+    att = Attachment(filename="장학금신청양식.hwp", url="https://example.com/download.do")
+    articles = [make_article(title="서류 제출 안내", attachments=[att])]
+    config = {"keywords": {"high": ["장학"], "medium": []}}
+    results = keyword_fallback(articles, config)
+    assert results[0]["score"] == 4
+    assert "장학" in results[0]["reason"]
+
+
+# --- _guess_attachment_mime_type ---
+
+
+@pytest.mark.parametrize("filename,expected", [
+    ("file.pdf", "application/pdf"),
+    ("file.hwp", "application/octet-stream"),
+    ("file.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"),
+    ("file.jpg", "image/jpeg"),
+])
+def test_guess_attachment_mime_type(filename, expected):
+    assert _guess_attachment_mime_type(filename) == expected
 
 
 # --- match_articles ---

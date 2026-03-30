@@ -4,6 +4,18 @@ from dataclasses import dataclass, field
 
 
 @dataclass
+class Attachment:
+    filename: str
+    url: str
+
+    @property
+    def ext(self) -> str:
+        """파일 확장자 (소문자, 점 포함). 예: '.hwp', '.pdf'"""
+        dot = self.filename.rfind(".")
+        return self.filename[dot:].lower() if dot != -1 else ""
+
+
+@dataclass
 class Article:
     id: str
     title: str
@@ -17,6 +29,7 @@ class Article:
     is_pinned: bool
     attachment_count: int
     images: list[str] = field(default_factory=list)
+    attachments: list[Attachment] = field(default_factory=list)
 
     @property
     def key(self) -> str:

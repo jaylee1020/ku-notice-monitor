@@ -19,7 +19,7 @@ from constants import (
     MAX_ARTICLE_BODY_LENGTH,
     MAX_IMAGES_PER_ARTICLE,
 )
-from models import Article
+from models import Article, Attachment
 
 logger = logging.getLogger(__name__)
 
@@ -170,13 +170,37 @@ def _extract_image_urls(content_div, base_url: str) -> list[str]:
     return image_urls
 
 
+def _extract_attachments(soup, base_url: str) -> list[Attachment]:
+    """페이지에서 첨부파일 목록을 추출"""
+    attachments: list[Attachment] = []
+
+    # div.attachments 내부의 다운로드 링크를 탐색
+    attach_div = soup.find("div", class_="attachments")
+    if not attach_div:
+        return attachments
+
+    for a_tag in attach_div.find_all("a", href=True):
+        href = a_tag["href"]
+        if "/download.do" not in href:
+            continue
+
+        filename = a_tag.get_text(strip=True)
+        if not filename:
+            continue
+
+        url = href if href.startswith("http") else base_url + href
+        attachments.append(Attachment(filename=filename, url=url))
+
+    return attachments
+
+
 async def _fetch_article_body_async(
     session: aiohttp.ClientSession,
     url: str,
     ssl_context: ssl.SSLContext,
     base_url: str,
-) -> tuple[str, list[str]]:
-    """게시물 웹페이지에서 본문 텍스트와 이미지 URL을 비동기로 크롤링"""
+) -> tuple[str, list[str], list[Attachment]]:
+    """게시물 웹페이지에서 본문 텍스트, 이미지 URL, 첨부파일 정보를 비동기로 크롤링"""
     from bs4 import BeautifulSoup
 
     try:
@@ -185,23 +209,28 @@ async def _fetch_article_body_async(
             html = await resp.text(encoding="utf-8", errors="replace")
 
         soup = BeautifulSoup(html, "lxml")
+
+        # 첨부파일 추출
+        attachments = _extract_attachments(soup, base_url)
+
+        # 본문 추출
         content_div = soup.find("div", class_=BOARD_CONTENT_CLASS)
         if not content_div:
-            return "", []
+            return "", [], attachments
 
         text = content_div.get_text(separator=" ", strip=True)
         text = re.sub(r"\s+", " ", text).strip()
 
         image_urls = _extract_image_urls(content_div, base_url)
 
-        return text[:MAX_ARTICLE_BODY_LENGTH], image_urls
+        return text[:MAX_ARTICLE_BODY_LENGTH], image_urls, attachments
     except Exception as e:
         logger.warning("본문 크롤링 실패 - %s: %s", url, e)
-        return "", []
+        return "", [], []
 
 
 async def enrich_articles_with_body(articles: list[Article], config: dict) -> None:
-    """새 공지들의 본문과 이미지를 비동기 병렬로 크롤링하여 Article에 추가"""
+    """새 공지들의 본문, 이미지, 첨부파일을 비동기 병렬로 크롤링하여 Article에 추가"""
     if not articles:
         return
 
@@ -222,11 +251,19 @@ async def enrich_articles_with_body(articles: list[Article], config: dict) -> No
         if isinstance(result, Exception):
             logger.warning("본문 크롤링 예외 - %s: %s", article.link, result)
         else:
-            body, image_urls = result
+            body, image_urls, attachments = result
             if body:
                 article.description = body
             if image_urls:
                 article.images = image_urls
+            if attachments:
+                article.attachments = attachments
+                logger.debug(
+                    "첨부파일 %d건 발견 - %s: %s",
+                    len(attachments),
+                    article.title,
+                    ", ".join(att.filename for att in attachments),
+                )
 
 
 async def check_ssl_health(config: dict) -> bool:

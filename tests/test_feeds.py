@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 
 from feeds import (
+    _extract_attachments,
     _extract_image_urls,
     _to_int,
     extract_article_id,
@@ -225,6 +226,70 @@ def test_extract_image_urls_skips_empty_src():
     div = BeautifulSoup(html, "html.parser").find("div")
     urls = _extract_image_urls(div, "https://www.konkuk.ac.kr")
     assert urls == ["https://example.com/valid.jpg"]
+
+
+# --- _extract_attachments ---
+
+
+def test_extract_attachments_basic():
+    from bs4 import BeautifulSoup
+
+    html = """
+    <div class="attachments">
+      <ul>
+        <li><a href="/bbs/konkuk/234/1209265/download.do">안내문.hwp</a> 미리보기</li>
+        <li><a href="/bbs/konkuk/234/1209266/download.do">양식.pdf</a> 미리보기</li>
+      </ul>
+    </div>
+    """
+    soup = BeautifulSoup(html, "html.parser")
+    attachments = _extract_attachments(soup, "https://www.konkuk.ac.kr")
+    assert len(attachments) == 2
+    assert attachments[0].filename == "안내문.hwp"
+    assert attachments[0].url == "https://www.konkuk.ac.kr/bbs/konkuk/234/1209265/download.do"
+    assert attachments[1].filename == "양식.pdf"
+
+
+def test_extract_attachments_no_section():
+    from bs4 import BeautifulSoup
+
+    html = "<div><p>첨부파일 없음</p></div>"
+    soup = BeautifulSoup(html, "html.parser")
+    attachments = _extract_attachments(soup, "https://www.konkuk.ac.kr")
+    assert attachments == []
+
+
+def test_extract_attachments_skips_non_download_links():
+    from bs4 import BeautifulSoup
+
+    html = """
+    <div class="attachments">
+      <ul>
+        <li><a href="/bbs/konkuk/234/1209265/download.do">파일.pdf</a></li>
+        <li><a href="https://example.com/other">기타 링크</a></li>
+      </ul>
+    </div>
+    """
+    soup = BeautifulSoup(html, "html.parser")
+    attachments = _extract_attachments(soup, "https://www.konkuk.ac.kr")
+    assert len(attachments) == 1
+    assert attachments[0].filename == "파일.pdf"
+
+
+def test_extract_attachments_absolute_url():
+    from bs4 import BeautifulSoup
+
+    html = """
+    <div class="attachments">
+      <ul>
+        <li><a href="https://www.konkuk.ac.kr/bbs/konkuk/234/123/download.do">파일.xlsx</a></li>
+      </ul>
+    </div>
+    """
+    soup = BeautifulSoup(html, "html.parser")
+    attachments = _extract_attachments(soup, "https://www.konkuk.ac.kr")
+    assert len(attachments) == 1
+    assert attachments[0].url == "https://www.konkuk.ac.kr/bbs/konkuk/234/123/download.do"
 
 
 def test_filter_new_articles_migrates_legacy_id_key(make_article):

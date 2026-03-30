@@ -1,4 +1,4 @@
-"""Gemini API 기반 공지 관련도 분석 모듈 (텍스트 + 이미지 멀티모달)"""
+"""Gemini API 기반 공지 관련도 분석 모듈 (텍스트 + 이미지 + 첨부파일 멀티모달)"""
 
 import asyncio
 import json
@@ -11,8 +11,16 @@ from google import genai
 from google.genai import types
 from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
 
-from constants import GEMINI_BATCH_SIZE, IMAGE_DOWNLOAD_TIMEOUT, MAX_CONCURRENT_IMAGE_DOWNLOADS
-from models import Article
+from constants import (
+    ATTACHMENT_DOWNLOAD_TIMEOUT,
+    GEMINI_BATCH_SIZE,
+    GEMINI_NATIVE_EXTENSIONS,
+    IMAGE_DOWNLOAD_TIMEOUT,
+    MAX_ATTACHMENT_SIZE,
+    MAX_CONCURRENT_ATTACHMENT_DOWNLOADS,
+    MAX_CONCURRENT_IMAGE_DOWNLOADS,
+)
+from models import Article, Attachment
 
 logger = logging.getLogger(__name__)
 
@@ -62,17 +70,24 @@ def build_profile_text(config: dict) -> str:
 def build_prompt(articles: list[Article], profile_text: str) -> str:
     """Gemini에게 보낼 배치 프롬프트 생성"""
     article_list = ""
-    has_images = any(a.images for a in articles)
+    has_media = any(a.images or a.attachments for a in articles)
     for i, a in enumerate(articles, 1):
         desc = a.description[:300] if a.description else "설명 없음"
-        image_note = f" (이미지 {len(a.images)}장 첨부)" if a.images else ""
-        article_list += f"{i}. [{a.board_name}] {a.title} - {desc}{image_note}\n"
+        notes: list[str] = []
+        if a.images:
+            notes.append(f"이미지 {len(a.images)}장")
+        if a.attachments:
+            filenames = ", ".join(att.filename for att in a.attachments)
+            notes.append(f"첨부파일: {filenames}")
+        note_str = f" ({'; '.join(notes)})" if notes else ""
+        article_list += f"{i}. [{a.board_name}] {a.title} - {desc}{note_str}\n"
 
-    image_instruction = ""
-    if has_images:
-        image_instruction = (
-            "\n일부 공지에는 이미지가 첨부되어 있습니다. "
-            "이미지의 내용도 함께 분석하여 관련도를 평가해주세요.\n"
+    media_instruction = ""
+    if has_media:
+        media_instruction = (
+            "\n일부 공지에는 이미지나 첨부파일(PDF 등)이 포함되어 있습니다. "
+            "첨부된 파일의 내용도 함께 분석하여 관련도를 평가해주세요. "
+            "첨부파일명 자체도 중요한 단서입니다 (예: '장학금신청양식.hwp'는 장학 관련 공지).\n"
         )
 
     return f"""당신은 한국 대학생을 위한 공지사항 관련도 분류기입니다.
@@ -86,7 +101,7 @@ def build_prompt(articles: list[Article], profile_text: str) -> str:
 - 3점: 관련 있을 수 있음 (일반 학생에게 유용한 정보)
 - 2점: 낮은 관련도 (특정 대상만 해당)
 - 1점: 관련 없음
-{image_instruction}
+{media_instruction}
 반드시 아래 JSON 형식으로만 응답해주세요. 다른 텍스트는 포함하지 마세요:
 [{{"index": 1, "score": 5, "reason": "사유"}}, ...]
 
@@ -100,6 +115,12 @@ def _guess_mime_type(url: str) -> str:
     if mime and mime.startswith("image/"):
         return mime
     return "image/jpeg"
+
+
+def _guess_attachment_mime_type(filename: str) -> str:
+    """첨부파일명에서 MIME 타입을 추측"""
+    mime, _ = mimetypes.guess_type(filename)
+    return mime or "application/octet-stream"
 
 
 async def _download_one_image(
@@ -157,21 +178,97 @@ async def _download_images(articles: list[Article]) -> dict[str, list[types.Part
     return image_parts
 
 
+async def _download_one_attachment(
+    session: aiohttp.ClientSession,
+    article_key: str,
+    attachment: Attachment,
+    semaphore: asyncio.Semaphore,
+) -> tuple[str, Attachment, bytes] | None:
+    """Gemini 지원 첨부파일을 다운로드. 실패 시 None."""
+    if attachment.ext not in GEMINI_NATIVE_EXTENSIONS:
+        return None
+
+    async with semaphore:
+        try:
+            async with session.get(
+                attachment.url,
+                timeout=aiohttp.ClientTimeout(total=ATTACHMENT_DOWNLOAD_TIMEOUT),
+            ) as resp:
+                if resp.status != 200:
+                    logger.debug("첨부파일 다운로드 실패 (status=%d): %s", resp.status, attachment.filename)
+                    return None
+
+                content_length = resp.headers.get("Content-Length")
+                if content_length and int(content_length) > MAX_ATTACHMENT_SIZE:
+                    logger.debug("첨부파일 크기 초과 (%s bytes): %s", content_length, attachment.filename)
+                    return None
+
+                data = await resp.read()
+                if len(data) > MAX_ATTACHMENT_SIZE:
+                    logger.debug("첨부파일 크기 초과 (%d bytes): %s", len(data), attachment.filename)
+                    return None
+
+            logger.debug("첨부파일 다운로드 성공: %s (%d bytes)", attachment.filename, len(data))
+            return article_key, attachment, data
+        except Exception as e:
+            logger.debug("첨부파일 다운로드 예외: %s - %s", attachment.filename, e)
+            return None
+
+
+async def _download_attachments(articles: list[Article]) -> dict[str, list[types.Part]]:
+    """공지별 첨부파일(PDF, 이미지)을 병렬 다운로드하여 Gemini Part 객체로 변환"""
+    tasks_info: list[tuple[str, Attachment]] = []
+    for a in articles:
+        for att in a.attachments:
+            if att.ext in GEMINI_NATIVE_EXTENSIONS:
+                tasks_info.append((a.key, att))
+
+    if not tasks_info:
+        return {}
+
+    semaphore = asyncio.Semaphore(MAX_CONCURRENT_ATTACHMENT_DOWNLOADS)
+
+    async with aiohttp.ClientSession() as session:
+        results = await asyncio.gather(
+            *(
+                _download_one_attachment(session, key, att, semaphore)
+                for key, att in tasks_info
+            ),
+            return_exceptions=True,
+        )
+
+    attachment_parts: dict[str, list[types.Part]] = {}
+    for result in results:
+        if isinstance(result, Exception) or result is None:
+            continue
+        article_key, att, data = result
+        mime_type = _guess_attachment_mime_type(att.filename)
+        part = types.Part.from_bytes(data=data, mime_type=mime_type)
+        attachment_parts.setdefault(article_key, []).append(part)
+
+    return attachment_parts
+
+
 def _build_multimodal_contents(
     prompt: str,
     articles: list[Article],
     image_parts: dict[str, list[types.Part]],
+    attachment_parts: dict[str, list[types.Part]],
 ) -> list:
-    """텍스트 프롬프트와 이미지를 결합하여 멀티모달 contents 생성"""
-    if not image_parts:
+    """텍스트 프롬프트와 이미지/첨부파일을 결합하여 멀티모달 contents 생성"""
+    if not image_parts and not attachment_parts:
         return [prompt]
 
     contents: list = [prompt]
     for i, a in enumerate(articles, 1):
-        parts = image_parts.get(a.key, [])
-        if parts:
+        imgs = image_parts.get(a.key, [])
+        atts = attachment_parts.get(a.key, [])
+        if imgs:
             contents.append(types.Part.from_text(text=f"\n--- 공지 {i}번 첨부 이미지 ---"))
-            contents.extend(parts)
+            contents.extend(imgs)
+        if atts:
+            contents.append(types.Part.from_text(text=f"\n--- 공지 {i}번 첨부파일 ---"))
+            contents.extend(atts)
 
     return contents
 
@@ -217,21 +314,29 @@ async def _analyze_batch(
     articles: list[Article],
     config: dict,
 ) -> list[dict]:
-    """단일 배치의 공지를 분석"""
+    """단일 배치의 공지를 분석 (이미지 + 첨부파일 포함)"""
     profile_text = build_profile_text(config)
     prompt = build_prompt(articles, profile_text)
 
-    image_parts = await _download_images(articles)
+    # 이미지와 첨부파일을 병렬 다운로드
+    image_parts, attachment_parts = await asyncio.gather(
+        _download_images(articles),
+        _download_attachments(articles),
+    )
+
     if image_parts:
         image_count = sum(len(parts) for parts in image_parts.values())
-        logger.info("이미지 %d장 다운로드 완료, 멀티모달 분석 진행", image_count)
+        logger.info("이미지 %d장 다운로드 완료", image_count)
+    if attachment_parts:
+        att_count = sum(len(parts) for parts in attachment_parts.values())
+        logger.info("첨부파일 %d건 다운로드 완료, 멀티모달 분석 진행", att_count)
 
-    contents = _build_multimodal_contents(prompt, articles, image_parts)
+    contents = _build_multimodal_contents(prompt, articles, image_parts, attachment_parts)
     return await asyncio.to_thread(_call_gemini_api, client, model_name, contents)
 
 
 async def analyze_with_gemini(articles: list[Article], config: dict) -> list[dict]:
-    """Gemini API로 공지 관련도 분석 (배치 분할 + 이미지 포함 멀티모달). 실패 시 빈 리스트 반환."""
+    """Gemini API로 공지 관련도 분석 (배치 분할 + 이미지/첨부파일 포함 멀티모달). 실패 시 빈 리스트 반환."""
     api_key = os.environ.get("GEMINI_API_KEY", "")
     if not api_key:
         logger.warning("GEMINI_API_KEY가 설정되지 않았습니다. 키워드 매칭으로 대체됩니다.")
@@ -263,14 +368,16 @@ async def analyze_with_gemini(articles: list[Article], config: dict) -> list[dic
 
 
 def keyword_fallback(articles: list[Article], config: dict) -> list[dict]:
-    """Gemini 실패 시 키워드 매칭으로 폴백"""
+    """Gemini 실패 시 키워드 매칭으로 폴백 (첨부파일명도 포함)"""
     keywords = config.get("keywords", {})
     high_keywords: list[str] = keywords.get("high", [])
     medium_keywords: list[str] = keywords.get("medium", [])
 
     results: list[dict] = []
     for i, a in enumerate(articles, 1):
-        text = (a.title + " " + a.description).lower()
+        # 본문 + 첨부파일명을 합쳐서 키워드 매칭
+        attachment_names = " ".join(att.filename for att in a.attachments)
+        text = (a.title + " " + a.description + " " + attachment_names).lower()
         score = 1
         reason = "키워드 매칭 없음"
 
