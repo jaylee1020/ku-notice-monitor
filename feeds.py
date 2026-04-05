@@ -18,6 +18,7 @@ from constants import (
     FEED_FETCH_TIMEOUT,
     MAX_ARTICLE_BODY_LENGTH,
     MAX_IMAGES_PER_ARTICLE,
+    MIN_IMAGE_URL_LENGTH,
 )
 from models import Article, Attachment
 
@@ -39,6 +40,18 @@ def parse_pub_date(date_str: str) -> datetime:
     """건국대 RSS의 비표준 날짜 포맷 파싱: 'YYYY-MM-DD HH:MM:SS.mmm'"""
     base = date_str.split(".")[0]
     return datetime.strptime(base, "%Y-%m-%d %H:%M:%S")
+
+
+def _safe_pub_date_string(entry) -> str:
+    """RSS 엔트리에서 pub_date 문자열을 안전하게 추출. 파싱 실패해도 원문은 보존."""
+    raw = entry.get("pubdate") or entry.get("published") or ""
+    if not raw:
+        return ""
+    try:
+        parse_pub_date(raw)
+    except (ValueError, TypeError):
+        logger.debug("pub_date 파싱 실패(원문 유지): %r", raw)
+    return raw
 
 
 def extract_article_id(link: str) -> str:
@@ -70,6 +83,54 @@ def _to_int(value, default: int = 0) -> int:
         return default
 
 
+def _strip_html(html: str) -> str:
+    """HTML 태그 제거 후 공백 정규화 (BeautifulSoup 없이 간단 처리)"""
+    if not html:
+        return ""
+    text = re.sub(r"<[^>]+>", " ", html)
+    text = re.sub(r"&nbsp;", " ", text)
+    text = re.sub(r"&amp;", "&", text)
+    text = re.sub(r"&lt;", "<", text)
+    text = re.sub(r"&gt;", ">", text)
+    text = re.sub(r"&quot;", '"', text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+
+def _extract_rss_content(entry) -> str:
+    """RSS 엔트리에서 가장 풍부한 본문 텍스트를 선택.
+
+    우선순위: content:encoded → summary_detail → description → summary.
+    feedparser는 <content:encoded>를 entry.content[0].value로, <description>을
+    entry.description으로 노출한다. 이 중 가장 긴 값을 HTML 제거 후 반환한다.
+    """
+    candidates: list[str] = []
+
+    content_list = entry.get("content")
+    if isinstance(content_list, list):
+        for item in content_list:
+            if isinstance(item, dict):
+                val = item.get("value") or ""
+                if val:
+                    candidates.append(val)
+
+    for key in ("summary_detail", "description", "summary"):
+        val = entry.get(key)
+        if isinstance(val, dict):
+            val = val.get("value", "")
+        if isinstance(val, str) and val:
+            candidates.append(val)
+
+    if not candidates:
+        return ""
+
+    stripped = [_strip_html(c) for c in candidates]
+    stripped = [s for s in stripped if s]
+    if not stripped:
+        return ""
+    return max(stripped, key=len)
+
+
 def _parse_entry(entry, board_name: str, board_id: int, base_url: str) -> Article | None:
     """RSS 엔트리를 Article 객체로 변환. 빈 피드 항목이면 None 반환."""
     if is_empty_feed_item(entry):
@@ -82,9 +143,9 @@ def _parse_entry(entry, board_name: str, board_id: int, base_url: str) -> Articl
         id=article_id,
         title=entry.get("title", "").strip(),
         link=link,
-        pub_date=entry.get("pubdate", entry.get("published", "")),
+        pub_date=_safe_pub_date_string(entry),
         author=entry.get("author", ""),
-        description=entry.get("description", "").strip(),
+        description=_extract_rss_content(entry),
         board_name=board_name,
         board_id=board_id,
         view_count=_to_int(entry.get("viewco", 0) or 0),
@@ -155,18 +216,76 @@ async def fetch_all_feeds(config: dict) -> list[Article]:
     return all_articles
 
 
-def _extract_image_urls(content_div, base_url: str) -> list[str]:
-    """콘텐츠 div에서 이미지 URL을 추출 (최대 MAX_IMAGES_PER_ARTICLE개)"""
+_TRACKING_IMAGE_PATTERNS = re.compile(
+    r"(?:^|[/_-])(spacer|blank|pixel|tracker|1x1|clear|bullet|icon|btn|button|arrow)\b",
+    re.IGNORECASE,
+)
+
+
+def _candidate_image_urls(img_tag) -> list[str]:
+    """img 태그에서 모든 src 후보를 수집 (lazy-load, srcset 포함)"""
+    candidates: list[str] = []
+
+    for attr in ("src", "data-src", "data-original", "data-lazy-src", "data-echo"):
+        val = img_tag.get(attr, "")
+        if val:
+            candidates.append(val)
+
+    srcset = img_tag.get("srcset", "")
+    if srcset:
+        for entry in srcset.split(","):
+            url = entry.strip().split(" ")[0]
+            if url:
+                candidates.append(url)
+
+    return candidates
+
+
+def _is_valid_content_image(url: str) -> bool:
+    """트래킹 픽셀/UI 아이콘 후보를 배제"""
+    if len(url) < MIN_IMAGE_URL_LENGTH:
+        return False
+    lower = url.lower()
+    if lower.endswith(".svg"):
+        return False  # Gemini 미지원
+    if _TRACKING_IMAGE_PATTERNS.search(lower):
+        return False
+    return True
+
+
+def _extract_image_urls(content_div, base_url: str, soup=None) -> list[str]:
+    """콘텐츠 div에서 이미지 URL을 추출 (lazy-load/srcset/og:image 포함, 트래킹 필터 적용)"""
     image_urls: list[str] = []
+    seen: set[str] = set()
+
+    def add(url: str) -> None:
+        if not url:
+            return
+        resolved = normalize_link(url, base_url) if url.startswith("/") else url
+        if not resolved.startswith("http"):
+            return
+        if not _is_valid_content_image(resolved):
+            return
+        if resolved in seen:
+            return
+        seen.add(resolved)
+        image_urls.append(resolved)
+
     for img in content_div.find_all("img"):
-        src = img.get("src", "")
-        if not src:
-            continue
-        url = normalize_link(src, base_url) if src.startswith("/") else src
-        if url.startswith("http"):
-            image_urls.append(url)
-        if len(image_urls) >= MAX_IMAGES_PER_ARTICLE:
-            break
+        for candidate in _candidate_image_urls(img):
+            add(candidate)
+            if len(image_urls) >= MAX_IMAGES_PER_ARTICLE:
+                return image_urls
+
+    # 본문에 이미지가 부족하면 og:image 메타 태그를 폴백으로 사용
+    if soup is not None and len(image_urls) < MAX_IMAGES_PER_ARTICLE:
+        for meta in soup.find_all("meta"):
+            prop = (meta.get("property") or meta.get("name") or "").lower()
+            if prop in ("og:image", "twitter:image"):
+                add(meta.get("content", ""))
+                if len(image_urls) >= MAX_IMAGES_PER_ARTICLE:
+                    break
+
     return image_urls
 
 
@@ -221,7 +340,7 @@ async def _fetch_article_body_async(
         text = content_div.get_text(separator=" ", strip=True)
         text = re.sub(r"\s+", " ", text).strip()
 
-        image_urls = _extract_image_urls(content_div, base_url)
+        image_urls = _extract_image_urls(content_div, base_url, soup=soup)
 
         return text[:MAX_ARTICLE_BODY_LENGTH], image_urls, attachments
     except Exception as e:
@@ -250,20 +369,29 @@ async def enrich_articles_with_body(articles: list[Article], config: dict) -> No
     for article, result in zip(link_articles, results):
         if isinstance(result, Exception):
             logger.warning("본문 크롤링 예외 - %s: %s", article.link, result)
-        else:
-            body, image_urls, attachments = result
-            if body:
-                article.description = body
-            if image_urls:
-                article.images = image_urls
-            if attachments:
-                article.attachments = attachments
-                logger.debug(
-                    "첨부파일 %d건 발견 - %s: %s",
-                    len(attachments),
-                    article.title,
-                    ", ".join(att.filename for att in attachments),
-                )
+            continue
+        body, image_urls, attachments = result
+
+        # RSS description과 크롤된 body 중 더 긴 쪽을 채택 (둘 다 유효하면 병합)
+        rss_body = article.description or ""
+        if body and rss_body and body != rss_body:
+            # 중복이 아니고 둘 다 의미 있는 길이면 결합 (RSS 먼저 - 공식 요약 성격)
+            combined = f"{rss_body}\n{body}" if rss_body not in body else body
+            article.description = combined[:MAX_ARTICLE_BODY_LENGTH]
+        elif body and not rss_body:
+            article.description = body[:MAX_ARTICLE_BODY_LENGTH]
+        # else: 크롤 실패 또는 동일 → RSS description 유지
+
+        if image_urls:
+            article.images = image_urls
+        if attachments:
+            article.attachments = attachments
+            logger.debug(
+                "첨부파일 %d건 발견 - %s: %s",
+                len(attachments),
+                article.title,
+                ", ".join(att.filename for att in attachments),
+            )
 
 
 async def check_ssl_health(config: dict) -> bool:

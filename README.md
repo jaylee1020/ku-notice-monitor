@@ -96,9 +96,10 @@ gemini:
   model: "gemini-flash-latest"
   relevance_threshold: 3
 
-# SSL 인증서 검증 (건국대 서버 인증서 문제로 기본값 false)
+# SSL 인증서 검증 (보안을 위해 기본 활성화)
+# 건국대 서버 인증서 문제가 있을 경우에만 false로 변경
 settings:
-  ssl_verify: false
+  ssl_verify: true
 ```
 
 ## 프로젝트 구조
@@ -133,5 +134,6 @@ ku-notice-monitor/
 - 실패 시 텔레그램으로 Actions 로그 링크가 자동 전송됩니다.
 
 ### SSL 오류가 발생해요
-- 건국대 서버 인증서 문제로 `ssl_verify: false`가 기본값입니다.
-- 인증서 문제가 해결된 경우 `config.yaml`에서 `ssl_verify: true`로 변경하면 보안이 강화됩니다.
+- 기본값은 `ssl_verify: true`(보안 권장)입니다.
+- 건국대 서버 인증서 체인 문제로 실패할 경우에만 `config.yaml`에서 `ssl_verify: false`로 일시 전환하세요.
+- `ssl_verify: false`로 운영 중이면 매 실행마다 `check_ssl_health()`가 현재 인증서 상태를 점검하고 로그에 기록하므로, 문제가 해결되면 다시 `true`로 되돌릴 수 있습니다.

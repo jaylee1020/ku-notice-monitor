@@ -6,9 +6,12 @@ from unittest.mock import AsyncMock, patch
 import pytest
 
 from matcher import (
+    _extension_of,
     _guess_attachment_mime_type,
     _guess_mime_type,
+    _is_retryable_gemini_error,
     _parse_gemini_json,
+    analyze_with_gemini,
     build_profile_text,
     build_prompt,
     keyword_fallback,
@@ -163,13 +166,56 @@ def test_keyword_fallback_matches_attachment_filename(make_article):
 
 
 @pytest.mark.parametrize("filename,expected", [
+    # 이미지
     ("file.pdf", "application/pdf"),
-    ("file.hwp", "application/octet-stream"),
-    ("file.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"),
     ("file.jpg", "image/jpeg"),
+    ("file.jpeg", "image/jpeg"),
+    ("file.png", "image/png"),
+    ("file.webp", "image/webp"),
+    ("file.heic", "image/heic"),
+    # 비디오
+    ("clip.mp4", "video/mp4"),
+    ("clip.mov", "video/mov"),
+    ("clip.webm", "video/webm"),
+    # 오디오
+    ("sound.mp3", "audio/mp3"),
+    ("sound.wav", "audio/wav"),
+    ("sound.ogg", "audio/ogg"),
+    ("sound.m4a", "audio/mp4"),
+    # 텍스트
+    ("readme.txt", "text/plain"),
+    ("doc.md", "text/md"),
+    ("data.csv", "text/csv"),
+    ("page.html", "text/html"),
+    ("data.json", "application/json"),
 ])
-def test_guess_attachment_mime_type(filename, expected):
+def test_guess_attachment_mime_type_gemini_native(filename, expected):
+    """Gemini inline 지원 포맷은 환경에 관계없이 고정 매핑을 사용한다."""
     assert _guess_attachment_mime_type(filename) == expected
+
+
+def test_guess_attachment_mime_type_unknown_extension():
+    # .hwp 등 Gemini 미지원 확장자는 시스템 mimetypes DB에 따라 달라짐.
+    # 핵심은 빈 문자열이 아닌 유효한 MIME 문자열을 반환하는 것.
+    result = _guess_attachment_mime_type("file.hwp")
+    assert isinstance(result, str) and "/" in result and result
+
+
+def test_guess_mime_type_handles_query_string():
+    """URL 쿼리스트링이 있어도 확장자를 올바르게 감지"""
+    assert _guess_mime_type("https://example.com/photo.webp?v=123") == "image/webp"
+    assert _guess_mime_type("https://example.com/photo.png#frag") == "image/png"
+
+
+@pytest.mark.parametrize("name,expected", [
+    ("photo.JPG", ".jpg"),
+    ("doc.PDF?v=1", ".pdf"),
+    ("file.tar.gz", ".gz"),
+    ("no-extension", ""),
+    ("https://example.com/path/file.webm#t=10", ".webm"),
+])
+def test_extension_of(name, expected):
+    assert _extension_of(name) == expected
 
 
 # --- match_articles ---
@@ -224,6 +270,64 @@ def test_match_articles_gemini_string_score_and_invalid_entries(make_article):
     assert method == "gemini"
     assert len(matched) == 1
     assert matched[0][1] == 5
+
+
+# --- _is_retryable_gemini_error ---
+
+
+def test_is_retryable_gemini_error_network():
+    assert _is_retryable_gemini_error(asyncio.TimeoutError()) is True
+    assert _is_retryable_gemini_error(ConnectionError()) is True
+    assert _is_retryable_gemini_error(TimeoutError()) is True
+
+
+def test_is_retryable_gemini_error_value_errors():
+    # JSON/스키마 오류는 재시도하지 않음
+    assert _is_retryable_gemini_error(ValueError("bad json")) is False
+    assert _is_retryable_gemini_error(KeyError("missing")) is False
+    assert _is_retryable_gemini_error(TypeError("bad")) is False
+
+
+def test_is_retryable_gemini_error_unknown_exception_not_retried():
+    # 분류되지 않은 예외는 무한 재시도 방지를 위해 기본 False
+    assert _is_retryable_gemini_error(RuntimeError("unknown")) is False
+
+
+# --- analyze_with_gemini 배치 index 오프셋 회귀 테스트 ---
+
+
+def test_analyze_with_gemini_multi_batch_index_offset(make_article, monkeypatch):
+    """2개 이상의 배치로 나뉠 때 전역 index가 올바르게 계산되는지 검증 (_extract_matched와 함께 동작)."""
+    from matcher import GEMINI_BATCH_SIZE, _extract_matched
+
+    # 25개 기사 → 3개 배치 (10/10/5)
+    articles = [make_article(id=str(i), title=f"공지 {i}") for i in range(25)]
+    # 각 배치별로 1번째 항목에 score=5, 나머지는 1을 부여
+    call_log: list[int] = []
+
+    async def fake_analyze_batch(client, model_name, batch, config):
+        call_log.append(len(batch))
+        return [
+            {"index": i + 1, "score": 5 if i == 0 else 1, "reason": "test"}
+            for i in range(len(batch))
+        ]
+
+    monkeypatch.setenv("GEMINI_API_KEY", "dummy")
+    import matcher
+    monkeypatch.setattr(matcher, "_analyze_batch", fake_analyze_batch)
+    # genai.Client는 MagicMock이므로 그대로 둠
+
+    config = {"gemini": {"model": "test", "relevance_threshold": 5}, "profile": {}, "keywords": {}}
+    results = asyncio.get_event_loop().run_until_complete(analyze_with_gemini(articles, config))
+
+    # 3개 배치가 호출되었는지 확인
+    assert call_log == [GEMINI_BATCH_SIZE, GEMINI_BATCH_SIZE, 5]
+
+    # threshold 5 이상인 항목만 추출 → 각 배치 첫 항목 (전역 index 1, 11, 21)
+    matched, valid = _extract_matched(results, articles, threshold=5)
+    matched_ids = sorted(a.id for a, _, _ in matched)
+    assert matched_ids == ["0", "10", "20"], f"배치 오프셋 계산 오류: {matched_ids}"
+    assert valid == 25
 
 
 def test_match_articles_gemini_invalid_results_fallback_to_keyword(make_article):

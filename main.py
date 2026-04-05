@@ -5,6 +5,7 @@ import json
 import logging
 import os
 import sys
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -79,14 +80,37 @@ def validate_config(config: dict) -> None:
     for feed_name, feed_config in config["feeds"].items():
         if "id" not in feed_config:
             raise ValueError(f"피드 '{feed_name}'에 필수 필드 'id'가 없습니다.")
+        if not isinstance(feed_config["id"], int):
+            raise ValueError(f"피드 '{feed_name}'의 'id'는 정수여야 합니다: {feed_config['id']!r}")
 
-    if "model" not in config.get("gemini", {}):
+    gemini_cfg = config.get("gemini", {})
+    if "model" not in gemini_cfg:
         raise ValueError("gemini 섹션에 필수 필드 'model'이 없습니다.")
+    if not isinstance(gemini_cfg["model"], str) or not gemini_cfg["model"].strip():
+        raise ValueError("gemini.model은 비어있지 않은 문자열이어야 합니다.")
+    threshold = gemini_cfg.get("relevance_threshold", 3)
+    if not isinstance(threshold, int) or not 1 <= threshold <= 5:
+        raise ValueError(f"gemini.relevance_threshold는 1~5 사이 정수여야 합니다: {threshold!r}")
 
+    settings_cfg = config.get("settings", {})
     required_settings = ["state_file", "base_url", "rss_url_template"]
     for field in required_settings:
-        if field not in config.get("settings", {}):
+        if field not in settings_cfg:
             raise ValueError(f"settings 섹션에 필수 필드 '{field}'가 없습니다.")
+    base_url = settings_cfg["base_url"]
+    if not isinstance(base_url, str) or not base_url.startswith(("http://", "https://")):
+        raise ValueError(f"settings.base_url은 http(s) URL이어야 합니다: {base_url!r}")
+    rss_tpl = settings_cfg["rss_url_template"]
+    if not isinstance(rss_tpl, str) or "{board_id}" not in rss_tpl:
+        raise ValueError(f"settings.rss_url_template에 {{board_id}} 자리표시자가 필요합니다: {rss_tpl!r}")
+    ssl_verify = settings_cfg.get("ssl_verify", True)
+    if not isinstance(ssl_verify, bool):
+        raise ValueError(f"settings.ssl_verify는 bool이어야 합니다: {ssl_verify!r}")
+
+    profile = config.get("profile", {})
+    year = profile.get("year")
+    if year not in (None, "", 0) and not (isinstance(year, int) and 1 <= year <= 10):
+        logger.warning("profile.year가 비정상 범위입니다 (1~10 권장): %r", year)
 
     if not os.environ.get("GEMINI_API_KEY"):
         logger.warning("GEMINI_API_KEY가 설정되지 않았습니다. 키워드 매칭으로 대체됩니다.")
@@ -103,7 +127,7 @@ def validate_config(config: dict) -> None:
 
 
 def _log_run_summary(stats: dict) -> None:
-    """실행 결과 요약을 로그로 출력"""
+    """실행 결과 요약을 사람이 읽는 형태와 구조화된 JSON 형태로 모두 출력"""
     logger = logging.getLogger(__name__)
     logger.info(
         "실행 요약: 피드 %d개, 수집 %d건, 신규 %d건, 매칭 %d건, 분석: %s",
@@ -113,6 +137,8 @@ def _log_run_summary(stats: dict) -> None:
         stats["matched_articles"],
         stats["method"],
     )
+    # GitHub Actions 로그에서 grep/jq로 추출하기 좋도록 단일 라인 JSON 출력
+    logger.info("run_summary_json=%s", json.dumps({"event": "run_summary", **stats}, ensure_ascii=False))
 
 
 def _finalize_state(state: dict, state_path: str, all_articles, stats: dict) -> None:
@@ -133,6 +159,7 @@ async def run() -> None:
         "new_articles": 0,
         "matched_articles": 0,
         "method": "none",
+        "timing": {},
     }
 
     config = load_config()
@@ -147,7 +174,9 @@ async def run() -> None:
         await check_ssl_health(config)
 
     logger.info("RSS 피드 수집 중...")
+    t0 = time.monotonic()
     all_articles = await fetch_all_feeds(config)
+    stats["timing"]["fetch_feeds"] = round(time.monotonic() - t0, 2)
     enabled_feeds = [n for n, fc in config["feeds"].items() if fc.get("enabled", True)]
     stats["feeds_collected"] = len(enabled_feeds)
     stats["articles_found"] = len(all_articles)
@@ -165,10 +194,14 @@ async def run() -> None:
         return
 
     logger.info("새 공지 본문 수집 중... (%d건)", len(new_articles))
+    t0 = time.monotonic()
     await enrich_articles_with_body(new_articles, config)
+    stats["timing"]["enrich_articles"] = round(time.monotonic() - t0, 2)
 
     logger.info("Gemini로 관련도 분석 중...")
+    t0 = time.monotonic()
     matched, method = await match_articles(new_articles, config)
+    stats["timing"]["analyze"] = round(time.monotonic() - t0, 2)
     stats["matched_articles"] = len(matched)
     stats["method"] = method
     logger.info("관련 공지: %d건", len(matched))
