@@ -6,6 +6,7 @@ from unittest.mock import AsyncMock, patch
 import pytest
 
 from matcher import (
+    _extension_of,
     _guess_attachment_mime_type,
     _guess_mime_type,
     _is_retryable_gemini_error,
@@ -165,19 +166,56 @@ def test_keyword_fallback_matches_attachment_filename(make_article):
 
 
 @pytest.mark.parametrize("filename,expected", [
+    # 이미지
     ("file.pdf", "application/pdf"),
-    ("file.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"),
     ("file.jpg", "image/jpeg"),
+    ("file.jpeg", "image/jpeg"),
+    ("file.png", "image/png"),
+    ("file.webp", "image/webp"),
+    ("file.heic", "image/heic"),
+    # 비디오
+    ("clip.mp4", "video/mp4"),
+    ("clip.mov", "video/mov"),
+    ("clip.webm", "video/webm"),
+    # 오디오
+    ("sound.mp3", "audio/mp3"),
+    ("sound.wav", "audio/wav"),
+    ("sound.ogg", "audio/ogg"),
+    ("sound.m4a", "audio/mp4"),
+    # 텍스트
+    ("readme.txt", "text/plain"),
+    ("doc.md", "text/md"),
+    ("data.csv", "text/csv"),
+    ("page.html", "text/html"),
+    ("data.json", "application/json"),
 ])
-def test_guess_attachment_mime_type(filename, expected):
+def test_guess_attachment_mime_type_gemini_native(filename, expected):
+    """Gemini inline 지원 포맷은 환경에 관계없이 고정 매핑을 사용한다."""
     assert _guess_attachment_mime_type(filename) == expected
 
 
 def test_guess_attachment_mime_type_unknown_extension():
-    # .hwp 등은 시스템 mimetypes DB에 따라 값이 달라질 수 있음 (예: application/x-hwp 또는 application/octet-stream).
+    # .hwp 등 Gemini 미지원 확장자는 시스템 mimetypes DB에 따라 달라짐.
     # 핵심은 빈 문자열이 아닌 유효한 MIME 문자열을 반환하는 것.
     result = _guess_attachment_mime_type("file.hwp")
     assert isinstance(result, str) and "/" in result and result
+
+
+def test_guess_mime_type_handles_query_string():
+    """URL 쿼리스트링이 있어도 확장자를 올바르게 감지"""
+    assert _guess_mime_type("https://example.com/photo.webp?v=123") == "image/webp"
+    assert _guess_mime_type("https://example.com/photo.png#frag") == "image/png"
+
+
+@pytest.mark.parametrize("name,expected", [
+    ("photo.JPG", ".jpg"),
+    ("doc.PDF?v=1", ".pdf"),
+    ("file.tar.gz", ".gz"),
+    ("no-extension", ""),
+    ("https://example.com/path/file.webm#t=10", ".webm"),
+])
+def test_extension_of(name, expected):
+    assert _extension_of(name) == expected
 
 
 # --- match_articles ---

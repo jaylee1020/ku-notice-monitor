@@ -9,7 +9,9 @@ import pytest
 from feeds import (
     _extract_attachments,
     _extract_image_urls,
+    _extract_rss_content,
     _safe_pub_date_string,
+    _strip_html,
     _to_int,
     extract_article_id,
     is_empty_feed_item,
@@ -237,11 +239,13 @@ def test_extract_image_urls_empty():
 def test_extract_image_urls_respects_max_limit():
     from bs4 import BeautifulSoup
 
-    imgs = "".join(f'<img src="https://example.com/img{i}.jpg">' for i in range(10))
+    from constants import MAX_IMAGES_PER_ARTICLE
+
+    imgs = "".join(f'<img src="https://example.com/img{i}.jpg">' for i in range(MAX_IMAGES_PER_ARTICLE + 5))
     html = f"<div>{imgs}</div>"
     div = BeautifulSoup(html, "html.parser").find("div")
     urls = _extract_image_urls(div, "https://www.konkuk.ac.kr")
-    assert len(urls) == 3  # MAX_IMAGES_PER_ARTICLE
+    assert len(urls) == MAX_IMAGES_PER_ARTICLE
 
 
 def test_extract_image_urls_skips_empty_src():
@@ -251,6 +255,119 @@ def test_extract_image_urls_skips_empty_src():
     div = BeautifulSoup(html, "html.parser").find("div")
     urls = _extract_image_urls(div, "https://www.konkuk.ac.kr")
     assert urls == ["https://example.com/valid.jpg"]
+
+
+def test_extract_image_urls_lazy_loaded():
+    from bs4 import BeautifulSoup
+
+    html = (
+        '<div>'
+        '<img data-src="https://example.com/lazy1.jpg">'
+        '<img data-original="https://example.com/lazy2.png">'
+        '<img src="data:image/gif;base64,R0" data-lazy-src="https://example.com/lazy3.webp">'
+        "</div>"
+    )
+    div = BeautifulSoup(html, "html.parser").find("div")
+    urls = _extract_image_urls(div, "https://www.konkuk.ac.kr")
+    assert "https://example.com/lazy1.jpg" in urls
+    assert "https://example.com/lazy2.png" in urls
+    assert "https://example.com/lazy3.webp" in urls
+
+
+def test_extract_image_urls_srcset():
+    from bs4 import BeautifulSoup
+
+    html = (
+        '<div>'
+        '<img srcset="https://example.com/small.jpg 480w, https://example.com/large.jpg 1024w">'
+        "</div>"
+    )
+    div = BeautifulSoup(html, "html.parser").find("div")
+    urls = _extract_image_urls(div, "https://www.konkuk.ac.kr")
+    assert "https://example.com/small.jpg" in urls
+    assert "https://example.com/large.jpg" in urls
+
+
+def test_extract_image_urls_filters_tracking_and_svg():
+    from bs4 import BeautifulSoup
+
+    html = (
+        '<div>'
+        '<img src="https://example.com/spacer.gif">'
+        '<img src="https://example.com/1x1-pixel.png">'
+        '<img src="https://example.com/icon-arrow.png">'
+        '<img src="https://example.com/logo.svg">'
+        '<img src="https://example.com/real-photo.jpg">'
+        "</div>"
+    )
+    div = BeautifulSoup(html, "html.parser").find("div")
+    urls = _extract_image_urls(div, "https://www.konkuk.ac.kr")
+    assert urls == ["https://example.com/real-photo.jpg"]
+
+
+def test_extract_image_urls_deduplicates():
+    from bs4 import BeautifulSoup
+
+    html = (
+        '<div>'
+        '<img src="https://example.com/same.jpg">'
+        '<img src="https://example.com/same.jpg">'
+        '<img data-src="https://example.com/same.jpg">'
+        "</div>"
+    )
+    div = BeautifulSoup(html, "html.parser").find("div")
+    urls = _extract_image_urls(div, "https://www.konkuk.ac.kr")
+    assert urls == ["https://example.com/same.jpg"]
+
+
+def test_extract_image_urls_og_image_fallback():
+    from bs4 import BeautifulSoup
+
+    html = (
+        '<html><head>'
+        '<meta property="og:image" content="https://example.com/og.jpg">'
+        "</head><body>"
+        '<div class="hwp_editor_board_content"><p>텍스트만 있는 공지</p></div>'
+        "</body></html>"
+    )
+    soup = BeautifulSoup(html, "html.parser")
+    div = soup.find("div")
+    urls = _extract_image_urls(div, "https://www.konkuk.ac.kr", soup=soup)
+    assert urls == ["https://example.com/og.jpg"]
+
+
+# --- _strip_html / _extract_rss_content ---
+
+
+def test_strip_html_basic():
+    assert _strip_html("<p>안녕<br>하세요</p>") == "안녕 하세요"
+    assert _strip_html("A &amp; B &lt;tag&gt;") == "A & B <tag>"
+    assert _strip_html("") == ""
+
+
+def test_extract_rss_content_prefers_longest():
+    entry = {
+        "description": "짧은 요약",
+        "content": [{"value": "<p>훨씬 더 긴 본문 내용입니다. 여기에 중요한 정보가 있습니다.</p>"}],
+    }
+    result = _extract_rss_content(entry)
+    assert "훨씬 더 긴" in result
+    assert "<p>" not in result
+
+
+def test_extract_rss_content_description_only():
+    entry = {"description": "<b>설명 본문</b>"}
+    assert _extract_rss_content(entry) == "설명 본문"
+
+
+def test_extract_rss_content_empty():
+    assert _extract_rss_content({}) == ""
+    assert _extract_rss_content({"description": ""}) == ""
+
+
+def test_extract_rss_content_summary_detail_dict():
+    entry = {"summary_detail": {"value": "<p>요약 상세</p>"}}
+    assert _extract_rss_content(entry) == "요약 상세"
 
 
 # --- _extract_attachments ---

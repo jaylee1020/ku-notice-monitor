@@ -14,11 +14,14 @@ from tenacity import retry, retry_if_exception, stop_after_attempt, wait_exponen
 from constants import (
     ATTACHMENT_DOWNLOAD_TIMEOUT,
     GEMINI_BATCH_SIZE,
+    GEMINI_EXTENSION_MIME_OVERRIDES,
+    GEMINI_IMAGE_EXTENSIONS,
     GEMINI_NATIVE_EXTENSIONS,
     IMAGE_DOWNLOAD_TIMEOUT,
     MAX_ATTACHMENT_SIZE,
     MAX_CONCURRENT_ATTACHMENT_DOWNLOADS,
     MAX_CONCURRENT_IMAGE_DOWNLOADS,
+    PROMPT_DESCRIPTION_MAX_LENGTH,
 )
 from models import Article, Attachment
 
@@ -72,7 +75,7 @@ def build_prompt(articles: list[Article], profile_text: str) -> str:
     article_list = ""
     has_media = any(a.images or a.attachments for a in articles)
     for i, a in enumerate(articles, 1):
-        desc = a.description[:300] if a.description else "설명 없음"
+        desc = a.description[:PROMPT_DESCRIPTION_MAX_LENGTH] if a.description else "설명 없음"
         notes: list[str] = []
         if a.images:
             notes.append(f"이미지 {len(a.images)}장")
@@ -109,8 +112,18 @@ def build_prompt(articles: list[Article], profile_text: str) -> str:
 {article_list}"""
 
 
+def _extension_of(name: str) -> str:
+    """파일명/URL에서 소문자 확장자를 추출 (쿼리스트링 제거)"""
+    clean = name.split("?")[0].split("#")[0]
+    dot = clean.rfind(".")
+    return clean[dot:].lower() if dot != -1 else ""
+
+
 def _guess_mime_type(url: str) -> str:
-    """URL에서 MIME 타입을 추측. 기본값은 image/jpeg."""
+    """이미지 URL에서 MIME 타입을 추측. 기본값은 image/jpeg."""
+    ext = _extension_of(url)
+    if ext in GEMINI_IMAGE_EXTENSIONS:
+        return GEMINI_EXTENSION_MIME_OVERRIDES.get(ext, "image/jpeg")
     mime, _ = mimetypes.guess_type(url.split("?")[0])
     if mime and mime.startswith("image/"):
         return mime
@@ -118,7 +131,14 @@ def _guess_mime_type(url: str) -> str:
 
 
 def _guess_attachment_mime_type(filename: str) -> str:
-    """첨부파일명에서 MIME 타입을 추측"""
+    """첨부파일명에서 Gemini 호환 MIME 타입을 추측.
+
+    Gemini가 inline으로 지원하는 포맷(이미지/비디오/오디오/PDF/텍스트)은
+    고정 매핑을 우선 사용해 환경별 mimetypes DB 차이를 제거한다.
+    """
+    ext = _extension_of(filename)
+    if ext in GEMINI_EXTENSION_MIME_OVERRIDES:
+        return GEMINI_EXTENSION_MIME_OVERRIDES[ext]
     mime, _ = mimetypes.guess_type(filename)
     return mime or "application/octet-stream"
 
