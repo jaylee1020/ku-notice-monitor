@@ -81,3 +81,45 @@ def test_validate_config_missing_settings_field():
     del config["settings"]["base_url"]
     with pytest.raises(ValueError, match="base_url"):
         validate_config(config)
+
+
+def test_validate_config_invalid_threshold():
+    config = _make_valid_config()
+    config["gemini"]["relevance_threshold"] = 10
+    with pytest.raises(ValueError, match="relevance_threshold"):
+        validate_config(config)
+
+
+def test_validate_config_threshold_wrong_type():
+    config = _make_valid_config()
+    config["gemini"]["relevance_threshold"] = "3"
+    with pytest.raises(ValueError, match="relevance_threshold"):
+        validate_config(config)
+
+
+def test_validate_config_invalid_base_url():
+    config = _make_valid_config()
+    config["settings"]["base_url"] = "not-a-url"
+    with pytest.raises(ValueError, match="base_url"):
+        validate_config(config)
+
+
+def test_validate_config_rss_template_missing_placeholder():
+    config = _make_valid_config()
+    config["settings"]["rss_url_template"] = "https://example.com/fixed"
+    with pytest.raises(ValueError, match="board_id"):
+        validate_config(config)
+
+
+def test_validate_config_ssl_verify_wrong_type():
+    config = _make_valid_config()
+    config["settings"]["ssl_verify"] = "true"  # 문자열 → bool이어야 함
+    with pytest.raises(ValueError, match="ssl_verify"):
+        validate_config(config)
+
+
+def test_validate_config_feed_id_must_be_int():
+    config = _make_valid_config()
+    config["feeds"]["bad"] = {"id": "234", "enabled": True}
+    with pytest.raises(ValueError, match="정수"):
+        validate_config(config)

@@ -9,6 +9,7 @@ import pytest
 from feeds import (
     _extract_attachments,
     _extract_image_urls,
+    _safe_pub_date_string,
     _to_int,
     extract_article_id,
     is_empty_feed_item,
@@ -32,6 +33,30 @@ from state import (
 ])
 def test_parse_pub_date(date_str, expected):
     assert parse_pub_date(date_str) == expected
+
+
+# --- _safe_pub_date_string ---
+
+
+def test_safe_pub_date_string_valid():
+    entry = {"pubdate": "2026-03-01 10:30:00.123"}
+    assert _safe_pub_date_string(entry) == "2026-03-01 10:30:00.123"
+
+
+def test_safe_pub_date_string_published_fallback():
+    entry = {"published": "2026-03-01 10:30:00"}
+    assert _safe_pub_date_string(entry) == "2026-03-01 10:30:00"
+
+
+def test_safe_pub_date_string_empty():
+    assert _safe_pub_date_string({}) == ""
+    assert _safe_pub_date_string({"pubdate": ""}) == ""
+
+
+def test_safe_pub_date_string_invalid_preserves_raw():
+    # 파싱 실패해도 원문은 보존 (로그만 남김)
+    entry = {"pubdate": "invalid-date"}
+    assert _safe_pub_date_string(entry) == "invalid-date"
 
 
 # --- extract_article_id ---

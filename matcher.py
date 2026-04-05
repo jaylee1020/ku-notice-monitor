@@ -9,7 +9,7 @@ import os
 import aiohttp
 from google import genai
 from google.genai import types
-from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
+from tenacity import retry, retry_if_exception, stop_after_attempt, wait_exponential
 
 from constants import (
     ATTACHMENT_DOWNLOAD_TIMEOUT,
@@ -293,14 +293,40 @@ def _parse_gemini_json(text: str) -> list[dict]:
     return results
 
 
+def _is_retryable_gemini_error(exc: BaseException) -> bool:
+    """네트워크/일시적 서버 오류만 재시도. 인증·권한·형식 오류는 재시도하지 않음."""
+    # 네트워크/타임아웃은 항상 재시도
+    if isinstance(exc, (asyncio.TimeoutError, TimeoutError, ConnectionError)):
+        return True
+    # JSON 파싱/스키마 검증 실패 등은 재시도 불필요
+    if isinstance(exc, (ValueError, TypeError, KeyError)):
+        return False
+    # google-genai 예외는 런타임에 상태코드 기반으로 판단 (모듈 모킹 환경 대비 지연 import)
+    try:
+        from google.genai import errors as genai_errors  # type: ignore
+        api_error_cls = getattr(genai_errors, "APIError", None)
+        if isinstance(api_error_cls, type) and isinstance(exc, api_error_cls):
+            code = getattr(exc, "code", None) or getattr(exc, "status_code", None)
+            if code is None:
+                return True  # 상태 불명 → 보수적으로 재시도
+            if isinstance(code, int):
+                # 429(rate limit), 5xx(server error)만 재시도. 4xx(auth/quota/bad request)는 즉시 실패.
+                return code == 429 or 500 <= code < 600
+            return False
+    except Exception:
+        pass
+    # 그 외 알 수 없는 예외는 재시도하지 않음 (무한 재시도 방지)
+    return False
+
+
 @retry(
-    retry=retry_if_exception_type(Exception),
+    retry=retry_if_exception(_is_retryable_gemini_error),
     stop=stop_after_attempt(3),
     wait=wait_exponential(multiplier=1, min=2, max=16),
     reraise=True,
 )
 def _call_gemini_api(client: genai.Client, model_name: str, contents: list | str) -> list[dict]:
-    """Gemini API 호출 (tenacity로 최대 3회 지수 백오프 재시도)"""
+    """Gemini API 호출 (tenacity로 최대 3회 지수 백오프 재시도, 재시도 가능한 오류만)"""
     response = client.models.generate_content(
         model=model_name,
         contents=contents,

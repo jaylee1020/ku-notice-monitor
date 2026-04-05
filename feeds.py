@@ -41,6 +41,18 @@ def parse_pub_date(date_str: str) -> datetime:
     return datetime.strptime(base, "%Y-%m-%d %H:%M:%S")
 
 
+def _safe_pub_date_string(entry) -> str:
+    """RSS 엔트리에서 pub_date 문자열을 안전하게 추출. 파싱 실패해도 원문은 보존."""
+    raw = entry.get("pubdate") or entry.get("published") or ""
+    if not raw:
+        return ""
+    try:
+        parse_pub_date(raw)
+    except (ValueError, TypeError):
+        logger.debug("pub_date 파싱 실패(원문 유지): %r", raw)
+    return raw
+
+
 def extract_article_id(link: str) -> str:
     """링크 경로에서 게시물 ID 추출: /bbs/konkuk/234/1166860/artclView.do"""
     match = re.search(r"/bbs/konkuk/\d+/(\d+)/artclView", link)
@@ -82,7 +94,7 @@ def _parse_entry(entry, board_name: str, board_id: int, base_url: str) -> Articl
         id=article_id,
         title=entry.get("title", "").strip(),
         link=link,
-        pub_date=entry.get("pubdate", entry.get("published", "")),
+        pub_date=_safe_pub_date_string(entry),
         author=entry.get("author", ""),
         description=entry.get("description", "").strip(),
         board_name=board_name,
