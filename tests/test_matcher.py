@@ -128,6 +128,18 @@ def test_parse_gemini_json_invalid_json():
         _parse_gemini_json("not json at all")
 
 
+def test_parse_gemini_json_none_raises():
+    with pytest.raises(ValueError, match="비어 있습니다"):
+        _parse_gemini_json(None)
+
+
+def test_parse_gemini_json_oneline_code_fence():
+    text = '```[{"index": 1, "score": 4, "reason": "test"}]```'
+    result = _parse_gemini_json(text)
+    assert len(result) == 1
+    assert result[0]["score"] == 4
+
+
 # --- keyword_fallback ---
 
 
@@ -248,6 +260,20 @@ def test_match_articles_gemini_fail_falls_back(make_article):
     assert len(matched) == 1
 
 
+def test_match_articles_ties_break_by_newest_date(make_article):
+    """동점일 때 발행일시가 최신인 공지가 먼저 오도록 정렬된다."""
+    older = make_article(id="1", title="오래된 장학", pub_date="2026-01-01 09:00:00")
+    newer = make_article(id="2", title="최신 장학", pub_date="2026-05-01 09:00:00")
+    config = {"gemini": {"model": "test", "relevance_threshold": 3}, "profile": {}, "keywords": {}}
+    mock_results = [
+        {"index": 1, "score": 5, "reason": "동점"},
+        {"index": 2, "score": 5, "reason": "동점"},
+    ]
+    with patch("matcher.analyze_with_gemini", new_callable=AsyncMock, return_value=mock_results):
+        matched, _ = asyncio.get_event_loop().run_until_complete(match_articles([older, newer], config))
+    assert [a.id for a, _, _ in matched] == ["2", "1"]
+
+
 def test_match_articles_empty():
     matched, method = asyncio.get_event_loop().run_until_complete(
         match_articles([], {"gemini": {"relevance_threshold": 3}})
@@ -328,6 +354,52 @@ def test_analyze_with_gemini_multi_batch_index_offset(make_article, monkeypatch)
     matched_ids = sorted(a.id for a, _, _ in matched)
     assert matched_ids == ["0", "10", "20"], f"배치 오프셋 계산 오류: {matched_ids}"
     assert valid == 25
+
+
+def test_analyze_with_gemini_partial_batch_failure_uses_keyword_for_failed_batch(make_article, monkeypatch):
+    """일부 배치만 실패하면 성공 배치는 유지하고, 실패 배치만 키워드 매칭으로 대체한다."""
+    from matcher import _extract_matched
+
+    # 15개 → 2개 배치 (10/5). 두 번째 배치만 실패시킨다.
+    articles = [make_article(id=str(i), title=f"장학 공지 {i}") for i in range(15)]
+
+    async def fake_analyze_batch(client, model_name, batch, config):
+        if len(batch) == 5:  # 두 번째 배치
+            raise RuntimeError("Gemini 호출 실패")
+        return [{"index": i + 1, "score": 5, "reason": "gemini"} for i in range(len(batch))]
+
+    monkeypatch.setenv("GEMINI_API_KEY", "dummy")
+    import matcher
+    monkeypatch.setattr(matcher, "_analyze_batch", fake_analyze_batch)
+
+    config = {
+        "gemini": {"model": "test", "relevance_threshold": 3},
+        "profile": {},
+        "keywords": {"high": ["장학"], "medium": []},
+    }
+    results = asyncio.get_event_loop().run_until_complete(analyze_with_gemini(articles, config))
+
+    # 15개 모두 점수가 매겨져야 한다 (성공 배치 10 + 키워드 폴백 5)
+    matched, valid = _extract_matched(results, articles, threshold=3)
+    assert valid == 15
+    matched_ids = sorted((int(a.id) for a, _, _ in matched))
+    assert matched_ids == list(range(15)), f"누락된 공지가 있음: {matched_ids}"
+
+
+def test_analyze_with_gemini_all_batches_fail_returns_empty(make_article, monkeypatch):
+    """모든 배치가 실패하면 빈 리스트를 반환해 호출부의 전체 키워드 폴백으로 넘긴다."""
+    articles = [make_article(id=str(i), title=f"공지 {i}") for i in range(3)]
+
+    async def always_fail(client, model_name, batch, config):
+        raise RuntimeError("실패")
+
+    monkeypatch.setenv("GEMINI_API_KEY", "dummy")
+    import matcher
+    monkeypatch.setattr(matcher, "_analyze_batch", always_fail)
+
+    config = {"gemini": {"model": "test", "relevance_threshold": 3}, "profile": {}, "keywords": {}}
+    results = asyncio.get_event_loop().run_until_complete(analyze_with_gemini(articles, config))
+    assert results == []
 
 
 def test_match_articles_gemini_invalid_results_fallback_to_keyword(make_article):

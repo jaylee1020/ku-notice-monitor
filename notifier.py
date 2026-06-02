@@ -3,6 +3,7 @@
 import logging
 import os
 from datetime import datetime
+from zoneinfo import ZoneInfo
 
 from telegram import Bot
 
@@ -11,13 +12,20 @@ from models import Article
 
 logger = logging.getLogger(__name__)
 
+# GitHub Actions 러너는 UTC이므로, 사용자에게 보이는 날짜/시각은 KST로 표기한다.
+_KST = ZoneInfo("Asia/Seoul")
+
+
+def _now_kst() -> datetime:
+    return datetime.now(_KST)
+
 
 def build_relevant_message(
     matched: list[tuple[Article, int, str]],
     total_new: int,
 ) -> str:
     """관련 공지가 있을 때 텔레그램 메시지 생성"""
-    today = datetime.now().strftime("%Y-%m-%d")
+    today = _now_kst().strftime("%Y-%m-%d")
     header = f"{today} 새 공지 {total_new}건 중 관련 {len(matched)}건\n"
 
     items: list[str] = []
@@ -37,20 +45,30 @@ def build_relevant_message(
 
 def build_no_new_message() -> str:
     """새 공지가 없을 때 메시지"""
-    today = datetime.now().strftime("%Y-%m-%d")
+    today = _now_kst().strftime("%Y-%m-%d")
     return f"{today} 새로운 공지가 없습니다."
 
 
 def build_no_relevant_message(total_new: int) -> str:
     """새 공지는 있지만 관련 공지가 없을 때 메시지"""
-    today = datetime.now().strftime("%Y-%m-%d")
+    today = _now_kst().strftime("%Y-%m-%d")
     return f"{today} 새 공지 {total_new}건 확인, 관련 공지 없음"
 
 
 def build_error_message(error_detail: str) -> str:
     """워크플로우 오류 알림 메시지"""
-    today = datetime.now().strftime("%Y-%m-%d %H:%M")
+    today = _now_kst().strftime("%Y-%m-%d %H:%M")
     return f"[오류] {today} 모니터링 실패\n{error_detail}"
+
+
+def build_first_run_message(seeded_count: int) -> str:
+    """최초 실행 시드 처리 안내 메시지"""
+    today = _now_kst().strftime("%Y-%m-%d")
+    return (
+        f"{today} 모니터링을 시작합니다.\n"
+        f"기존 공지 {seeded_count}건은 '확인함'으로 처리했으며, "
+        f"이후 등록되는 새 공지부터 관련도를 분석해 알려드립니다."
+    )
 
 
 def split_message(text: str) -> list[str]:
@@ -101,9 +119,16 @@ async def send_telegram(text: str) -> None:
 
     bot = Bot(token=token)
     parts = split_message(text)
-    for msg in parts:
-        await bot.send_message(chat_id=chat_id, text=msg)
-    logger.info("텔레그램 메시지 전송 완료 (%d개 분할)", len(parts))
+    sent = 0
+    for i, msg in enumerate(parts, 1):
+        try:
+            await bot.send_message(chat_id=chat_id, text=msg)
+            sent += 1
+        except Exception as e:
+            # 일부 조각 전송 실패가 전체 실행을 중단시키지 않도록 한다.
+            # (예외를 올리면 main에서 notify_error가 다시 텔레그램 전송을 시도해 실패가 연쇄될 수 있음)
+            logger.error("텔레그램 메시지 전송 실패 (%d/%d): %s", i, len(parts), e)
+    logger.info("텔레그램 메시지 전송 완료 (%d/%d개 전송)", sent, len(parts))
 
 
 async def notify_relevant(
@@ -130,4 +155,10 @@ async def notify_no_relevant(total_new: int) -> None:
 async def notify_error(error_detail: str) -> None:
     """워크플로우 오류 발생 시 텔레그램으로 알림"""
     text = build_error_message(error_detail)
+    await send_telegram(text)
+
+
+async def notify_first_run(seeded_count: int) -> None:
+    """최초 실행 시 기존 공지를 시드 처리했음을 한 건의 메시지로 알림"""
+    text = build_first_run_message(seeded_count)
     await send_telegram(text)

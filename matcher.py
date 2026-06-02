@@ -5,6 +5,9 @@ import json
 import logging
 import mimetypes
 import os
+import re
+import ssl
+from datetime import datetime
 
 import aiohttp
 from google import genai
@@ -23,9 +26,20 @@ from constants import (
     MAX_CONCURRENT_IMAGE_DOWNLOADS,
     PROMPT_DESCRIPTION_MAX_LENGTH,
 )
+from feeds import _DEFAULT_HEADERS, _make_ssl_context, parse_pub_date
 from models import Article, Attachment
 
 logger = logging.getLogger(__name__)
+
+
+def _sort_date(article: Article) -> datetime:
+    """정렬용 발행일시. 파싱 불가/누락 시 가장 오래된 값으로 취급."""
+    if not article.pub_date:
+        return datetime.min
+    try:
+        return parse_pub_date(article.pub_date)
+    except (ValueError, TypeError):
+        return datetime.min
 
 
 def _parse_index(value: object) -> int | None:
@@ -148,12 +162,14 @@ async def _download_one_image(
     article_key: str,
     url: str,
     semaphore: asyncio.Semaphore,
+    ssl_context: ssl.SSLContext,
 ) -> tuple[str, types.Part] | None:
     """단일 이미지를 다운로드하여 (article_key, Part) 반환. 실패 시 None."""
     async with semaphore:
         try:
             async with session.get(
                 url,
+                ssl=ssl_context,
                 timeout=aiohttp.ClientTimeout(total=IMAGE_DOWNLOAD_TIMEOUT),
             ) as resp:
                 if resp.status != 200:
@@ -170,7 +186,9 @@ async def _download_one_image(
             return None
 
 
-async def _download_images(articles: list[Article]) -> dict[str, list[types.Part]]:
+async def _download_images(
+    articles: list[Article], ssl_context: ssl.SSLContext
+) -> dict[str, list[types.Part]]:
     """공지별 이미지를 병렬 다운로드하여 Gemini Part 객체로 변환. 키는 article.key."""
     tasks_info: list[tuple[str, str]] = []
     for a in articles:
@@ -182,9 +200,9 @@ async def _download_images(articles: list[Article]) -> dict[str, list[types.Part
 
     semaphore = asyncio.Semaphore(MAX_CONCURRENT_IMAGE_DOWNLOADS)
 
-    async with aiohttp.ClientSession() as session:
+    async with aiohttp.ClientSession(headers=_DEFAULT_HEADERS) as session:
         results = await asyncio.gather(
-            *(_download_one_image(session, key, url, semaphore) for key, url in tasks_info),
+            *(_download_one_image(session, key, url, semaphore, ssl_context) for key, url in tasks_info),
             return_exceptions=True,
         )
 
@@ -203,6 +221,7 @@ async def _download_one_attachment(
     article_key: str,
     attachment: Attachment,
     semaphore: asyncio.Semaphore,
+    ssl_context: ssl.SSLContext,
 ) -> tuple[str, Attachment, bytes] | None:
     """Gemini 지원 첨부파일을 다운로드. 실패 시 None."""
     if attachment.ext not in GEMINI_NATIVE_EXTENSIONS:
@@ -212,6 +231,7 @@ async def _download_one_attachment(
         try:
             async with session.get(
                 attachment.url,
+                ssl=ssl_context,
                 timeout=aiohttp.ClientTimeout(total=ATTACHMENT_DOWNLOAD_TIMEOUT),
             ) as resp:
                 if resp.status != 200:
@@ -235,7 +255,9 @@ async def _download_one_attachment(
             return None
 
 
-async def _download_attachments(articles: list[Article]) -> dict[str, list[types.Part]]:
+async def _download_attachments(
+    articles: list[Article], ssl_context: ssl.SSLContext
+) -> dict[str, list[types.Part]]:
     """공지별 첨부파일(PDF, 이미지)을 병렬 다운로드하여 Gemini Part 객체로 변환"""
     tasks_info: list[tuple[str, Attachment]] = []
     for a in articles:
@@ -248,10 +270,10 @@ async def _download_attachments(articles: list[Article]) -> dict[str, list[types
 
     semaphore = asyncio.Semaphore(MAX_CONCURRENT_ATTACHMENT_DOWNLOADS)
 
-    async with aiohttp.ClientSession() as session:
+    async with aiohttp.ClientSession(headers=_DEFAULT_HEADERS) as session:
         results = await asyncio.gather(
             *(
-                _download_one_attachment(session, key, att, semaphore)
+                _download_one_attachment(session, key, att, semaphore, ssl_context)
                 for key, att in tasks_info
             ),
             return_exceptions=True,
@@ -293,11 +315,17 @@ def _build_multimodal_contents(
     return contents
 
 
-def _parse_gemini_json(text: str) -> list[dict]:
+def _parse_gemini_json(text: str | None) -> list[dict]:
     """Gemini 응답에서 JSON을 추출하고 필수 필드를 검증"""
+    if not text:
+        raise ValueError("Gemini 응답이 비어 있습니다 (None 또는 빈 문자열).")
+
     text = text.strip()
     if text.startswith("```"):
-        text = text.split("\n", 1)[1].rsplit("```", 1)[0].strip()
+        # ```json\n...\n``` 와 한 줄짜리 ```[...]``` 를 모두 처리.
+        # 앞뒤 백틱을 모두 제거한 뒤 선행 언어 지정자(json 등)를 떼어낸다.
+        text = text.strip("`").strip()
+        text = re.sub(r"^[a-zA-Z]+\s+", "", text, count=1).strip()
 
     results = json.loads(text)
 
@@ -364,10 +392,15 @@ async def _analyze_batch(
     profile_text = build_profile_text(config)
     prompt = build_prompt(articles, profile_text)
 
+    # 본문 크롤링과 동일한 SSL 정책으로 이미지/첨부파일을 다운로드해야
+    # ssl_verify=false 환경에서도 멀티모달 입력이 누락되지 않는다.
+    ssl_verify = config.get("settings", {}).get("ssl_verify", True)
+    ssl_context = _make_ssl_context(ssl_verify)
+
     # 이미지와 첨부파일을 병렬 다운로드
     image_parts, attachment_parts = await asyncio.gather(
-        _download_images(articles),
-        _download_attachments(articles),
+        _download_images(articles, ssl_context),
+        _download_attachments(articles, ssl_context),
     )
 
     if image_parts:
@@ -392,25 +425,31 @@ async def analyze_with_gemini(articles: list[Article], config: dict) -> list[dic
     model_name = config["gemini"]["model"]
 
     all_results: list[dict] = []
+    any_gemini_success = False
     for batch_start in range(0, len(articles), GEMINI_BATCH_SIZE):
         batch = articles[batch_start:batch_start + GEMINI_BATCH_SIZE]
         try:
             batch_results = await _analyze_batch(client, model_name, batch, config)
-            # 배치 내 index를 전체 index로 보정
-            for r in batch_results:
-                idx = _parse_index(r.get("index"))
-                if idx is not None:
-                    r["index"] = idx + batch_start
-            all_results.extend(batch_results)
+            any_gemini_success = True
             logger.info("Gemini 배치 분석 완료: %d/%d건", batch_start + len(batch), len(articles))
         except Exception as e:
+            # 한 배치가 실패해도 성공한 배치 결과는 버리지 않고,
+            # 실패한 배치만 키워드 매칭으로 대체해 해당 공지가 누락되지 않게 한다.
             logger.error(
-                "Gemini API 배치 호출 최종 실패 (offset=%d, 3회 시도): %s",
+                "Gemini API 배치 호출 최종 실패 (offset=%d, 3회 시도). 해당 배치는 키워드 매칭으로 대체: %s",
                 batch_start, e, exc_info=True,
             )
-            return []
+            batch_results = keyword_fallback(batch, config)
 
-    return all_results
+        # 배치 내 index를 전체 index로 보정 (Gemini/키워드 결과 모두 1-based)
+        for r in batch_results:
+            idx = _parse_index(r.get("index"))
+            if idx is not None:
+                r["index"] = idx + batch_start
+        all_results.extend(batch_results)
+
+    # 모든 배치가 실패했다면 빈 리스트를 반환해 호출부에서 전체 키워드 폴백(method="keyword")으로 처리하게 한다.
+    return all_results if any_gemini_success else []
 
 
 def keyword_fallback(articles: list[Article], config: dict) -> list[dict]:
@@ -497,5 +536,6 @@ async def match_articles(articles: list[Article], config: dict) -> tuple[list[tu
         method = "keyword"
         matched, _ = _extract_matched(results, articles, threshold)
 
-    matched.sort(key=lambda x: x[1], reverse=True)
+    # 점수 내림차순, 동점이면 최신 공지 우선
+    matched.sort(key=lambda x: (x[1], _sort_date(x[0])), reverse=True)
     return matched, method

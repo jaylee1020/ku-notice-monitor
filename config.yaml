@@ -67,3 +67,8 @@ settings:
   # 건국대 서버 인증서 문제가 있을 경우 false로 변경하세요.
   # ssl_verify가 false인 경우, 매 실행 시 SSL 상태를 자동 점검하고 로그에 기록합니다.
   ssl_verify: true
+  # 최초 실행(state.json이 없을 때) 동작.
+  # true: 기존 공지를 알림 없이 '확인함'으로 시드 처리하고, 이후 새 공지부터 분석.
+  #       과거 공지 수백 건에 대한 대량 알림/크롤링 폭발을 방지합니다.
+  # false: 최초 실행에도 모든 공지를 신규로 간주해 분석·알림.
+  seed_on_first_run: true

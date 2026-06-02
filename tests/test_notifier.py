@@ -3,6 +3,7 @@
 from constants import MAX_TELEGRAM_MESSAGE_LENGTH
 from notifier import (
     build_error_message,
+    build_first_run_message,
     build_no_new_message,
     build_no_relevant_message,
     build_relevant_message,
@@ -59,6 +60,15 @@ def test_build_error_message():
     msg = build_error_message("테스트 오류")
     assert "오류" in msg
     assert "테스트 오류" in msg
+
+
+# --- build_first_run_message ---
+
+
+def test_build_first_run_message():
+    msg = build_first_run_message(123)
+    assert "123" in msg
+    assert "확인함" in msg
 
 
 # --- split_message ---
