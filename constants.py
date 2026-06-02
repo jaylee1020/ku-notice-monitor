@@ -78,9 +78,12 @@ STATE_RETENTION_DAYS = 90
 FEED_FETCH_TIMEOUT = 15
 ARTICLE_BODY_TIMEOUT = 15
 
-# 동시 요청 제한 (멀티모달 처리량 향상)
+# 동시 요청 제한 (멀티모달 처리량 향상 + 서버 과부하/차단 방지)
 MAX_CONCURRENT_IMAGE_DOWNLOADS = 8
 MAX_CONCURRENT_ATTACHMENT_DOWNLOADS = 5
+# 본문 크롤링 동시 요청 제한. 첫 실행 시 모든 공지가 신규로 잡혀
+# 수백 건이 동시에 요청되는 것을 막는다.
+MAX_CONCURRENT_BODY_FETCHES = 8
 
 # Gemini 배치 크기
 GEMINI_BATCH_SIZE = 10

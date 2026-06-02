@@ -17,6 +17,7 @@ from constants import (
     EMPTY_FEED_SENTINEL,
     FEED_FETCH_TIMEOUT,
     MAX_ARTICLE_BODY_LENGTH,
+    MAX_CONCURRENT_BODY_FETCHES,
     MAX_IMAGES_PER_ARTICLE,
     MIN_IMAGE_URL_LENGTH,
 )
@@ -318,14 +319,18 @@ async def _fetch_article_body_async(
     url: str,
     ssl_context: ssl.SSLContext,
     base_url: str,
+    semaphore: asyncio.Semaphore,
 ) -> tuple[str, list[str], list[Attachment]]:
     """게시물 웹페이지에서 본문 텍스트, 이미지 URL, 첨부파일 정보를 비동기로 크롤링"""
     from bs4 import BeautifulSoup
 
     try:
-        async with session.get(url, ssl=ssl_context, timeout=aiohttp.ClientTimeout(total=ARTICLE_BODY_TIMEOUT)) as resp:
-            resp.raise_for_status()
-            html = await resp.text(encoding="utf-8", errors="replace")
+        async with semaphore:
+            async with session.get(
+                url, ssl=ssl_context, timeout=aiohttp.ClientTimeout(total=ARTICLE_BODY_TIMEOUT)
+            ) as resp:
+                resp.raise_for_status()
+                html = await resp.text(encoding="utf-8", errors="replace")
 
         soup = BeautifulSoup(html, "lxml")
 
@@ -357,9 +362,10 @@ async def enrich_articles_with_body(articles: list[Article], config: dict) -> No
     ssl_context = _make_ssl_context(ssl_verify)
     base_url = config["settings"]["base_url"]
 
+    semaphore = asyncio.Semaphore(MAX_CONCURRENT_BODY_FETCHES)
     async with aiohttp.ClientSession(headers=_DEFAULT_HEADERS) as session:
         tasks = [
-            _fetch_article_body_async(session, a.link, ssl_context, base_url)
+            _fetch_article_body_async(session, a.link, ssl_context, base_url, semaphore)
             for a in articles
             if a.link
         ]
