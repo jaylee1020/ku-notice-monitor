@@ -13,7 +13,13 @@ import yaml
 
 from feeds import check_ssl_health, enrich_articles_with_body, fetch_all_feeds
 from matcher import match_articles
-from notifier import notify_error, notify_no_new, notify_no_relevant, notify_relevant
+from notifier import (
+    notify_error,
+    notify_first_run,
+    notify_no_new,
+    notify_no_relevant,
+    notify_relevant,
+)
 from state import filter_new_articles, load_state, mark_as_seen, save_state
 
 
@@ -106,6 +112,9 @@ def validate_config(config: dict) -> None:
     ssl_verify = settings_cfg.get("ssl_verify", True)
     if not isinstance(ssl_verify, bool):
         raise ValueError(f"settings.ssl_verify는 bool이어야 합니다: {ssl_verify!r}")
+    seed_on_first_run = settings_cfg.get("seed_on_first_run", True)
+    if not isinstance(seed_on_first_run, bool):
+        raise ValueError(f"settings.seed_on_first_run은 bool이어야 합니다: {seed_on_first_run!r}")
 
     profile = config.get("profile", {})
     year = profile.get("year")
@@ -166,6 +175,7 @@ async def run() -> None:
     validate_config(config)
 
     state_path = str(Path(__file__).parent / config["settings"]["state_file"])
+    first_run = not Path(state_path).exists()
     state = load_state(state_path)
     logger.info("기존 확인 공지: %d건", len(state.get("seen_ids", {})))
 
@@ -181,6 +191,18 @@ async def run() -> None:
     stats["feeds_collected"] = len(enabled_feeds)
     stats["articles_found"] = len(all_articles)
     logger.info("총 %d건 수집", len(all_articles))
+
+    # 최초 실행(상태 파일 없음) 시, 기존 공지를 전부 알림 없이 '확인함' 처리한다.
+    # 과거 공지 수백 건에 대한 본문 크롤링/분석/대량 알림 폭발을 방지한다.
+    seed_on_first_run = config["settings"].get("seed_on_first_run", True)
+    if first_run and seed_on_first_run and all_articles:
+        logger.info("최초 실행 감지: 기존 공지 %d건을 알림 없이 확인 처리합니다.", len(all_articles))
+        stats["method"] = "seed"
+        _finalize_state(state, state_path, all_articles, stats)
+        await notify_first_run(len(all_articles))
+        _log_run_summary(stats)
+        logger.info("=== 최초 실행 시드 완료 ===")
+        return
 
     new_articles = filter_new_articles(all_articles, state)
     stats["new_articles"] = len(new_articles)

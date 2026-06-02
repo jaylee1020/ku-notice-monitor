@@ -260,6 +260,20 @@ def test_match_articles_gemini_fail_falls_back(make_article):
     assert len(matched) == 1
 
 
+def test_match_articles_ties_break_by_newest_date(make_article):
+    """동점일 때 발행일시가 최신인 공지가 먼저 오도록 정렬된다."""
+    older = make_article(id="1", title="오래된 장학", pub_date="2026-01-01 09:00:00")
+    newer = make_article(id="2", title="최신 장학", pub_date="2026-05-01 09:00:00")
+    config = {"gemini": {"model": "test", "relevance_threshold": 3}, "profile": {}, "keywords": {}}
+    mock_results = [
+        {"index": 1, "score": 5, "reason": "동점"},
+        {"index": 2, "score": 5, "reason": "동점"},
+    ]
+    with patch("matcher.analyze_with_gemini", new_callable=AsyncMock, return_value=mock_results):
+        matched, _ = asyncio.get_event_loop().run_until_complete(match_articles([older, newer], config))
+    assert [a.id for a, _, _ in matched] == ["2", "1"]
+
+
 def test_match_articles_empty():
     matched, method = asyncio.get_event_loop().run_until_complete(
         match_articles([], {"gemini": {"relevance_threshold": 3}})

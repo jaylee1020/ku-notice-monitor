@@ -123,3 +123,16 @@ def test_validate_config_feed_id_must_be_int():
     config["feeds"]["bad"] = {"id": "234", "enabled": True}
     with pytest.raises(ValueError, match="정수"):
         validate_config(config)
+
+
+def test_validate_config_seed_on_first_run_wrong_type():
+    config = _make_valid_config()
+    config["settings"]["seed_on_first_run"] = "yes"  # bool이어야 함
+    with pytest.raises(ValueError, match="seed_on_first_run"):
+        validate_config(config)
+
+
+def test_validate_config_seed_on_first_run_bool_ok():
+    config = _make_valid_config()
+    config["settings"]["seed_on_first_run"] = False
+    validate_config(config)  # 예외 없이 통과해야 함

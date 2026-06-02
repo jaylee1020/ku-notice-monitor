@@ -7,6 +7,7 @@ import mimetypes
 import os
 import re
 import ssl
+from datetime import datetime
 
 import aiohttp
 from google import genai
@@ -25,10 +26,20 @@ from constants import (
     MAX_CONCURRENT_IMAGE_DOWNLOADS,
     PROMPT_DESCRIPTION_MAX_LENGTH,
 )
-from feeds import _DEFAULT_HEADERS, _make_ssl_context
+from feeds import _DEFAULT_HEADERS, _make_ssl_context, parse_pub_date
 from models import Article, Attachment
 
 logger = logging.getLogger(__name__)
+
+
+def _sort_date(article: Article) -> datetime:
+    """정렬용 발행일시. 파싱 불가/누락 시 가장 오래된 값으로 취급."""
+    if not article.pub_date:
+        return datetime.min
+    try:
+        return parse_pub_date(article.pub_date)
+    except (ValueError, TypeError):
+        return datetime.min
 
 
 def _parse_index(value: object) -> int | None:
@@ -525,5 +536,6 @@ async def match_articles(articles: list[Article], config: dict) -> tuple[list[tu
         method = "keyword"
         matched, _ = _extract_matched(results, articles, threshold)
 
-    matched.sort(key=lambda x: x[1], reverse=True)
+    # 점수 내림차순, 동점이면 최신 공지 우선
+    matched.sort(key=lambda x: (x[1], _sort_date(x[0])), reverse=True)
     return matched, method

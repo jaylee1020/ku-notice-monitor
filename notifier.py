@@ -61,6 +61,16 @@ def build_error_message(error_detail: str) -> str:
     return f"[오류] {today} 모니터링 실패\n{error_detail}"
 
 
+def build_first_run_message(seeded_count: int) -> str:
+    """최초 실행 시드 처리 안내 메시지"""
+    today = _now_kst().strftime("%Y-%m-%d")
+    return (
+        f"{today} 모니터링을 시작합니다.\n"
+        f"기존 공지 {seeded_count}건은 '확인함'으로 처리했으며, "
+        f"이후 등록되는 새 공지부터 관련도를 분석해 알려드립니다."
+    )
+
+
 def split_message(text: str) -> list[str]:
     """텔레그램 메시지 길이 제한에 맞게 분할"""
     limit = MAX_TELEGRAM_MESSAGE_LENGTH
@@ -145,4 +155,10 @@ async def notify_no_relevant(total_new: int) -> None:
 async def notify_error(error_detail: str) -> None:
     """워크플로우 오류 발생 시 텔레그램으로 알림"""
     text = build_error_message(error_detail)
+    await send_telegram(text)
+
+
+async def notify_first_run(seeded_count: int) -> None:
+    """최초 실행 시 기존 공지를 시드 처리했음을 한 건의 메시지로 알림"""
+    text = build_first_run_message(seeded_count)
     await send_telegram(text)

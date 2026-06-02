@@ -408,7 +408,7 @@ async def check_ssl_health(config: dict) -> bool:
 
     ssl_context = _make_ssl_context(ssl_verify=True)
     try:
-        async with aiohttp.ClientSession() as session:
+        async with aiohttp.ClientSession(headers=_DEFAULT_HEADERS) as session:
             async with session.get(
                 base_url,
                 ssl=ssl_context,
