@@ -26,10 +26,16 @@ from constants import (
     MAX_CONCURRENT_IMAGE_DOWNLOADS,
     PROMPT_DESCRIPTION_MAX_LENGTH,
 )
-from feeds import _DEFAULT_HEADERS, _make_ssl_context, parse_pub_date
-from models import Article, Attachment
+from feeds import parse_pub_date
+from models import Article
+from net import DEFAULT_HEADERS, download_bytes, ssl_context_from_config
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# 결과 파싱 헬퍼
+# ---------------------------------------------------------------------------
 
 
 def _sort_date(article: Article) -> datetime:
@@ -55,17 +61,18 @@ def _parse_score(value: object) -> int | None:
         score = int(value)
     except (TypeError, ValueError):
         return None
-    if 1 <= score <= 5:
-        return score
-    return None
+    return score if 1 <= score <= 5 else None
+
+
+# ---------------------------------------------------------------------------
+# 프롬프트 생성
+# ---------------------------------------------------------------------------
 
 
 def build_profile_text(config: dict) -> str:
-    """config에서 사용자 프로필 텍스트 생성"""
+    """config에서 사용자 프로필 텍스트를 생성한다."""
     p = config["profile"]
     keywords = config.get("keywords", {})
-    high = ", ".join(keywords.get("high", []))
-    medium = ", ".join(keywords.get("medium", []))
 
     lines: list[str] = []
     if p.get("major"):
@@ -76,28 +83,28 @@ def build_profile_text(config: dict) -> str:
         lines.append(f"캠퍼스: {p['campus']}")
     if p.get("status"):
         lines.append(f"재학 상태: {p['status']}")
-    if high:
-        lines.append(f"높은 관심 키워드: {high}")
-    if medium:
-        lines.append(f"일반 관심 키워드: {medium}")
+    if keywords.get("high"):
+        lines.append(f"높은 관심 키워드: {', '.join(keywords['high'])}")
+    if keywords.get("medium"):
+        lines.append(f"일반 관심 키워드: {', '.join(keywords['medium'])}")
 
     return "\n".join(lines) if lines else "프로필 미설정 (모든 공지를 일반적으로 평가)"
 
 
 def build_prompt(articles: list[Article], profile_text: str) -> str:
-    """Gemini에게 보낼 배치 프롬프트 생성"""
-    article_list = ""
+    """Gemini에게 보낼 배치 프롬프트를 생성한다."""
     has_media = any(a.images or a.attachments for a in articles)
+
+    article_lines: list[str] = []
     for i, a in enumerate(articles, 1):
         desc = a.description[:PROMPT_DESCRIPTION_MAX_LENGTH] if a.description else "설명 없음"
         notes: list[str] = []
         if a.images:
             notes.append(f"이미지 {len(a.images)}장")
         if a.attachments:
-            filenames = ", ".join(att.filename for att in a.attachments)
-            notes.append(f"첨부파일: {filenames}")
+            notes.append(f"첨부파일: {', '.join(att.filename for att in a.attachments)}")
         note_str = f" ({'; '.join(notes)})" if notes else ""
-        article_list += f"{i}. [{a.board_name}] {a.title} - {desc}{note_str}\n"
+        article_lines.append(f"{i}. [{a.board_name}] {a.title} - {desc}{note_str}")
 
     media_instruction = ""
     if has_media:
@@ -123,32 +130,36 @@ def build_prompt(articles: list[Article], profile_text: str) -> str:
 [{{"index": 1, "score": 5, "reason": "사유"}}, ...]
 
 공지사항 목록:
-{article_list}"""
+{chr(10).join(article_lines)}
+"""
+
+
+# ---------------------------------------------------------------------------
+# MIME 타입 추론
+# ---------------------------------------------------------------------------
 
 
 def _extension_of(name: str) -> str:
-    """파일명/URL에서 소문자 확장자를 추출 (쿼리스트링 제거)"""
+    """파일명/URL에서 소문자 확장자를 추출한다 (쿼리/프래그먼트 제거)."""
     clean = name.split("?")[0].split("#")[0]
     dot = clean.rfind(".")
     return clean[dot:].lower() if dot != -1 else ""
 
 
 def _guess_mime_type(url: str) -> str:
-    """이미지 URL에서 MIME 타입을 추측. 기본값은 image/jpeg."""
+    """이미지 URL에서 MIME 타입을 추측한다. 기본값은 image/jpeg."""
     ext = _extension_of(url)
     if ext in GEMINI_IMAGE_EXTENSIONS:
         return GEMINI_EXTENSION_MIME_OVERRIDES.get(ext, "image/jpeg")
     mime, _ = mimetypes.guess_type(url.split("?")[0])
-    if mime and mime.startswith("image/"):
-        return mime
-    return "image/jpeg"
+    return mime if mime and mime.startswith("image/") else "image/jpeg"
 
 
 def _guess_attachment_mime_type(filename: str) -> str:
-    """첨부파일명에서 Gemini 호환 MIME 타입을 추측.
+    """첨부파일명에서 Gemini 호환 MIME 타입을 추측한다.
 
-    Gemini가 inline으로 지원하는 포맷(이미지/비디오/오디오/PDF/텍스트)은
-    고정 매핑을 우선 사용해 환경별 mimetypes DB 차이를 제거한다.
+    Gemini가 inline으로 지원하는 포맷은 고정 매핑을 우선 사용해
+    환경별 mimetypes DB 차이를 제거한다.
     """
     ext = _extension_of(filename)
     if ext in GEMINI_EXTENSION_MIME_OVERRIDES:
@@ -157,138 +168,60 @@ def _guess_attachment_mime_type(filename: str) -> str:
     return mime or "application/octet-stream"
 
 
-async def _download_one_image(
-    session: aiohttp.ClientSession,
-    article_key: str,
-    url: str,
-    semaphore: asyncio.Semaphore,
+# ---------------------------------------------------------------------------
+# 멀티모달 입력 다운로드
+# ---------------------------------------------------------------------------
+
+
+async def _download_media(
+    items: list[tuple[str, str, str]],
     ssl_context: ssl.SSLContext,
-) -> tuple[str, types.Part] | None:
-    """단일 이미지를 다운로드하여 (article_key, Part) 반환. 실패 시 None."""
-    async with semaphore:
-        try:
-            async with session.get(
-                url,
-                ssl=ssl_context,
-                timeout=aiohttp.ClientTimeout(total=IMAGE_DOWNLOAD_TIMEOUT),
-            ) as resp:
-                if resp.status != 200:
-                    logger.debug("이미지 다운로드 실패 (status=%d): %s", resp.status, url)
-                    return None
-                data = await resp.read()
-
-            mime_type = _guess_mime_type(url)
-            part = types.Part.from_bytes(data=data, mime_type=mime_type)
-            logger.debug("이미지 다운로드 성공: %s (%d bytes)", url, len(data))
-            return article_key, part
-        except Exception as e:
-            logger.debug("이미지 다운로드 예외: %s - %s", url, e)
-            return None
-
-
-async def _download_images(
-    articles: list[Article], ssl_context: ssl.SSLContext
+    *,
+    max_concurrent: int,
+    timeout: int,
+    max_size: int | None = None,
 ) -> dict[str, list[types.Part]]:
-    """공지별 이미지를 병렬 다운로드하여 Gemini Part 객체로 변환. 키는 article.key."""
-    tasks_info: list[tuple[str, str]] = []
-    for a in articles:
-        for url in a.images:
-            tasks_info.append((a.key, url))
-
-    if not tasks_info:
+    """(article_key, url, mime_type) 목록을 병렬 다운로드해 공지별 Part 리스트로 묶는다."""
+    if not items:
         return {}
 
-    semaphore = asyncio.Semaphore(MAX_CONCURRENT_IMAGE_DOWNLOADS)
+    semaphore = asyncio.Semaphore(max_concurrent)
 
-    async with aiohttp.ClientSession(headers=_DEFAULT_HEADERS) as session:
+    async def one(session, key: str, url: str, mime: str) -> tuple[str, types.Part] | None:
+        data = await download_bytes(
+            session, url, ssl_context=ssl_context, timeout=timeout,
+            semaphore=semaphore, max_size=max_size,
+        )
+        if data is None:
+            return None
+        return key, types.Part.from_bytes(data=data, mime_type=mime)
+
+    async with aiohttp.ClientSession(headers=DEFAULT_HEADERS) as session:
         results = await asyncio.gather(
-            *(_download_one_image(session, key, url, semaphore, ssl_context) for key, url in tasks_info),
+            *(one(session, key, url, mime) for key, url, mime in items),
             return_exceptions=True,
         )
 
-    image_parts: dict[str, list[types.Part]] = {}
+    parts: dict[str, list[types.Part]] = {}
     for result in results:
         if isinstance(result, Exception) or result is None:
             continue
-        article_key, part = result
-        image_parts.setdefault(article_key, []).append(part)
-
-    return image_parts
-
-
-async def _download_one_attachment(
-    session: aiohttp.ClientSession,
-    article_key: str,
-    attachment: Attachment,
-    semaphore: asyncio.Semaphore,
-    ssl_context: ssl.SSLContext,
-) -> tuple[str, Attachment, bytes] | None:
-    """Gemini 지원 첨부파일을 다운로드. 실패 시 None."""
-    if attachment.ext not in GEMINI_NATIVE_EXTENSIONS:
-        return None
-
-    async with semaphore:
-        try:
-            async with session.get(
-                attachment.url,
-                ssl=ssl_context,
-                timeout=aiohttp.ClientTimeout(total=ATTACHMENT_DOWNLOAD_TIMEOUT),
-            ) as resp:
-                if resp.status != 200:
-                    logger.debug("첨부파일 다운로드 실패 (status=%d): %s", resp.status, attachment.filename)
-                    return None
-
-                content_length = resp.headers.get("Content-Length")
-                if content_length and int(content_length) > MAX_ATTACHMENT_SIZE:
-                    logger.debug("첨부파일 크기 초과 (%s bytes): %s", content_length, attachment.filename)
-                    return None
-
-                data = await resp.read()
-                if len(data) > MAX_ATTACHMENT_SIZE:
-                    logger.debug("첨부파일 크기 초과 (%d bytes): %s", len(data), attachment.filename)
-                    return None
-
-            logger.debug("첨부파일 다운로드 성공: %s (%d bytes)", attachment.filename, len(data))
-            return article_key, attachment, data
-        except Exception as e:
-            logger.debug("첨부파일 다운로드 예외: %s - %s", attachment.filename, e)
-            return None
+        key, part = result
+        parts.setdefault(key, []).append(part)
+    return parts
 
 
-async def _download_attachments(
-    articles: list[Article], ssl_context: ssl.SSLContext
-) -> dict[str, list[types.Part]]:
-    """공지별 첨부파일(PDF, 이미지)을 병렬 다운로드하여 Gemini Part 객체로 변환"""
-    tasks_info: list[tuple[str, Attachment]] = []
-    for a in articles:
-        for att in a.attachments:
-            if att.ext in GEMINI_NATIVE_EXTENSIONS:
-                tasks_info.append((a.key, att))
+def _image_items(articles: list[Article]) -> list[tuple[str, str, str]]:
+    return [(a.key, url, _guess_mime_type(url)) for a in articles for url in a.images]
 
-    if not tasks_info:
-        return {}
 
-    semaphore = asyncio.Semaphore(MAX_CONCURRENT_ATTACHMENT_DOWNLOADS)
-
-    async with aiohttp.ClientSession(headers=_DEFAULT_HEADERS) as session:
-        results = await asyncio.gather(
-            *(
-                _download_one_attachment(session, key, att, semaphore, ssl_context)
-                for key, att in tasks_info
-            ),
-            return_exceptions=True,
-        )
-
-    attachment_parts: dict[str, list[types.Part]] = {}
-    for result in results:
-        if isinstance(result, Exception) or result is None:
-            continue
-        article_key, att, data = result
-        mime_type = _guess_attachment_mime_type(att.filename)
-        part = types.Part.from_bytes(data=data, mime_type=mime_type)
-        attachment_parts.setdefault(article_key, []).append(part)
-
-    return attachment_parts
+def _attachment_items(articles: list[Article]) -> list[tuple[str, str, str]]:
+    return [
+        (a.key, att.url, _guess_attachment_mime_type(att.filename))
+        for a in articles
+        for att in a.attachments
+        if att.ext in GEMINI_NATIVE_EXTENSIONS
+    ]
 
 
 def _build_multimodal_contents(
@@ -297,38 +230,38 @@ def _build_multimodal_contents(
     image_parts: dict[str, list[types.Part]],
     attachment_parts: dict[str, list[types.Part]],
 ) -> list:
-    """텍스트 프롬프트와 이미지/첨부파일을 결합하여 멀티모달 contents 생성"""
+    """텍스트 프롬프트와 이미지/첨부파일을 결합하여 멀티모달 contents를 생성한다."""
     if not image_parts and not attachment_parts:
         return [prompt]
 
     contents: list = [prompt]
     for i, a in enumerate(articles, 1):
-        imgs = image_parts.get(a.key, [])
-        atts = attachment_parts.get(a.key, [])
-        if imgs:
+        if imgs := image_parts.get(a.key):
             contents.append(types.Part.from_text(text=f"\n--- 공지 {i}번 첨부 이미지 ---"))
             contents.extend(imgs)
-        if atts:
+        if atts := attachment_parts.get(a.key):
             contents.append(types.Part.from_text(text=f"\n--- 공지 {i}번 첨부파일 ---"))
             contents.extend(atts)
-
     return contents
 
 
+# ---------------------------------------------------------------------------
+# Gemini 호출
+# ---------------------------------------------------------------------------
+
+
 def _parse_gemini_json(text: str | None) -> list[dict]:
-    """Gemini 응답에서 JSON을 추출하고 필수 필드를 검증"""
+    """Gemini 응답에서 JSON을 추출하고 필수 필드를 검증한다."""
     if not text:
         raise ValueError("Gemini 응답이 비어 있습니다 (None 또는 빈 문자열).")
 
     text = text.strip()
     if text.startswith("```"):
         # ```json\n...\n``` 와 한 줄짜리 ```[...]``` 를 모두 처리.
-        # 앞뒤 백틱을 모두 제거한 뒤 선행 언어 지정자(json 등)를 떼어낸다.
         text = text.strip("`").strip()
         text = re.sub(r"^[a-zA-Z]+\s+", "", text, count=1).strip()
 
     results = json.loads(text)
-
     if not isinstance(results, list):
         raise ValueError(f"응답이 JSON 배열이 아닙니다: {type(results)}")
 
@@ -337,34 +270,31 @@ def _parse_gemini_json(text: str | None) -> list[dict]:
             raise ValueError(f"배열 원소가 객체가 아닙니다: {type(r)}")
         if "index" not in r or "score" not in r:
             raise ValueError(f"필수 필드(index, score) 누락: {r}")
-
     return results
 
 
 def _is_retryable_gemini_error(exc: BaseException) -> bool:
-    """네트워크/일시적 서버 오류만 재시도. 인증·권한·형식 오류는 재시도하지 않음."""
-    # 네트워크/타임아웃은 항상 재시도
+    """네트워크/일시적 서버 오류만 재시도. 인증·권한·형식 오류는 재시도하지 않는다."""
     if isinstance(exc, (asyncio.TimeoutError, TimeoutError, ConnectionError)):
         return True
-    # JSON 파싱/스키마 검증 실패 등은 재시도 불필요
     if isinstance(exc, (ValueError, TypeError, KeyError)):
         return False
     # google-genai 예외는 런타임에 상태코드 기반으로 판단 (모듈 모킹 환경 대비 지연 import)
     try:
         from google.genai import errors as genai_errors  # type: ignore
+
         api_error_cls = getattr(genai_errors, "APIError", None)
         if isinstance(api_error_cls, type) and isinstance(exc, api_error_cls):
             code = getattr(exc, "code", None) or getattr(exc, "status_code", None)
             if code is None:
                 return True  # 상태 불명 → 보수적으로 재시도
             if isinstance(code, int):
-                # 429(rate limit), 5xx(server error)만 재시도. 4xx(auth/quota/bad request)는 즉시 실패.
+                # 429(rate limit), 5xx(server error)만 재시도. 4xx는 즉시 실패.
                 return code == 429 or 500 <= code < 600
             return False
     except Exception:
         pass
-    # 그 외 알 수 없는 예외는 재시도하지 않음 (무한 재시도 방지)
-    return False
+    return False  # 알 수 없는 예외는 무한 재시도 방지를 위해 재시도하지 않음
 
 
 @retry(
@@ -375,10 +305,7 @@ def _is_retryable_gemini_error(exc: BaseException) -> bool:
 )
 def _call_gemini_api(client: genai.Client, model_name: str, contents: list | str) -> list[dict]:
     """Gemini API 호출 (tenacity로 최대 3회 지수 백오프 재시도, 재시도 가능한 오류만)"""
-    response = client.models.generate_content(
-        model=model_name,
-        contents=contents,
-    )
+    response = client.models.generate_content(model=model_name, contents=contents)
     return _parse_gemini_json(response.text)
 
 
@@ -388,34 +315,39 @@ async def _analyze_batch(
     articles: list[Article],
     config: dict,
 ) -> list[dict]:
-    """단일 배치의 공지를 분석 (이미지 + 첨부파일 포함)"""
-    profile_text = build_profile_text(config)
-    prompt = build_prompt(articles, profile_text)
+    """단일 배치의 공지를 분석한다 (이미지 + 첨부파일 포함)."""
+    prompt = build_prompt(articles, build_profile_text(config))
 
-    # 본문 크롤링과 동일한 SSL 정책으로 이미지/첨부파일을 다운로드해야
+    # 본문 크롤링과 동일한 SSL 정책으로 다운로드해야
     # ssl_verify=false 환경에서도 멀티모달 입력이 누락되지 않는다.
-    ssl_verify = config.get("settings", {}).get("ssl_verify", True)
-    ssl_context = _make_ssl_context(ssl_verify)
+    ssl_context = ssl_context_from_config(config)
 
-    # 이미지와 첨부파일을 병렬 다운로드
     image_parts, attachment_parts = await asyncio.gather(
-        _download_images(articles, ssl_context),
-        _download_attachments(articles, ssl_context),
+        _download_media(
+            _image_items(articles), ssl_context,
+            max_concurrent=MAX_CONCURRENT_IMAGE_DOWNLOADS, timeout=IMAGE_DOWNLOAD_TIMEOUT,
+        ),
+        _download_media(
+            _attachment_items(articles), ssl_context,
+            max_concurrent=MAX_CONCURRENT_ATTACHMENT_DOWNLOADS, timeout=ATTACHMENT_DOWNLOAD_TIMEOUT,
+            max_size=MAX_ATTACHMENT_SIZE,
+        ),
     )
 
     if image_parts:
-        image_count = sum(len(parts) for parts in image_parts.values())
-        logger.info("이미지 %d장 다운로드 완료", image_count)
+        logger.info("이미지 %d장 다운로드 완료", sum(len(p) for p in image_parts.values()))
     if attachment_parts:
-        att_count = sum(len(parts) for parts in attachment_parts.values())
-        logger.info("첨부파일 %d건 다운로드 완료, 멀티모달 분석 진행", att_count)
+        logger.info(
+            "첨부파일 %d건 다운로드 완료, 멀티모달 분석 진행",
+            sum(len(p) for p in attachment_parts.values()),
+        )
 
     contents = _build_multimodal_contents(prompt, articles, image_parts, attachment_parts)
     return await asyncio.to_thread(_call_gemini_api, client, model_name, contents)
 
 
 async def analyze_with_gemini(articles: list[Article], config: dict) -> list[dict]:
-    """Gemini API로 공지 관련도 분석 (배치 분할 + 이미지/첨부파일 포함 멀티모달). 실패 시 빈 리스트 반환."""
+    """Gemini API로 공지 관련도를 분석한다 (배치 분할 + 멀티모달). 전체 실패 시 빈 리스트."""
     api_key = os.environ.get("GEMINI_API_KEY", "")
     if not api_key:
         logger.warning("GEMINI_API_KEY가 설정되지 않았습니다. 키워드 매칭으로 대체됩니다.")
@@ -425,18 +357,18 @@ async def analyze_with_gemini(articles: list[Article], config: dict) -> list[dic
     model_name = config["gemini"]["model"]
 
     all_results: list[dict] = []
-    any_gemini_success = False
+    any_success = False
     for batch_start in range(0, len(articles), GEMINI_BATCH_SIZE):
         batch = articles[batch_start:batch_start + GEMINI_BATCH_SIZE]
         try:
             batch_results = await _analyze_batch(client, model_name, batch, config)
-            any_gemini_success = True
+            any_success = True
             logger.info("Gemini 배치 분석 완료: %d/%d건", batch_start + len(batch), len(articles))
         except Exception as e:
-            # 한 배치가 실패해도 성공한 배치 결과는 버리지 않고,
-            # 실패한 배치만 키워드 매칭으로 대체해 해당 공지가 누락되지 않게 한다.
+            # 한 배치가 실패해도 성공한 배치는 유지하고, 실패한 배치만 키워드 매칭으로 대체해
+            # 해당 공지가 누락되지 않게 한다.
             logger.error(
-                "Gemini API 배치 호출 최종 실패 (offset=%d, 3회 시도). 해당 배치는 키워드 매칭으로 대체: %s",
+                "Gemini API 배치 호출 최종 실패 (offset=%d, 3회 시도). 키워드 매칭으로 대체: %s",
                 batch_start, e, exc_info=True,
             )
             batch_results = keyword_fallback(batch, config)
@@ -448,39 +380,39 @@ async def analyze_with_gemini(articles: list[Article], config: dict) -> list[dic
                 r["index"] = idx + batch_start
         all_results.extend(batch_results)
 
-    # 모든 배치가 실패했다면 빈 리스트를 반환해 호출부에서 전체 키워드 폴백(method="keyword")으로 처리하게 한다.
-    return all_results if any_gemini_success else []
+    # 모든 배치가 실패했다면 빈 리스트를 반환해 호출부가 전체 키워드 폴백으로 처리하게 한다.
+    return all_results if any_success else []
 
 
 def keyword_fallback(articles: list[Article], config: dict) -> list[dict]:
-    """Gemini 실패 시 키워드 매칭으로 폴백 (첨부파일명도 포함)"""
+    """Gemini 실패 시 키워드 매칭으로 폴백한다 (첨부파일명도 포함)."""
     keywords = config.get("keywords", {})
     high_keywords: list[str] = keywords.get("high", [])
     medium_keywords: list[str] = keywords.get("medium", [])
 
     results: list[dict] = []
     for i, a in enumerate(articles, 1):
-        # 본문 + 첨부파일명을 합쳐서 키워드 매칭
         attachment_names = " ".join(att.filename for att in a.attachments)
-        text = (a.title + " " + a.description + " " + attachment_names).lower()
-        score = 1
-        reason = "키워드 매칭 없음"
+        text = f"{a.title} {a.description} {attachment_names}".lower()
+        score, reason = 1, "키워드 매칭 없음"
 
         for kw in high_keywords:
             if kw.lower() in text:
-                score = max(score, 4)
-                reason = f"키워드 '{kw}' 매칭"
+                score, reason = 4, f"키워드 '{kw}' 매칭"
                 break
-
-        if score < 4:
+        else:
             for kw in medium_keywords:
                 if kw.lower() in text:
-                    score = max(score, 3)
-                    reason = f"키워드 '{kw}' 매칭"
+                    score, reason = 3, f"키워드 '{kw}' 매칭"
                     break
 
         results.append({"index": i, "score": score, "reason": reason})
     return results
+
+
+# ---------------------------------------------------------------------------
+# 매칭 (분석 + 폴백 조율)
+# ---------------------------------------------------------------------------
 
 
 def _extract_matched(
@@ -488,7 +420,7 @@ def _extract_matched(
     articles: list[Article],
     threshold: int,
 ) -> tuple[list[tuple[Article, int, str]], int]:
-    """분석 결과에서 threshold 이상인 공지를 추출. (매칭 리스트, 유효 결과 수) 반환."""
+    """분석 결과에서 threshold 이상인 공지를 추출한다. (매칭 리스트, 유효 결과 수) 반환."""
     matched: list[tuple[Article, int, str]] = []
     valid_count = 0
 
@@ -502,17 +434,18 @@ def _extract_matched(
         valid_count += 1
         idx = idx_raw - 1
         if 0 <= idx < len(articles) and score >= threshold:
-            reason = str(r.get("reason", ""))
-            matched.append((articles[idx], score, reason))
+            matched.append((articles[idx], score, str(r.get("reason", ""))))
 
     return matched, valid_count
 
 
-async def match_articles(articles: list[Article], config: dict) -> tuple[list[tuple[Article, int, str]], str]:
-    """
-    공지 관련도 분석 후 (Article, score, reason) 튜플 리스트와 분석 방법을 반환.
-    threshold 이상인 공지만 포함, 점수 높은 순 정렬.
-    반환: (matched_list, method) - method는 "gemini", "keyword", 또는 "none"
+async def match_articles(
+    articles: list[Article], config: dict
+) -> tuple[list[tuple[Article, int, str]], str]:
+    """공지 관련도를 분석해 (Article, score, reason) 리스트와 분석 방법을 반환한다.
+
+    threshold 이상인 공지만, 점수 내림차순(동점이면 최신 우선)으로 정렬한다.
+    method는 "gemini", "keyword", 또는 "none".
     """
     if not articles:
         return [], "none"
@@ -529,13 +462,12 @@ async def match_articles(articles: list[Article], config: dict) -> tuple[list[tu
 
     matched, valid_count = _extract_matched(results, articles, threshold)
 
-    # Gemini 응답이 있었지만 유효 결과가 하나도 없으면 키워드 매칭으로 재시도
+    # Gemini 응답은 있었지만 유효 결과가 하나도 없으면 키워드 매칭으로 재시도
     if method == "gemini" and valid_count == 0:
         logger.info("Gemini 결과 형식이 유효하지 않아 키워드 매칭으로 대체합니다.")
         results = keyword_fallback(articles, config)
         method = "keyword"
         matched, _ = _extract_matched(results, articles, threshold)
 
-    # 점수 내림차순, 동점이면 최신 공지 우선
     matched.sort(key=lambda x: (x[1], _sort_date(x[0])), reverse=True)
     return matched, method

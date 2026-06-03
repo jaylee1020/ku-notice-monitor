@@ -1,11 +1,11 @@
-"""main.py 단위 테스트"""
+"""config.py(설정 로딩/검증) 단위 테스트"""
 
 import os
 from unittest.mock import patch
 
 import pytest
 
-from main import _load_json_env, validate_config
+from config import _load_json_env, validate_config
 
 # --- _load_json_env ---
 

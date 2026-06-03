@@ -113,16 +113,21 @@ settings:
 
 ```
 ku-notice-monitor/
-├── main.py          # 메인 실행 파일 (로깅 설정, 설정 검증, 워크플로우 조율)
+├── main.py          # 메인 실행 파일 (워크플로우 조율)
+├── config.py        # config.yaml 로딩 및 유효성 검증
 ├── feeds.py         # RSS 피드 수집 (비동기 aiohttp, BeautifulSoup 본문 파싱)
 ├── matcher.py       # Gemini API 관련도 분석 (tenacity 재시도 로직)
 ├── notifier.py      # 텔레그램 알림 (오류 알림 포함)
+├── net.py           # 공통 HTTP/SSL 유틸리티 (feeds/matcher 공유)
+├── state.py         # 처리된 공지 ID 상태 관리 (원자적 쓰기)
+├── models.py        # Article/Attachment 데이터 모델
 ├── constants.py     # 전역 상수
 ├── config.yaml      # 설정 파일
 ├── state.json       # 처리된 공지 ID 상태 (자동 생성)
 └── .github/
     └── workflows/
-        └── monitor.yml  # GitHub Actions 워크플로우
+        ├── ci.yml       # 린트 + 테스트 (push/PR)
+        └── monitor.yml  # GitHub Actions 모니터링 워크플로우
 ```
 
 ## 트러블슈팅
