@@ -13,22 +13,26 @@ from models import Article
 logger = logging.getLogger(__name__)
 
 
+def _initial_state() -> dict:
+    return {"seen_ids": {}, "last_run": None}
+
+
 def load_state(state_path: str) -> dict:
     """state.json 로드. 없거나 손상되면 초기 상태 반환"""
     path = Path(state_path)
     if not path.exists():
-        return {"seen_ids": {}, "last_run": None}
+        return _initial_state()
 
     try:
         with open(path, "r", encoding="utf-8") as f:
             state = json.load(f)
     except (json.JSONDecodeError, OSError) as e:
         logger.warning("state 파일 로드 실패, 초기 상태로 복구합니다: %s", e)
-        return {"seen_ids": {}, "last_run": None}
+        return _initial_state()
 
     if not isinstance(state, dict):
         logger.warning("state 파일 형식 오류(객체 아님). 초기 상태로 복구합니다.")
-        return {"seen_ids": {}, "last_run": None}
+        return _initial_state()
 
     state.setdefault("seen_ids", {})
     state.setdefault("last_run", None)
