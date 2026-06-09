@@ -373,12 +373,15 @@ async def analyze_with_gemini(articles: list[Article], config: dict) -> list[dic
             )
             batch_results = keyword_fallback(batch, config)
 
-        # 배치 내 index를 전체 index로 보정 (Gemini/키워드 결과 모두 1-based)
+        # 배치 내 index를 전체 index로 보정 (Gemini/키워드 결과 모두 1-based).
+        # 배치 범위를 벗어난 index(환각)는 다른 배치의 공지로 잘못 매핑되므로 버린다.
         for r in batch_results:
             idx = _parse_index(r.get("index"))
-            if idx is not None:
-                r["index"] = idx + batch_start
-        all_results.extend(batch_results)
+            if idx is None or idx > len(batch):
+                logger.debug("배치 범위를 벗어난 분석 결과를 건너뜁니다 (offset=%d): %s", batch_start, r)
+                continue
+            r["index"] = idx + batch_start
+            all_results.append(r)
 
     # 모든 배치가 실패했다면 빈 리스트를 반환해 호출부가 전체 키워드 폴백으로 처리하게 한다.
     return all_results if any_success else []

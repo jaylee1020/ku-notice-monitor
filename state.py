@@ -3,6 +3,7 @@
 import json
 import logging
 import os
+import re
 import tempfile
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -15,6 +16,21 @@ logger = logging.getLogger(__name__)
 
 def _initial_state() -> dict:
     return {"seen_ids": {}, "last_run": None}
+
+
+def _normalize_seen_key(key: str) -> str:
+    """게시물 ID 대신 링크가 저장된 구형 키를 'board_id:artcl_id' 형식으로 정규화한다.
+
+    과거 extract_article_id()가 www.konkuk.ac.kr 외 게시판(예: kuinc)의 링크에서
+    ID를 추출하지 못해 '4083:/bbs/job/4083/1168188/artclView.do?...' 형태로
+    저장된 키를 '4083:1168188'로 변환한다. 변환하지 않으면 ID 추출 수정 후
+    해당 공지들이 전부 신규로 재인식되어 중복 알림이 발생한다.
+    """
+    board, sep, rest = key.partition(":")
+    if not sep:
+        return key
+    match = re.search(r"/(\d+)/artclView", rest)
+    return f"{board}:{match.group(1)}" if match else key
 
 
 def load_state(state_path: str) -> dict:
@@ -42,7 +58,7 @@ def load_state(state_path: str) -> dict:
     normalized_seen: dict[str, str] = {}
     for k, v in state["seen_ids"].items():
         if isinstance(v, str):
-            normalized_seen[str(k)] = v
+            normalized_seen[_normalize_seen_key(str(k))] = v
     state["seen_ids"] = normalized_seen
 
     return state

@@ -386,6 +386,32 @@ def test_analyze_with_gemini_partial_batch_failure_uses_keyword_for_failed_batch
     assert matched_ids == list(range(15)), f"누락된 공지가 있음: {matched_ids}"
 
 
+def test_analyze_with_gemini_drops_out_of_batch_indices(make_article, monkeypatch):
+    """배치 크기를 벗어난 환각 index는 다른 배치의 공지로 매핑되지 않도록 버려져야 한다."""
+    from matcher import _extract_matched
+
+    # 15개 → 2개 배치 (10/5). 첫 배치가 index 11(범위 밖)을 환각으로 반환.
+    articles = [make_article(id=str(i), title=f"공지 {i}") for i in range(15)]
+
+    async def fake_analyze_batch(client, model_name, batch, config):
+        results = [{"index": i + 1, "score": 1, "reason": "test"} for i in range(len(batch))]
+        if len(batch) == 10:  # 첫 번째 배치에 범위 밖 index 추가
+            results.append({"index": 11, "score": 5, "reason": "환각"})
+        return results
+
+    monkeypatch.setenv("GEMINI_API_KEY", "dummy")
+    import matcher
+    monkeypatch.setattr(matcher, "_analyze_batch", fake_analyze_batch)
+
+    config = {"gemini": {"model": "test", "relevance_threshold": 5}, "profile": {}, "keywords": {}}
+    results = asyncio.get_event_loop().run_until_complete(analyze_with_gemini(articles, config))
+
+    # 환각 index(11)가 두 번째 배치의 첫 공지(전역 index 11)로 새지 않아야 한다
+    matched, valid = _extract_matched(results, articles, threshold=5)
+    assert matched == [], f"환각 index가 다른 배치 공지로 매핑됨: {[a.id for a, _, _ in matched]}"
+    assert valid == 15
+
+
 def test_analyze_with_gemini_all_batches_fail_returns_empty(make_article, monkeypatch):
     """모든 배치가 실패하면 빈 리스트를 반환해 호출부의 전체 키워드 폴백으로 넘긴다."""
     articles = [make_article(id=str(i), title=f"공지 {i}") for i in range(3)]

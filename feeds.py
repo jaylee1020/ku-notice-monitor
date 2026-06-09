@@ -5,10 +5,12 @@ import logging
 import re
 import ssl
 from datetime import datetime
+from html import unescape
+from urllib.parse import urlsplit
 
 import aiohttp
 import feedparser
-from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
+from tenacity import retry, retry_if_exception, retry_if_exception_type, stop_after_attempt, wait_exponential
 
 from constants import (
     ARTICLE_BODY_TIMEOUT,
@@ -50,8 +52,12 @@ def _safe_pub_date_string(entry) -> str:
 
 
 def extract_article_id(link: str) -> str:
-    """링크 경로에서 게시물 ID 추출: /bbs/konkuk/234/1166860/artclView.do → 1166860"""
-    match = re.search(r"/bbs/konkuk/\d+/(\d+)/artclView", link)
+    """링크 경로에서 게시물 ID 추출: /bbs/{사이트}/234/1166860/artclView.do → 1166860
+
+    www.konkuk.ac.kr(/bbs/konkuk/...)뿐 아니라 kuinc.konkuk.ac.kr(/bbs/job/...) 등
+    사이트 경로가 다른 게시판도 동일하게 처리한다.
+    """
+    match = re.search(r"/bbs/[^/]+/\d+/(\d+)/artclView", link)
     if not match:
         logger.debug("게시물 ID 추출 실패, 링크를 ID로 사용: %s", link)
         return link
@@ -62,6 +68,12 @@ def normalize_link(link: str, base_url: str) -> str:
     """상대 링크를 절대 URL로 변환하고 쿼리 파라미터를 제거한다."""
     link = link.split("?")[0]
     return base_url + link if link.startswith("/") else link
+
+
+def base_url_of(url: str) -> str:
+    """절대 URL에서 'scheme://host' 부분을 추출한다. 절대 URL이 아니면 빈 문자열."""
+    parts = urlsplit(url)
+    return f"{parts.scheme}://{parts.netloc}" if parts.scheme and parts.netloc else ""
 
 
 def is_empty_feed_item(entry) -> bool:
@@ -76,16 +88,11 @@ def _to_int(value, default: int = 0) -> int:
         return default
 
 
-_HTML_ENTITIES = {"&nbsp;": " ", "&amp;": "&", "&lt;": "<", "&gt;": ">", "&quot;": '"'}
-
-
 def _strip_html(html: str) -> str:
-    """HTML 태그 제거 후 공백 정규화 (BeautifulSoup 없이 간단 처리)"""
+    """HTML 태그 제거 후 엔티티 복원·공백 정규화 (BeautifulSoup 없이 간단 처리)"""
     if not html:
         return ""
-    text = re.sub(r"<[^>]+>", " ", html)
-    for entity, char in _HTML_ENTITIES.items():
-        text = text.replace(entity, char)
+    text = unescape(re.sub(r"<[^>]+>", " ", html))
     return re.sub(r"\s+", " ", text).strip()
 
 
@@ -140,8 +147,17 @@ def _parse_entry(entry, board_name: str, board_id: int, base_url: str) -> Articl
 # ---------------------------------------------------------------------------
 
 
+def _is_retryable_feed_error(exc: BaseException) -> bool:
+    """4xx 응답(429 제외)은 재시도해도 결과가 같으므로 즉시 실패시킨다."""
+    status = getattr(exc, "status", None)
+    if isinstance(status, int) and 400 <= status < 500:
+        return status == 429
+    return True
+
+
 @retry(
-    retry=retry_if_exception_type((aiohttp.ClientError, asyncio.TimeoutError)),
+    retry=retry_if_exception_type((aiohttp.ClientError, asyncio.TimeoutError))
+    & retry_if_exception(_is_retryable_feed_error),
     stop=stop_after_attempt(3),
     wait=wait_exponential(multiplier=1, min=2, max=10),
     reraise=True,
@@ -155,8 +171,10 @@ async def _fetch_feed_async(
     ssl_context: ssl.SSLContext,
 ) -> list[Article]:
     """단일 RSS 피드를 수집하고 Article 리스트로 반환 (최대 3회 재시도)"""
-    base_url = config["settings"]["base_url"]
     url = feed_config.get("rss_url") or config["settings"]["rss_url_template"].format(board_id=board_id)
+    # 상대 링크는 해당 피드가 서빙되는 호스트 기준으로 해석해야 한다.
+    # (예: kuinc.konkuk.ac.kr 피드의 링크를 www.konkuk.ac.kr로 잘못 연결하지 않도록)
+    base_url = base_url_of(url) or config["settings"]["base_url"]
 
     async with session.get(
         url, ssl=ssl_context, timeout=aiohttp.ClientTimeout(total=FEED_FETCH_TIMEOUT)
@@ -348,7 +366,10 @@ async def enrich_articles_with_body(articles: list[Article], config: dict) -> No
     async with aiohttp.ClientSession(headers=DEFAULT_HEADERS) as session:
         results = await asyncio.gather(
             *(
-                _fetch_article_body_async(session, a.link, ssl_context, base_url, semaphore)
+                # 이미지/첨부파일 상대 경로는 게시물이 있는 호스트 기준으로 해석한다.
+                _fetch_article_body_async(
+                    session, a.link, ssl_context, base_url_of(a.link) or base_url, semaphore
+                )
                 for a in link_articles
             ),
             return_exceptions=True,
