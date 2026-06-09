@@ -12,6 +12,7 @@ concurrency:
 jobs:
   monitor:
     runs-on: ubuntu-latest
+    timeout-minutes: 15  # 네트워크 행(hang) 시 기본 6시간 동안 러너가 잡혀 있는 것을 방지
     permissions:
       contents: write
 

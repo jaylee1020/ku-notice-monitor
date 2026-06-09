@@ -10,9 +10,11 @@ from feeds import (
     _extract_attachments,
     _extract_image_urls,
     _extract_rss_content,
+    _is_retryable_feed_error,
     _safe_pub_date_string,
     _strip_html,
     _to_int,
+    base_url_of,
     extract_article_id,
     is_empty_feed_item,
     normalize_link,
@@ -67,10 +69,47 @@ def test_safe_pub_date_string_invalid_preserves_raw():
 @pytest.mark.parametrize("link,expected", [
     ("/bbs/konkuk/234/1166860/artclView.do", "1166860"),
     ("/bbs/konkuk/999/1234567/artclView.do", "1234567"),
+    # kuinc 등 사이트 경로가 konkuk이 아닌 게시판도 ID를 추출해야 한다
+    ("/bbs/job/4083/1168188/artclView.do?layout=unknown", "1168188"),
+    ("https://kuinc.konkuk.ac.kr/bbs/job/4083/1168188/artclView.do", "1168188"),
     ("https://example.com/page", "https://example.com/page"),
 ])
 def test_extract_article_id(link, expected):
     assert extract_article_id(link) == expected
+
+
+# --- base_url_of ---
+
+
+@pytest.mark.parametrize("url,expected", [
+    ("https://kuinc.konkuk.ac.kr/bbs/job/4083/rssList.do", "https://kuinc.konkuk.ac.kr"),
+    ("https://www.konkuk.ac.kr/bbs/konkuk/234/rssList.do", "https://www.konkuk.ac.kr"),
+    ("/bbs/job/4083/rssList.do", ""),
+    ("", ""),
+])
+def test_base_url_of(url, expected):
+    assert base_url_of(url) == expected
+
+
+# --- _is_retryable_feed_error ---
+
+
+def test_is_retryable_feed_error_4xx_not_retried():
+    class FakeResponseError(Exception):
+        def __init__(self, status):
+            self.status = status
+
+    assert _is_retryable_feed_error(FakeResponseError(404)) is False
+    assert _is_retryable_feed_error(FakeResponseError(403)) is False
+    assert _is_retryable_feed_error(FakeResponseError(429)) is True  # rate limit은 재시도
+    assert _is_retryable_feed_error(FakeResponseError(500)) is True
+    assert _is_retryable_feed_error(FakeResponseError(503)) is True
+
+
+def test_is_retryable_feed_error_network_errors_retried():
+    # 상태코드가 없는 네트워크/타임아웃 오류는 재시도
+    assert _is_retryable_feed_error(TimeoutError()) is True
+    assert _is_retryable_feed_error(ConnectionError()) is True
 
 
 # --- normalize_link ---
@@ -174,6 +213,22 @@ def test_load_state_existing_file(tmp_path):
     path.write_text('{"seen_ids": {"1": "2026-01-01"}, "last_run": "2026-01-01"}')
     result = load_state(str(path))
     assert "1" in result["seen_ids"]
+
+
+def test_load_state_migrates_link_style_keys(tmp_path):
+    """ID 추출 실패로 링크가 키에 저장된 구형 항목을 'board_id:artcl_id'로 정규화한다."""
+    path = tmp_path / "state.json"
+    path.write_text(json.dumps({
+        "seen_ids": {
+            "4083:/bbs/job/4083/1168188/artclView.do?layout=unknown": "2026-01-01T00:00:00",
+            "234:1166860": "2026-01-01T00:00:00",
+        },
+        "last_run": None,
+    }), encoding="utf-8")
+    result = load_state(str(path))
+    assert "4083:1168188" in result["seen_ids"]
+    assert "4083:/bbs/job/4083/1168188/artclView.do?layout=unknown" not in result["seen_ids"]
+    assert "234:1166860" in result["seen_ids"]  # 정상 키는 그대로 유지
 
 
 def test_load_state_corrupted_file_returns_default(tmp_path):
@@ -343,6 +398,11 @@ def test_strip_html_basic():
     assert _strip_html("<p>안녕<br>하세요</p>") == "안녕 하세요"
     assert _strip_html("A &amp; B &lt;tag&gt;") == "A & B <tag>"
     assert _strip_html("") == ""
+
+
+def test_strip_html_numeric_and_named_entities():
+    # 수치 참조(&#39;)와 &nbsp; 같은 명명 엔티티도 복원/정규화되어야 한다
+    assert _strip_html("Kim&#39;s&nbsp;공지") == "Kim's 공지"
 
 
 def test_extract_rss_content_prefers_longest():
