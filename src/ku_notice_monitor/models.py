@@ -3,6 +3,7 @@
 import hashlib
 import json
 from dataclasses import asdict, dataclass, field
+from typing import Literal
 
 
 @dataclass
@@ -68,21 +69,39 @@ class ClassifiedNotice:
     """분리된 판정 축과 최종 전달 정책을 담는 공지."""
 
     article: Article
-    delivery: str
-    category: str
+    delivery: Literal["immediate", "digest", "review", "suppress"]
+    category: Literal[
+        "academic",
+        "tuition",
+        "scholarship",
+        "career",
+        "international",
+        "event",
+        "campus_life",
+        "administrative",
+        "other",
+    ]
     summary: str
     reason: str
-    audience_fit: str = "unknown"
-    interest_fit: str = "low"
-    obligation: str = "none"
-    consequence: str = "none"
+    audience_fit: Literal[
+        "eligible", "possibly_eligible", "ineligible", "unknown"
+    ] = "unknown"
+    interest_fit: Literal["high", "medium", "low"] = "low"
+    obligation: Literal["required", "optional", "none"] = "none"
+    consequence: Literal[
+        "academic_risk",
+        "financial_loss",
+        "administrative_block",
+        "missed_opportunity",
+        "none",
+    ] = "none"
     deadline: str | None = None
     dates: list[dict] = field(default_factory=list)
     actions: list[str] = field(default_factory=list)
     benefits: list[str] = field(default_factory=list)
     evidence: list[str] = field(default_factory=list)
     uncertainties: list[str] = field(default_factory=list)
-    source: str = "openai"
+    source: Literal["openai", "rules", "legacy"] = "openai"
 
     @property
     def urgency(self) -> str:
@@ -136,7 +155,3 @@ class ClassifiedNotice:
             data.setdefault("source", "legacy")
         data.pop("score", None)
         return cls(**data)
-
-
-# 외부 호출부 호환을 위한 별칭. 새 코드에서는 ClassifiedNotice를 사용한다.
-ArticleMatch = ClassifiedNotice

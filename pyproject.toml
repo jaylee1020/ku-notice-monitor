@@ -4,12 +4,13 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ku-notice-monitor"
-version = "1.0.0"
+version = "2.0.0"
 description = "건국대학교 공지사항 모니터링 에이전트"
 requires-python = ">=3.12"
 dependencies = [
     "feedparser>=6.0",
     "openai>=2.0",
+    "httpx[socks]>=0.28",
     "pydantic>=2.0",
     "python-telegram-bot>=21.0",
     "python-dotenv>=1.0",
@@ -19,29 +20,21 @@ dependencies = [
     "aiohttp>=3.9",
     "certifi>=2024.2",
     "tenacity>=8.0",
+    "syhwp==0.0.7",
 ]
 
-[tool.setuptools]
-py-modules = [
-    "analysis_models",
-    "classification",
-    "config",
-    "constants",
-    "feeds",
-    "main",
-    "matcher",
-    "models",
-    "net",
-    "notifier",
-    "openai_classifier",
-    "prompts",
-    "state",
-]
+[project.scripts]
+ku-notice-monitor = "ku_notice_monitor.main:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
 
 [project.optional-dependencies]
 dev = [
     "ruff>=0.4",
     "pytest>=8.0",
+    "pytest-cov>=6.0",
+    "mypy>=1.15",
 ]
 
 [tool.ruff]
@@ -53,3 +46,23 @@ select = ["E", "F", "W", "I"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+pythonpath = ["src"]
+
+[tool.coverage.run]
+branch = true
+source = ["ku_notice_monitor"]
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = true
+fail_under = 75
+
+[tool.mypy]
+python_version = "3.12"
+check_untyped_defs = true
+ignore_missing_imports = true
+warn_unused_ignores = true
+warn_redundant_casts = true
+
+[tool.uv]
+required-version = "==0.11.29"

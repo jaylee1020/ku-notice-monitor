@@ -18,7 +18,7 @@ for mod_name in [
     if mod_name not in sys.modules:
         sys.modules[mod_name] = MagicMock()
 
-from models import Article, Attachment, ClassifiedNotice  # noqa: E402
+from ku_notice_monitor.models import Article, Attachment, ClassifiedNotice  # noqa: E402
 
 
 @pytest.fixture

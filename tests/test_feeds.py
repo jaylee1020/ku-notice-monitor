@@ -1,26 +1,31 @@
 """feeds.py 단위 테스트"""
 
+import asyncio
 import json
 from datetime import datetime, timedelta
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
-from feeds import (
+from ku_notice_monitor.feeds import (
     _extract_attachments,
     _extract_image_urls,
     _extract_rss_content,
+    _html_to_markdown,
     _is_retryable_feed_error,
     _safe_pub_date_string,
     _strip_html,
     _to_int,
     base_url_of,
     extract_article_id,
+    fetch_all_feeds_detailed,
     is_empty_feed_item,
     normalize_link,
     parse_pub_date,
 )
-from state import (
+from ku_notice_monitor.state import (
+    StateCorruptionError,
     filter_new_articles,
     load_state,
     mark_as_seen,
@@ -234,12 +239,18 @@ def test_load_state_migrates_link_style_keys(tmp_path):
     assert "234:1166860" in result["seen_ids"]  # 정상 키는 그대로 유지
 
 
-def test_load_state_corrupted_file_returns_default(tmp_path):
+def test_load_state_corrupted_file_stops_safely(tmp_path):
     path = tmp_path / "state.json"
     path.write_text('{"seen_ids":', encoding="utf-8")
-    result = load_state(str(path))
-    assert result["seen_ids"] == {}
-    assert result["pending_digest"] == []
+    with pytest.raises(StateCorruptionError):
+        load_state(str(path))
+
+
+def test_load_state_rejects_future_schema(tmp_path):
+    path = tmp_path / "state.json"
+    path.write_text('{"schema_version": 999}', encoding="utf-8")
+    with pytest.raises(StateCorruptionError, match="새로운 state 스키마"):
+        load_state(str(path))
 
 
 # --- save_state ---
@@ -295,10 +306,31 @@ def test_extract_image_urls_empty():
     assert urls == []
 
 
+def test_html_to_markdown_preserves_table_relationships():
+    from bs4 import BeautifulSoup
+
+    html = """
+    <div>
+      <h2>지원 자격</h2>
+      <table>
+        <tr><th>학년</th><th>마감</th></tr>
+        <tr><td>2학년</td><td>8월 10일</td></tr>
+      </table>
+      <ul><li>서류 제출</li></ul>
+    </div>
+    """
+    content = BeautifulSoup(html, "html.parser").find("div")
+    markdown = _html_to_markdown(content)
+    assert "## 지원 자격" in markdown
+    assert "| 학년 | 마감 |" in markdown
+    assert "| 2학년 | 8월 10일 |" in markdown
+    assert "- 서류 제출" in markdown
+
+
 def test_extract_image_urls_respects_max_limit():
     from bs4 import BeautifulSoup
 
-    from constants import MAX_IMAGES_PER_ARTICLE
+    from ku_notice_monitor.constants import MAX_IMAGES_PER_ARTICLE
 
     imgs = "".join(f'<img src="https://example.com/img{i}.jpg">' for i in range(MAX_IMAGES_PER_ARTICLE + 5))
     html = f"<div>{imgs}</div>"
@@ -505,3 +537,33 @@ def test_filter_new_articles_migrates_legacy_id_key(make_article):
     assert result == []
     assert "243:1" in state["seen_ids"]
     assert "1" not in state["seen_ids"]
+
+
+def test_fetch_all_feeds_reports_partial_failure(make_article):
+    config = {
+        "feeds": {
+            "학사": {"id": 234, "enabled": True},
+            "장학": {"id": 235, "enabled": True},
+        },
+        "settings": {
+            "ssl_verify": True,
+            "base_url": "https://www.konkuk.ac.kr",
+            "rss_url_template": "https://www.konkuk.ac.kr/{board_id}",
+            "allowed_download_hosts": ["konkuk.ac.kr"],
+        },
+    }
+
+    async def fake_fetch(_session, name, *_args):
+        if name == "장학":
+            raise TimeoutError("feed timeout")
+        return [make_article()]
+
+    with (
+        patch("ku_notice_monitor.feeds.make_ssl_context", return_value=None),
+        patch("ku_notice_monitor.feeds._fetch_feed_async", side_effect=fake_fetch),
+    ):
+        batch = asyncio.run(fetch_all_feeds_detailed(config))
+    assert len(batch.articles) == 1
+    assert batch.successful_count == 1
+    assert batch.failed_count == 1
+    assert batch.statuses[1].error.startswith("TimeoutError")

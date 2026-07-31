@@ -5,12 +5,13 @@ EMPTY_FEED_SENTINEL = "no exist data"
 BOARD_CONTENT_CLASS = "hwp_editor_board_content"
 
 # 본문 수집 (멀티모달 컨텍스트를 위한 넉넉한 상한)
-MAX_ARTICLE_BODY_LENGTH = 4000
+MAX_ARTICLE_BODY_LENGTH = 12000
 MAX_IMAGES_PER_ARTICLE = 6
 IMAGE_DOWNLOAD_TIMEOUT = 15
+MAX_IMAGE_SIZE = 10 * 1024 * 1024
 
 # 프롬프트에 포함할 설명 텍스트 절삭 길이
-PROMPT_DESCRIPTION_MAX_LENGTH = 2000
+PROMPT_DESCRIPTION_MAX_LENGTH = 6000
 
 # 이미지 필터 (트래킹 픽셀/아이콘 배제)
 MIN_IMAGE_URL_LENGTH = 10
@@ -19,9 +20,12 @@ MIN_IMAGE_URL_LENGTH = 10
 ATTACHMENT_DOWNLOAD_TIMEOUT = 45
 MAX_ATTACHMENT_SIZE = 20 * 1024 * 1024
 MAX_TOTAL_MEDIA_SIZE = 45 * 1024 * 1024
+MAX_DOWNLOAD_REDIRECTS = 3
+MAX_EXTRACTED_DOCUMENT_LENGTH = 200_000
 
 # Responses API에 직접 전달하는 미디어 형식.
 OPENAI_IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".gif", ".webp"}
+OPENAI_HWP_EXTENSIONS = {".hwp", ".hwpx"}
 OPENAI_FILE_EXTENSIONS = {
     ".pdf", ".txt", ".md", ".csv", ".tsv", ".html", ".htm", ".xml", ".rtf", ".json",
     ".doc", ".docx", ".ppt", ".pptx", ".xls", ".xlsx",
@@ -59,6 +63,8 @@ STATE_RETENTION_DAYS = 90
 # 네트워크 타임아웃 (초)
 FEED_FETCH_TIMEOUT = 15
 ARTICLE_BODY_TIMEOUT = 15
+MAX_FEED_SIZE = 5 * 1024 * 1024
+MAX_ARTICLE_HTML_SIZE = 5 * 1024 * 1024
 
 # 동시 요청 제한 (멀티모달 처리량 향상 + 서버 과부하/차단 방지)
 MAX_CONCURRENT_IMAGE_DOWNLOADS = 8

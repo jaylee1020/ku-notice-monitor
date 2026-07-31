@@ -8,3 +8,6 @@ venv/
 logs/
 .claude/
 search_state.json
+.coverage
+htmlcov/
+*.egg-info/

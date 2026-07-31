@@ -8,20 +8,21 @@ from unittest.mock import AsyncMock, patch
 import pytest
 from pydantic import ValidationError
 
-import openai_classifier
-from analysis_models import NoticeAssessment, NoticeDate
-from classification import Delivery, classify_assessment, decide_delivery
-from matcher import keyword_fallback, match_articles
-from models import Attachment
-from openai_classifier import (
+from ku_notice_monitor import openai_classifier
+from ku_notice_monitor.analysis_models import NoticeAssessment, NoticeDate
+from ku_notice_monitor.classification import Delivery, classify_assessment, decide_delivery
+from ku_notice_monitor.matcher import keyword_fallback, match_articles, validate_assessment_grounding
+from ku_notice_monitor.models import Attachment
+from ku_notice_monitor.openai_classifier import (
     MediaPayload,
     _build_input_content,
     _classify_one,
     _extension_of,
     _guess_mime_type,
     _is_retryable_openai_error,
+    _media_items,
 )
-from prompts import build_profile_text, build_prompt
+from ku_notice_monitor.prompts import build_profile_text, build_prompt, select_relevant_excerpt
 
 
 def _config(**ai_overrides):
@@ -86,6 +87,16 @@ def test_build_prompt_is_single_notice_and_marks_attachment_pass(make_article):
     assert "기존 공지 수정본" in prompt
     assert "안내.pdf" in prompt
     assert "직접 확인" in prompt
+    assert "<notice_content>" in prompt
+
+
+def test_prompt_excerpt_preserves_head_critical_window_and_tail():
+    body = "앞부분 " + ("일반 내용 " * 800) + "신청 마감 2026-08-10 " + ("기타 " * 800) + "맨 끝 자격 조건"
+    excerpt = select_relevant_excerpt(body, limit=1000)
+    assert excerpt.startswith("[본문 앞부분]")
+    assert "신청 마감 2026-08-10" in excerpt
+    assert "맨 끝 자격 조건" in excerpt
+    assert len(excerpt) <= 1000
 
 
 def test_notice_assessment_keeps_axes_separate():
@@ -194,7 +205,7 @@ def test_match_articles_openai_success(make_article):
         consequence="missed_opportunity",
     ).model_dump(mode="json")
     with patch(
-        "matcher.analyze_with_openai",
+        "ku_notice_monitor.matcher.analyze_with_openai",
         new_callable=AsyncMock,
         return_value={article.key: raw},
     ):
@@ -212,7 +223,7 @@ def test_match_articles_partially_falls_back(make_article):
         consequence="missed_opportunity",
     ).model_dump(mode="json")
     with patch(
-        "matcher.analyze_with_openai",
+        "ku_notice_monitor.matcher.analyze_with_openai",
         new_callable=AsyncMock,
         return_value={openai_article.key: raw},
     ):
@@ -246,6 +257,17 @@ def test_guess_mime_type_uses_stable_mapping():
     assert _guess_mime_type("photo.JPG", image=True) == "image/jpeg"
 
 
+def test_hwp_attachments_are_selected_for_safe_conversion(make_article):
+    article = make_article(
+        attachments=[
+            Attachment("지원서.hwp", "https://www.konkuk.ac.kr/a.hwp"),
+            Attachment("안내.hwpx", "https://www.konkuk.ac.kr/b.hwpx"),
+        ]
+    )
+    items = _media_items(article)
+    assert [item[3] for item in items] == ["hwp", "hwp"]
+
+
 def test_build_input_content_uses_low_detail():
     media = [
         MediaPayload("photo.jpg", "image/jpeg", b"image", "image"),
@@ -272,6 +294,39 @@ def test_retryable_openai_error():
     assert _is_retryable_openai_error(ValueError("bad schema")) is False
 
 
+def test_ungrounded_ineligible_is_changed_to_unknown(make_article):
+    assessment = _assessment(
+        audience_fit="ineligible",
+        audience_reason="대학원생만 가능",
+        evidence=["대학원 재학생만 지원 가능"],
+    )
+    grounded = validate_assessment_grounding(
+        make_article(title="전체 학생 대상 프로그램", description="재학생 신청 가능"),
+        assessment,
+    )
+    assert grounded.audience_fit.value == "unknown"
+    assert grounded.evidence == []
+    assert grounded.uncertainties
+
+
+def test_hallucinated_dates_are_removed(make_article):
+    assessment = _assessment(
+        dates=[
+            {
+                "kind": "application_deadline",
+                "date": "2026-09-30",
+                "label": "신청 마감",
+            }
+        ]
+    )
+    grounded = validate_assessment_grounding(
+        make_article(description="신청 일정은 추후 공지"),
+        assessment,
+    )
+    assert grounded.dates == []
+    assert any("날짜" in item for item in grounded.uncertainties)
+
+
 def test_call_openai_api_returns_parsed_schema():
     parsed = _assessment(interest_fit="medium")
     response = SimpleNamespace(
@@ -281,12 +336,14 @@ def test_call_openai_api_returns_parsed_schema():
     client = SimpleNamespace(
         responses=SimpleNamespace(parse=AsyncMock(return_value=response))
     )
+    metrics = {}
     result = asyncio.run(
         openai_classifier._call_openai_api(
             client,
             model_name="gpt-5.6-luna",
             reasoning_effort="low",
             content=[{"type": "input_text", "text": "test"}],
+            metrics=metrics,
         )
     )
     assert result.interest_fit.value == "medium"
@@ -294,6 +351,14 @@ def test_call_openai_api_returns_parsed_schema():
     assert kwargs["model"] == "gpt-5.6-luna"
     assert kwargs["text_format"] is NoticeAssessment
     assert kwargs["store"] is False
+    assert metrics == {
+        "request_attempts": 1,
+        "successful_calls": 1,
+        "input_tokens": 10,
+        "output_tokens": 5,
+        "total_tokens": 15,
+        "cached_input_tokens": 0,
+    }
 
 
 def test_classify_one_only_loads_attachments_when_required(make_article):
@@ -303,7 +368,7 @@ def test_classify_one_only_loads_attachments_when_required(make_article):
     first = _assessment(attachment_need="required")
     second = _assessment(attachment_need="not_needed", evidence=["첨부 확인"])
     with patch(
-        "openai_classifier._analyze_article",
+        "ku_notice_monitor.openai_classifier._analyze_article",
         new_callable=AsyncMock,
         side_effect=[first, second],
     ) as analyze:
@@ -336,7 +401,7 @@ def test_analyze_with_openai_returns_results_by_article_key(
     monkeypatch.setenv("OPENAI_API_KEY", "dummy")
     articles = [make_article(id="1"), make_article(id="2")]
 
-    async def fake_classify(client, article, config, semaphore):
+    async def fake_classify(client, article, config, semaphore, metrics=None):
         return article.key, _assessment().model_dump(mode="json")
 
     monkeypatch.setattr(openai_classifier, "_classify_one", fake_classify)

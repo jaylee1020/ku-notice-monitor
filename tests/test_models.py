@@ -2,7 +2,7 @@
 
 import pytest
 
-from models import Attachment, ClassifiedNotice
+from ku_notice_monitor.models import Attachment, ClassifiedNotice
 
 
 @pytest.mark.parametrize("filename,expected_ext", [

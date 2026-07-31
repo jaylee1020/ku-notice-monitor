@@ -5,6 +5,8 @@ from enum import StrEnum
 
 from pydantic import BaseModel, Field, field_validator
 
+ASSESSMENT_SCHEMA_VERSION = 1
+
 
 class NoticeCategory(StrEnum):
     ACADEMIC = "academic"

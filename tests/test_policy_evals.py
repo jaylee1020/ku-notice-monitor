@@ -6,8 +6,8 @@ from pathlib import Path
 
 import pytest
 
-from analysis_models import NoticeAssessment
-from classification import decide_delivery
+from ku_notice_monitor.analysis_models import NoticeAssessment
+from ku_notice_monitor.classification import decide_delivery
 
 _CASES_PATH = Path(__file__).parents[1] / "evals" / "classification_cases.jsonl"
 _CASES = [

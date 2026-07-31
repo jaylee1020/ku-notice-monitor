@@ -2,9 +2,10 @@
 
 from datetime import date, datetime
 from enum import StrEnum
+from typing import Literal
 from zoneinfo import ZoneInfo
 
-from analysis_models import (
+from .analysis_models import (
     AudienceFit,
     Consequence,
     DateKind,
@@ -12,7 +13,7 @@ from analysis_models import (
     NoticeAssessment,
     Obligation,
 )
-from models import Article, ClassifiedNotice
+from .models import Article, ClassifiedNotice
 
 
 class Delivery(StrEnum):
@@ -65,7 +66,9 @@ def decide_delivery(
     deadline = _nearest_deadline(assessment)
     days_left = _days_until(deadline, current_date)
     active_deadline = days_left is not None and days_left >= 0
-    deadline_close = active_deadline and days_left <= action_window_days
+    deadline_close = (
+        days_left is not None and active_deadline and days_left <= action_window_days
+    )
     has_required_action = (
         assessment.obligation == Obligation.REQUIRED
         or any(action.required for action in assessment.actions)
@@ -120,7 +123,7 @@ def classify_assessment(
     article: Article,
     assessment: NoticeAssessment,
     *,
-    source: str,
+    source: Literal["openai", "rules", "legacy"],
     today: date | None = None,
     action_window_days: int = 21,
 ) -> ClassifiedNotice:
