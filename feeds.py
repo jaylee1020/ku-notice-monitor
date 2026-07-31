@@ -254,7 +254,7 @@ def _is_valid_content_image(url: str) -> bool:
     if len(url) < MIN_IMAGE_URL_LENGTH:
         return False
     lower = url.lower()
-    if lower.endswith(".svg"):  # Gemini 미지원
+    if lower.endswith(".svg"):  # Responses API 이미지 입력에서 직접 지원하지 않음
         return False
     return not _TRACKING_IMAGE_PATTERNS.search(lower)
 

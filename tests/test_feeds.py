@@ -205,7 +205,10 @@ def test_migrate_legacy_ids_skips_already_migrated(make_article):
 
 def test_load_state_missing_file(tmp_path):
     result = load_state(str(tmp_path / "nonexistent.json"))
-    assert result == {"seen_ids": {}, "last_run": None}
+    assert result["seen_ids"] == {}
+    assert result["article_fingerprints"] == {}
+    assert result["pending_digest"] == []
+    assert result["last_run"] is None
 
 
 def test_load_state_existing_file(tmp_path):
@@ -235,7 +238,8 @@ def test_load_state_corrupted_file_returns_default(tmp_path):
     path = tmp_path / "state.json"
     path.write_text('{"seen_ids":', encoding="utf-8")
     result = load_state(str(path))
-    assert result == {"seen_ids": {}, "last_run": None}
+    assert result["seen_ids"] == {}
+    assert result["pending_digest"] == []
 
 
 # --- save_state ---

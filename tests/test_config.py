@@ -42,7 +42,15 @@ def _make_valid_config():
         "profile": {},
         "keywords": {},
         "feeds": {"테스트": {"id": 234, "enabled": True}},
-        "gemini": {"model": "gemini-flash-latest", "relevance_threshold": 3},
+        "ai": {
+            "model": "gpt-5.6-luna",
+            "reasoning_effort": "low",
+            "max_concurrency": 4,
+            "image_detail": "low",
+            "file_detail": "low",
+        },
+        "classification": {"action_window_days": 21},
+        "notifications": {"digest_hour_kst": 21, "notify_empty_runs": False},
         "settings": {
             "state_file": "state.json",
             "base_url": "https://example.com",
@@ -69,9 +77,9 @@ def test_validate_config_feed_missing_id():
         validate_config(config)
 
 
-def test_validate_config_missing_gemini_model():
+def test_validate_config_missing_ai_model():
     config = _make_valid_config()
-    del config["gemini"]["model"]
+    del config["ai"]["model"]
     with pytest.raises(ValueError, match="model"):
         validate_config(config)
 
@@ -83,17 +91,17 @@ def test_validate_config_missing_settings_field():
         validate_config(config)
 
 
-def test_validate_config_invalid_threshold():
+def test_validate_config_invalid_concurrency():
     config = _make_valid_config()
-    config["gemini"]["relevance_threshold"] = 10
-    with pytest.raises(ValueError, match="relevance_threshold"):
+    config["ai"]["max_concurrency"] = 21
+    with pytest.raises(ValueError, match="max_concurrency"):
         validate_config(config)
 
 
-def test_validate_config_threshold_wrong_type():
+def test_validate_config_invalid_action_window():
     config = _make_valid_config()
-    config["gemini"]["relevance_threshold"] = "3"
-    with pytest.raises(ValueError, match="relevance_threshold"):
+    config["classification"]["action_window_days"] = 120
+    with pytest.raises(ValueError, match="action_window_days"):
         validate_config(config)
 
 
@@ -136,3 +144,17 @@ def test_validate_config_seed_on_first_run_bool_ok():
     config = _make_valid_config()
     config["settings"]["seed_on_first_run"] = False
     validate_config(config)  # 예외 없이 통과해야 함
+
+
+def test_validate_config_invalid_reasoning_effort():
+    config = _make_valid_config()
+    config["ai"]["reasoning_effort"] = "ultra"
+    with pytest.raises(ValueError, match="reasoning_effort"):
+        validate_config(config)
+
+
+def test_validate_config_invalid_digest_hour():
+    config = _make_valid_config()
+    config["notifications"]["digest_hour_kst"] = 24
+    with pytest.raises(ValueError, match="digest_hour_kst"):
+        validate_config(config)

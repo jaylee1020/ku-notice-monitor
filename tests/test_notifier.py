@@ -2,38 +2,98 @@
 
 from constants import MAX_TELEGRAM_MESSAGE_LENGTH
 from notifier import (
+    build_digest_message,
     build_error_message,
     build_first_run_message,
     build_no_new_message,
     build_no_relevant_message,
     build_relevant_message,
+    build_urgent_message,
     split_message,
 )
 
 # --- build_relevant_message ---
 
 
-def test_build_relevant_message(make_article):
-    matched = [(make_article(title="장학금", board_name="장학공지", link="https://example.com"), 5, "장학 관련")]
+def test_build_relevant_message(make_article, make_classified):
+    matched = [
+        make_classified(
+            article=make_article(
+                title="장학금",
+                board_name="장학공지",
+                link="https://example.com",
+            ),
+            reason="장학 관련",
+        )
+    ]
     msg = build_relevant_message(matched, 10)
     assert "장학금" in msg
     assert "장학공지" in msg
     assert "10" in msg
 
 
-def test_build_relevant_message_with_attachments(make_article):
+def test_build_relevant_message_with_attachments(make_article, make_classified):
     from models import Attachment
 
     att1 = Attachment(filename="안내문.hwp", url="https://example.com/1/download.do")
     att2 = Attachment(filename="양식.pdf", url="https://example.com/2/download.do")
-    matched = [(
-        make_article(title="장학금", board_name="장학공지", link="https://example.com", attachments=[att1, att2]),
-        5,
-        "장학 관련",
-    )]
+    matched = [
+        make_classified(
+            article=make_article(
+                title="장학금",
+                board_name="장학공지",
+                link="https://example.com",
+                attachments=[att1, att2],
+            ),
+            reason="장학 관련",
+        )
+    ]
     msg = build_relevant_message(matched, 5)
     assert "안내문.hwp" in msg
     assert "양식.pdf" in msg
+
+
+def test_build_urgent_message_has_deadline_and_actions(make_article, make_classified):
+    matched = [
+        make_classified(
+            article=make_article(title="수강신청"),
+            delivery="immediate",
+            reason="필수 일정",
+            summary="오늘 확인",
+            deadline="2099-12-31",
+            actions=["수강바구니 확인"],
+        )
+    ]
+    msg = build_urgent_message(matched, 3)
+    assert "🚨" in msg
+    assert "2099-12-31" in msg
+    assert "수강바구니 확인" in msg
+
+
+def test_build_digest_message_marks_updated_article(make_article, make_classified):
+    matched = [
+        make_classified(
+            article=make_article(title="인턴 모집", is_update=True),
+            reason="관심 분야",
+        )
+    ]
+    msg = build_digest_message(matched)
+    assert "🗂" in msg
+    assert "[수정]" in msg
+
+
+def test_review_message_explains_uncertainty(make_article, make_classified):
+    matched = [
+        make_classified(
+            article=make_article(title="졸업 요건"),
+            delivery="review",
+            audience_fit="unknown",
+            uncertainties=["학번별 적용 기준 불명확"],
+        )
+    ]
+    msg = build_urgent_message(matched, 1)
+    assert "[대상 확인 필요]" in msg
+    assert "학번별 적용 기준 불명확" in msg
 
 
 # --- build_no_new_message ---
