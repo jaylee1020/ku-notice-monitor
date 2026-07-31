@@ -28,7 +28,7 @@ from ku_notice_monitor.prompts import build_profile_text, build_prompt, select_r
 def _config(**ai_overrides):
     ai = {
         "model": "gpt-5.6-luna",
-        "reasoning_effort": "low",
+        "reasoning_effort": "medium",
         "max_concurrency": 4,
         "image_detail": "low",
         "file_detail": "low",

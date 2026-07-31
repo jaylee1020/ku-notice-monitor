@@ -84,7 +84,7 @@
 ```yaml
 ai:
   model: "gpt-5.6-luna"
-  reasoning_effort: "low"
+  reasoning_effort: "medium"
   max_concurrency: 4
   request_timeout_seconds: 45
   image_detail: "low"
@@ -99,7 +99,7 @@ notifications:
   notify_empty_runs: false
 ```
 
-- `reasoning_effort: low`: 사실 추출 정확도와 처리 비용의 균형값입니다.
+- `reasoning_effort: medium`: Luna의 표준 thinking 기본값으로, 정확도와 비용의 균형점입니다.
 - `action_window_days`: 관련 행동 마감이 이 기간 안이면 즉시 알림으로 승격합니다.
 - `suppress_speculative_opportunities`: 프로필로 뒷받침되는 자격 경로가 없는
   선택적 기회를 알림에서 제외합니다.

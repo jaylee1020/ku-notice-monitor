@@ -299,7 +299,7 @@ async def _analyze_article(
     assessment = await _call_openai_api(
         client,
         model_name=config["ai"]["model"],
-        reasoning_effort=config["ai"].get("reasoning_effort", "low"),
+        reasoning_effort=config["ai"].get("reasoning_effort", "medium"),
         content=_build_input_content(prompt, download.payloads, config),
         metrics=metrics,
     )

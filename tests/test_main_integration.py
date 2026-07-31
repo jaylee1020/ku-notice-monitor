@@ -19,7 +19,7 @@ def _config() -> AppConfig:
             "feeds": {"학사": {"id": 234, "enabled": True}},
             "ai": {
                 "model": "gpt-5.6-luna",
-                "reasoning_effort": "low",
+                "reasoning_effort": "medium",
                 "max_concurrency": 4,
                 "request_timeout_seconds": 45,
                 "image_detail": "low",

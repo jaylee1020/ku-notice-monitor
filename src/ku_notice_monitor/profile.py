@@ -220,7 +220,7 @@ async def resolve_profile_snapshot(
             client,
             document=document,
             model_name=config["ai"]["model"],
-            reasoning_effort=config["ai"].get("reasoning_effort", "low"),
+            reasoning_effort=config["ai"].get("reasoning_effort", "medium"),
         )
     except Exception as exc:
         raise ProfileResolutionError(
