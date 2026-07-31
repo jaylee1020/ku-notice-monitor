@@ -58,6 +58,7 @@ ai:
   model: "gpt-5.6-luna"
   reasoning_effort: "low"      # 사실 추출에 맞춘 비용/지연 기본값
   max_concurrency: 4           # 공지별 독립 분석 동시 요청 수
+  request_timeout_seconds: 45  # 재시도 1회당 전체 요청 제한
   image_detail: "low"          # 공지 이미지 분석 비용 절감
   file_detail: "low"           # PDF 텍스트는 유지하면서 페이지 이미지 비용 절감
 
@@ -75,6 +76,9 @@ settings:
   state_file: "state.json"
   base_url: "https://www.konkuk.ac.kr"
   rss_url_template: "https://www.konkuk.ac.kr/bbs/konkuk/{board_id}/rssList.do"
+  # 공지 본문·첨부에서 발견한 URL은 이 도메인과 그 하위 도메인만 다운로드합니다.
+  allowed_download_hosts:
+    - "konkuk.ac.kr"
   # SSL 인증서 검증 (보안을 위해 기본 활성화)
   # 건국대 서버 인증서 문제가 있을 경우 false로 변경하세요.
   # ssl_verify가 false인 경우, 매 실행 시 SSL 상태를 자동 점검하고 로그에 기록합니다.
@@ -84,3 +88,10 @@ settings:
   #       과거 공지 수백 건에 대한 대량 알림/크롤링 폭발을 방지합니다.
   # false: 최초 실행에도 모든 공지를 신규로 간주해 분석·알림.
   seed_on_first_run: true
+  # 상태 유실이나 피드 구조 변경으로 신규 공지가 폭증할 때 API 호출·알림을 중단합니다.
+  max_new_articles_per_run: 60
+  min_feed_success_ratio: 0.7
+  # RSS 제목/요약이 그대로여도 상세 본문이 바뀔 수 있어 최근 공지를 주기적으로 재확인합니다.
+  detail_refresh_interval_hours: 6
+  detail_refresh_days: 14
+  detail_refresh_max_articles: 30

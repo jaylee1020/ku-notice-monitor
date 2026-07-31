@@ -1,11 +1,19 @@
 """수정 공지 감지와 일일 요약 큐 테스트."""
 
-from state import (
+from datetime import datetime
+
+from ku_notice_monitor.state import (
     clear_pending_digest,
+    complete_delivery,
+    due_classification_retry_keys,
+    due_deliveries,
+    enqueue_delivery,
     enqueue_digest,
     filter_new_articles,
     get_pending_digest,
     mark_as_seen,
+    record_delivery_failure,
+    schedule_classification_retry,
 )
 
 
@@ -47,6 +55,25 @@ def test_mark_as_seen_can_preserve_pre_enrichment_fingerprint(make_article):
     assert state["article_fingerprints"][article.key] == source_fingerprint
 
 
+def test_enriched_fingerprint_detects_body_only_change(make_article):
+    article = make_article(description="RSS 요약")
+    state = {"seen_ids": {}, "article_fingerprints": {}, "enriched_fingerprints": {}}
+    mark_as_seen(
+        [article],
+        state,
+        fingerprints={article.key: article.fingerprint},
+        enriched_fingerprints={article.key: "old-detail"},
+    )
+    result = filter_new_articles(
+        [make_article(description="RSS 요약")],
+        state,
+        source_fingerprints={article.key: article.fingerprint},
+        enriched_fingerprints={article.key: "new-detail"},
+    )
+    assert len(result) == 1
+    assert result[0].is_update is True
+
+
 def test_filter_new_articles_deduplicates_by_key(make_article):
     one = make_article(id="1")
     duplicate = make_article(id="1")
@@ -66,3 +93,71 @@ def test_digest_queue_deduplicates_and_round_trips(make_article, make_classified
     assert pending[0].summary == "새 요약"
     clear_pending_digest(state)
     assert get_pending_digest(state) == []
+
+
+def test_outbox_deduplicates_and_completes():
+    state = {"pending_deliveries": []}
+    first = enqueue_delivery(
+        ["첫 조각", "둘째 조각"],
+        state,
+        kind="urgent",
+        dedup_key="notice-1",
+        metadata={"group_id": "group-1"},
+    )
+    second = enqueue_delivery(
+        ["첫 조각", "둘째 조각"],
+        state,
+        kind="urgent",
+        dedup_key="notice-1",
+        metadata={"group_id": "group-1"},
+    )
+    assert first == second
+    assert len(state["pending_deliveries"]) == 2
+    completed = complete_delivery(state, first[0])
+    assert completed["text"] == "첫 조각"
+    assert len(state["pending_deliveries"]) == 1
+
+
+def test_completed_delivery_is_not_queued_again():
+    state = {"pending_deliveries": [], "delivery_history": {}}
+    delivery_id = enqueue_delivery(
+        ["메시지"],
+        state,
+        kind="urgent",
+        dedup_key="notice-1",
+    )[0]
+    complete_delivery(state, delivery_id)
+    enqueue_delivery(
+        ["메시지"],
+        state,
+        kind="urgent",
+        dedup_key="notice-1",
+    )
+    assert state["pending_deliveries"] == []
+
+
+def test_outbox_failure_records_backoff():
+    state = {"pending_deliveries": []}
+    delivery_id = enqueue_delivery(
+        ["메시지"],
+        state,
+        kind="urgent",
+        dedup_key="notice-1",
+    )[0]
+    now = datetime.fromisoformat("2026-08-01T10:00:00")
+    record_delivery_failure(state, delivery_id, "temporary failure", now=now)
+    item = state["pending_deliveries"][0]
+    assert item["attempts"] == 1
+    assert item["next_attempt_at"] == "2026-08-01T10:05:00"
+    assert due_deliveries(state, now=now) == []
+
+
+def test_classification_retry_uses_bounded_backoff():
+    state = {"classification_retries": {}}
+    now = datetime.fromisoformat("2026-08-01T10:00:00")
+    schedule_classification_retry(state, "234:1", now=now)
+    assert due_classification_retry_keys(state, now=now) == set()
+    assert due_classification_retry_keys(
+        state,
+        now=datetime.fromisoformat("2026-08-01T11:00:00"),
+    ) == {"234:1"}

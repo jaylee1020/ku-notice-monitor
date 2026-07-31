@@ -2,18 +2,37 @@
 
 import logging
 import os
+from dataclasses import dataclass
 from datetime import date, datetime
 from zoneinfo import ZoneInfo
 
 from telegram import Bot
 
-from constants import MAX_TELEGRAM_MESSAGE_LENGTH
-from models import ClassifiedNotice
+from .constants import MAX_TELEGRAM_MESSAGE_LENGTH
+from .models import ClassifiedNotice
 
 logger = logging.getLogger(__name__)
 
 # GitHub Actions 러너는 UTC이므로, 사용자에게 보이는 날짜/시각은 KST로 표기한다.
 _KST = ZoneInfo("Asia/Seoul")
+
+
+class TelegramDeliveryError(RuntimeError):
+    """텔레그램 메시지가 완전히 전송되지 않았을 때 발생한다."""
+
+
+class TelegramNotConfiguredError(TelegramDeliveryError):
+    """텔레그램 자격 증명이 없을 때 발생한다."""
+
+
+@dataclass(frozen=True)
+class DeliveryResult:
+    sent_parts: int
+    total_parts: int
+
+    @property
+    def complete(self) -> bool:
+        return self.sent_parts == self.total_parts
 
 
 def _now_kst() -> datetime:
@@ -38,6 +57,17 @@ def _deadline_label(deadline: str | None) -> str | None:
 
 
 def _build_items(matched: list[ClassifiedNotice]) -> str:
+    category_labels = {
+        "academic": "학사",
+        "tuition": "등록금",
+        "scholarship": "장학",
+        "career": "취업·진로",
+        "international": "국제교류",
+        "event": "행사",
+        "campus_life": "학생생활",
+        "administrative": "행정",
+        "other": "기타",
+    }
     items: list[str] = []
     for index, match in enumerate(matched, 1):
         article = match.article
@@ -49,13 +79,23 @@ def _build_items(matched: list[ClassifiedNotice]) -> str:
         )
         if match.summary and match.summary != article.title:
             item += f"요약: {match.summary}\n"
+        item += f"분류: {category_labels.get(match.category, match.category)}\n"
         item += f"이유: {match.reason}\n"
         if match.audience_fit != "eligible":
-            item += f"대상 판정: {match.audience_fit}\n"
+            audience_labels = {
+                "possibly_eligible": "대상일 가능성 있음",
+                "ineligible": "대상 아님",
+                "unknown": "대상 여부 확인 필요",
+            }
+            item += f"대상 판정: {audience_labels.get(match.audience_fit, match.audience_fit)}\n"
         if deadline := _deadline_label(match.deadline):
             item += f"⏰ 마감: {deadline}\n"
         if match.actions:
             item += "✅ 할 일: " + " · ".join(match.actions) + "\n"
+        if match.benefits:
+            item += "🎁 혜택: " + " · ".join(match.benefits[:2]) + "\n"
+        if match.evidence:
+            item += "🔎 근거: " + " · ".join(match.evidence[:2]) + "\n"
         if match.uncertainties:
             item += "⚠️ 확인 필요: " + " · ".join(match.uncertainties[:2]) + "\n"
         item += article.link
@@ -145,31 +185,41 @@ def split_message(text: str) -> list[str]:
     return messages
 
 
-async def send_telegram(text: str) -> None:
-    """텔레그램 봇으로 메시지 전송"""
+def _telegram_credentials() -> tuple[str, str]:
     token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
     chat_id = os.environ.get("TELEGRAM_CHAT_ID", "")
-
     if not token or not chat_id:
-        logger.warning(
+        raise TelegramNotConfiguredError(
             "TELEGRAM_BOT_TOKEN 또는 TELEGRAM_CHAT_ID가 설정되지 않았습니다. "
-            "메시지를 전송하지 않고 콘솔에 출력합니다."
+            "메시지는 outbox에 보존됩니다."
         )
-        logger.info("--- 메시지 미리보기 ---\n%s", text)
-        return
+    return token, chat_id
 
+
+async def send_telegram_part(text: str) -> None:
+    """이미 분할된 텔레그램 메시지 한 조각을 전송한다."""
+    if len(text) > MAX_TELEGRAM_MESSAGE_LENGTH:
+        raise ValueError("텔레그램 메시지 한 조각이 길이 제한을 초과했습니다.")
+    token, chat_id = _telegram_credentials()
     bot = Bot(token=token)
+    await bot.send_message(chat_id=chat_id, text=text)
+
+
+async def send_telegram(text: str) -> DeliveryResult:
+    """모든 조각의 전송 성공을 보장하며, 일부 실패도 호출자에게 알린다."""
     parts = split_message(text)
     sent = 0
     for i, msg in enumerate(parts, 1):
         try:
-            await bot.send_message(chat_id=chat_id, text=msg)
+            await send_telegram_part(msg)
             sent += 1
         except Exception as e:
-            # 일부 조각 전송 실패가 전체 실행을 중단시키지 않도록 한다.
-            # (예외를 올리면 main에서 notify_error가 다시 텔레그램 전송을 시도해 실패가 연쇄될 수 있음)
             logger.error("텔레그램 메시지 전송 실패 (%d/%d): %s", i, len(parts), e)
+            raise TelegramDeliveryError(
+                f"텔레그램 메시지 전송 실패 ({sent}/{len(parts)}개 완료): {e}"
+            ) from e
     logger.info("텔레그램 메시지 전송 완료 (%d/%d개 전송)", sent, len(parts))
+    return DeliveryResult(sent_parts=sent, total_parts=len(parts))
 
 
 async def notify_relevant(
@@ -200,10 +250,14 @@ async def notify_no_relevant(total_new: int) -> None:
     await send_telegram(text)
 
 
-async def notify_error(error_detail: str) -> None:
+async def notify_error(error_detail: str) -> DeliveryResult | None:
     """워크플로우 오류 발생 시 텔레그램으로 알림"""
     text = build_error_message(error_detail)
-    await send_telegram(text)
+    try:
+        return await send_telegram(text)
+    except TelegramDeliveryError as exc:
+        logger.error("오류 알림도 전송하지 못했습니다: %s", exc)
+        return None
 
 
 async def notify_first_run(seeded_count: int) -> None:

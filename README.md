@@ -10,9 +10,10 @@
 - 결정론적 정책 엔진이 `immediate` / `digest` / `review` / `suppress`를 선택합니다.
 - 대상이 불명확한 고위험 공지는 숨기지 않고 `review`로 보냅니다.
 - 첨부파일은 핵심 판정에 필요하다고 나온 공지만 2차 분석해 비용과 지연을 줄입니다.
-- OpenAI 호출이 실패하면 해당 공지만 보수적인 규칙 기반 판정으로 대체합니다.
-- 동일 ID의 내용이 바뀌면 `[수정]` 공지로 다시 분석합니다.
-- 기존 공지, 내용 해시, 일일 요약 대기열은 `state.json`에 저장합니다.
+- OpenAI 호출이 실패하면 해당 공지만 보수적으로 판정하고 백오프로 재분류합니다.
+- RSS가 그대로여도 최근 공지의 상세 본문을 다시 확인해 `[수정]`으로 감지합니다.
+- 알림은 영구 outbox에 먼저 기록하고, 실제 전송에 성공한 조각만 완료 처리합니다.
+- 런타임 상태는 `main`이 아닌 전용 `monitor-state` 브랜치에 저장합니다.
 
 ## 주요 기능
 
@@ -21,9 +22,11 @@
 - `immediate` / `digest` / `review` / `suppress` 전달 정책
 - 신청·서류·납부·행사 날짜를 종류별로 추출하고 가장 가까운 행동 마감 D-day 표시
 - 학생이 해야 할 구체적인 행동 요약
-- 이미지와 PDF 등 파일 입력
+- 이미지·PDF와 격리 변환된 HWP/HWPX 입력
+- 허용 도메인·공인 IP·리디렉션 검증과 스트리밍 다운로드 상한
 - 키워드 폴백, 부분 실패 복구, 지수 백오프
-- 수정 공지 감지와 피드 중복 제거
+- 본문 수정 감지, 피드별 상태 검사와 중복 제거
+- AI 토큰·fallback·억제·전송 실패를 포함한 구조화 실행 요약
 - GitHub Actions 매시간 자동 실행
 
 ## 설정
@@ -68,6 +71,7 @@ ai:
   model: "gpt-5.6-luna"
   reasoning_effort: "low"
   max_concurrency: 4
+  request_timeout_seconds: 45
   image_detail: "low"
   file_detail: "low"
 
@@ -89,10 +93,8 @@ notifications:
 Python 3.12 이상이 필요합니다.
 
 ```bash
-python -m venv .venv
-source .venv/bin/activate
-pip install -e ".[dev]"
-python main.py
+uv sync --locked --extra dev
+uv run ku-notice-monitor
 ```
 
 로컬 시크릿은 커밋되지 않는 `.env.local`에 둡니다.
@@ -106,25 +108,32 @@ TELEGRAM_CHAT_ID=...
 ## 프로젝트 구조
 
 ```text
-analysis_models.py   OpenAI Structured Outputs 스키마
-classification.py    전달 결정을 내리는 정책 엔진
-openai_classifier.py 공지별 Responses API·선택적 첨부 분석
-prompts.py           축 분리형 사실 추출 프롬프트
-matcher.py           AI/규칙 폴백과 정책 조율
-feeds.py             RSS·본문·이미지·첨부 수집
-notifier.py          긴급 알림과 일일 요약 메시지
-state.py             확인 상태·수정 감지·요약 대기열
-main.py              실행 파이프라인
+src/ku_notice_monitor/
+  analysis_models.py   OpenAI Structured Outputs 스키마
+  classification.py    전달 결정을 내리는 정책 엔진
+  openai_classifier.py Responses API·선택적 첨부 분석
+  document_extract.py  HWP/HWPX 격리 변환
+  prompts.py           근거 중심 사실 추출 프롬프트
+  matcher.py           AI/규칙 폴백·근거 검증·정책 조율
+  feeds.py             RSS·본문·이미지·첨부 수집
+  net.py               SSRF 방어와 제한 다운로드
+  notifier.py          텔레그램 메시지와 전송 결과
+  state.py             상태·outbox·재시도·수정 감지
+  main.py              실행 파이프라인
+evals/                 정책·근거 검증 회귀 사례
+tests/                 단위·장애·종단간 테스트
 ```
 
 ## 검증
 
 ```bash
-ruff check .
-pytest -q
+uv run --no-sync ruff check .
+uv run --no-sync mypy src
+uv run --no-sync pytest --cov=ku_notice_monitor --cov-branch
 ```
 
-CI는 Python 3.12와 3.13에서 린트와 테스트를 실행합니다.
+CI는 잠긴 의존성으로 Python 3.12와 3.13에서 린트·타입 검사·분기
+커버리지 테스트를 실행합니다.
 
 분류 원칙과 골든 케이스 운영법은
 [`docs/classification-design.md`](docs/classification-design.md)에 정리되어 있습니다.

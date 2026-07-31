@@ -23,8 +23,12 @@
    - 종류가 지정된 날짜와 행동
    - 근거와 불확실성
 3. 첨부가 핵심 판정에 필요하다고 나온 공지만 미디어를 내려받아 2차 분석한다.
-4. 결정론적 정책 엔진이 `immediate`, `digest`, `review`, `suppress` 중 하나를 고른다.
-5. OpenAI 호출이 실패한 공지만 보수적 규칙 추출기로 대체한다.
+   HWP/HWPX는 별도 프로세스에서 Markdown으로 변환하며 실패 사실을
+   불확실성으로 남긴다.
+4. 모델의 직접 인용과 날짜가 실제 입력에 존재하는지 검증한다. 근거 없는
+   `ineligible`은 `unknown`으로 강등해 중요한 공지를 숨기지 않는다.
+5. 결정론적 정책 엔진이 `immediate`, `digest`, `review`, `suppress` 중 하나를 고른다.
+6. OpenAI 호출이 실패한 공지만 보수적 규칙 추출기로 대체하고 다음 실행에서 재시도한다.
 
 ## 결정 의미
 
@@ -37,7 +41,8 @@
 
 ## 평가
 
-`evals/classification_cases.jsonl`은 정책의 비대칭 손실을 고정하는 골든 케이스다.
+`evals/classification_cases.jsonl`은 정책의 비대칭 손실을,
+`evals/notice_grounding_cases.jsonl`은 실제 공지형 근거 검증을 고정한다.
 모델 또는 프롬프트를 바꿀 때는 실제 공지에서 다음 지표를 별도로 측정한다.
 
 - 고위험 공지 recall

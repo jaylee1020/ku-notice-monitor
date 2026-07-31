@@ -14,20 +14,32 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15  # 네트워크 행(hang) 시 기본 6시간 동안 러너가 잡혀 있는 것을 방지
     permissions:
-      contents: write
+      contents: read
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
         with:
           python-version: '3.12'
-          cache: 'pip'
 
-      - name: Install dependencies
-        run: pip install -r requirements.txt
+      - name: Set up uv
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          version: '0.11.29'
+          enable-cache: true
+
+      - name: Load runtime state
+        run: |
+          git fetch --no-tags origin refs/heads/monitor-state:refs/remotes/origin/monitor-state || true
+          if git show-ref --verify --quiet refs/remotes/origin/monitor-state; then
+            git show origin/monitor-state:state.json > state.json
+          fi
+
+      - name: Install locked dependencies
+        run: uv sync --locked --python '3.12'
 
       - name: Run monitor
         id: monitor
@@ -37,19 +49,20 @@ jobs:
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           PROFILE_JSON: ${{ secrets.PROFILE_JSON }}
           KEYWORDS_JSON: ${{ secrets.KEYWORDS_JSON }}
-        run: python main.py
+        run: uv run --no-sync ku-notice-monitor
 
-      - name: Commit state changes
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add state.json
-          git diff --staged --quiet || git commit -m "Update state [skip ci]"
-          git pull --rebase && git push || (sleep 3 && git pull --rebase && git push)
+      - name: Upload runtime state
+        if: success()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: runtime-state
+          path: state.json
+          retention-days: 1
+          if-no-files-found: error
 
       - name: Upload logs on failure
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: monitor-logs
           path: |
@@ -59,13 +72,48 @@ jobs:
 
       - name: Notify on failure
         if: failure()
+        continue-on-error: true
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
-          python -c "
-          import asyncio, os
-          from notifier import notify_error
-          run_url = 'https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}'
-          asyncio.run(notify_error(f'GitHub Actions 워크플로우 실패\n로그 확인: {run_url}'))
-          "
+          if [ -n "$TELEGRAM_BOT_TOKEN" ] && [ -n "$TELEGRAM_CHAT_ID" ]; then
+            curl --silent --show-error --fail \
+              --request POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+              --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
+              --data-urlencode "text=건국대 공지 모니터링 실패
+          로그: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          fi
+
+  persist-state:
+    needs: monitor
+    if: needs.monitor.result == 'success'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+
+      - name: Download runtime state
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: runtime-state
+          path: runtime-state
+
+      - name: Commit state to dedicated branch
+        run: |
+          if git show-ref --verify --quiet refs/remotes/origin/monitor-state; then
+            git switch -C monitor-state origin/monitor-state
+          else
+            git switch -c monitor-state
+          fi
+          cp runtime-state/state.json state.json
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add state.json
+          git diff --staged --quiet || git commit -m "Update runtime state [skip ci]"
+          git push origin HEAD:monitor-state

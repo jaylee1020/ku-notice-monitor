@@ -1,7 +1,13 @@
 """notifier.py 단위 테스트"""
 
-from constants import MAX_TELEGRAM_MESSAGE_LENGTH
-from notifier import (
+import asyncio
+from unittest.mock import AsyncMock, patch
+
+import pytest
+
+from ku_notice_monitor.constants import MAX_TELEGRAM_MESSAGE_LENGTH
+from ku_notice_monitor.notifier import (
+    TelegramDeliveryError,
     build_digest_message,
     build_error_message,
     build_first_run_message,
@@ -9,6 +15,7 @@ from notifier import (
     build_no_relevant_message,
     build_relevant_message,
     build_urgent_message,
+    send_telegram,
     split_message,
 )
 
@@ -33,7 +40,7 @@ def test_build_relevant_message(make_article, make_classified):
 
 
 def test_build_relevant_message_with_attachments(make_article, make_classified):
-    from models import Attachment
+    from ku_notice_monitor.models import Attachment
 
     att1 = Attachment(filename="안내문.hwp", url="https://example.com/1/download.do")
     att2 = Attachment(filename="양식.pdf", url="https://example.com/2/download.do")
@@ -156,3 +163,22 @@ def test_split_message_long_single_line_no_loss():
     parts = split_message(text)
     assert "".join(parts) == text
     assert all(len(part) <= MAX_TELEGRAM_MESSAGE_LENGTH for part in parts)
+
+
+def test_send_telegram_reports_complete_delivery():
+    with patch("ku_notice_monitor.notifier.send_telegram_part", new_callable=AsyncMock) as send:
+        result = asyncio.run(send_telegram("hello"))
+    assert result.complete is True
+    assert result.sent_parts == 1
+    send.assert_awaited_once_with("hello")
+
+
+def test_send_telegram_raises_on_partial_failure():
+    text = "x" * (MAX_TELEGRAM_MESSAGE_LENGTH + 10)
+    with patch(
+        "ku_notice_monitor.notifier.send_telegram_part",
+        new_callable=AsyncMock,
+        side_effect=[None, RuntimeError("telegram down")],
+    ):
+        with pytest.raises(TelegramDeliveryError, match="1/2"):
+            asyncio.run(send_telegram(text))

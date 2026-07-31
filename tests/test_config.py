@@ -5,7 +5,7 @@ from unittest.mock import patch
 
 import pytest
 
-from config import _load_json_env, validate_config
+from ku_notice_monitor.config import _load_json_env, validate_config
 
 # --- _load_json_env ---
 
@@ -46,6 +46,7 @@ def _make_valid_config():
             "model": "gpt-5.6-luna",
             "reasoning_effort": "low",
             "max_concurrency": 4,
+            "request_timeout_seconds": 45,
             "image_detail": "low",
             "file_detail": "low",
         },
@@ -55,6 +56,7 @@ def _make_valid_config():
             "state_file": "state.json",
             "base_url": "https://example.com",
             "rss_url_template": "https://example.com/{board_id}",
+            "allowed_download_hosts": ["example.com"],
         },
     }
 
@@ -95,6 +97,27 @@ def test_validate_config_invalid_concurrency():
     config = _make_valid_config()
     config["ai"]["max_concurrency"] = 21
     with pytest.raises(ValueError, match="max_concurrency"):
+        validate_config(config)
+
+
+def test_validate_config_invalid_request_timeout():
+    config = _make_valid_config()
+    config["ai"]["request_timeout_seconds"] = 121
+    with pytest.raises(ValueError, match="request_timeout_seconds"):
+        validate_config(config)
+
+
+def test_validate_config_requires_allowed_download_hosts():
+    config = _make_valid_config()
+    config["settings"]["allowed_download_hosts"] = []
+    with pytest.raises(ValueError, match="allowed_download_hosts"):
+        validate_config(config)
+
+
+def test_validate_config_rejects_invalid_feed_success_ratio():
+    config = _make_valid_config()
+    config["settings"]["min_feed_success_ratio"] = 0
+    with pytest.raises(ValueError, match="min_feed_success_ratio"):
         validate_config(config)
 
 

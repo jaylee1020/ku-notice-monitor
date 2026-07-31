@@ -2,14 +2,16 @@
 
 import logging
 import re
+from dataclasses import dataclass
 from datetime import date, datetime
+from typing import Literal
 
-from analysis_models import NoticeAssessment
-from classification import Delivery, classify_assessment
-from feeds import parse_pub_date
-from models import Article, ClassifiedNotice
-from openai_classifier import analyze_with_openai
-from prompts import build_profile_text, build_prompt
+from .analysis_models import AudienceFit, NoticeAssessment
+from .classification import Delivery, classify_assessment
+from .feeds import parse_pub_date
+from .models import Article, ClassifiedNotice
+from .openai_classifier import analyze_with_openai
+from .prompts import build_profile_text, build_prompt
 
 logger = logging.getLogger(__name__)
 
@@ -20,6 +22,20 @@ _SCHOLARSHIP_TERMS = {"장학", "학자금"}
 _CAREER_TERMS = {"채용", "인턴", "취업", "현장실습"}
 _INTERNATIONAL_TERMS = {"교환학생", "국제교류", "어학연수", "유학"}
 _DATE_PATTERN = re.compile(r"(20\d{2})[.\-/년]\s*(\d{1,2})[.\-/월]\s*(\d{1,2})일?")
+
+
+@dataclass(frozen=True)
+class MatchResult:
+    notices: list[ClassifiedNotice]
+    method: str
+    failed_keys: set[str]
+    suppressed_count: int
+    metrics: dict
+
+    def __iter__(self):
+        """기존의 ``matched, method = ...`` 호출과 호환한다."""
+        yield self.notices
+        yield self.method
 
 
 def _sort_date(article: Article) -> datetime:
@@ -156,22 +172,94 @@ def keyword_fallback(article: Article, config: dict) -> NoticeAssessment:
     )
 
 
+def _normalize_grounding_text(value: str) -> str:
+    return re.sub(r"[^0-9a-z가-힣]+", "", value.lower())
+
+
+def validate_assessment_grounding(
+    article: Article,
+    assessment: NoticeAssessment,
+) -> NoticeAssessment:
+    """모델의 인용·날짜가 실제 입력 텍스트에 존재하는지 보수적으로 확인한다."""
+    source = " ".join(
+        [
+            article.title,
+            article.description,
+            *(attachment.filename for attachment in article.attachments),
+        ]
+    )
+    normalized_source = _normalize_grounding_text(source)
+    valid_evidence = [
+        evidence
+        for evidence in assessment.evidence
+        if _normalize_grounding_text(evidence) in normalized_source
+    ]
+    uncertainties = list(assessment.uncertainties)
+    updates: dict = {"evidence": valid_evidence}
+
+    if len(valid_evidence) != len(assessment.evidence):
+        uncertainties.append("일부 인용 근거를 입력 원문에서 자동 확인하지 못함")
+    if not valid_evidence:
+        uncertainties.append("핵심 판정의 직접 인용 근거가 확인되지 않음")
+        if assessment.audience_fit == AudienceFit.INELIGIBLE:
+            updates["audience_fit"] = AudienceFit.UNKNOWN
+            updates["audience_reason"] = (
+                "부적격 판정의 직접 근거가 원문에서 확인되지 않아 대상 여부 재확인 필요"
+            )
+
+    source_digits = re.sub(r"\D", "", source)
+    source_dates = {item["date"] for item in _fallback_dates(source)}
+
+    def date_is_grounded(value: str) -> bool:
+        return value in source_dates or value.replace("-", "") in source_digits
+
+    grounded_dates = []
+    removed_dates = False
+    for notice_date in assessment.dates:
+        if date_is_grounded(notice_date.date):
+            grounded_dates.append(notice_date)
+        else:
+            removed_dates = True
+    if removed_dates:
+        updates["dates"] = grounded_dates
+        uncertainties.append("일부 추출 날짜를 원문에서 확인하지 못해 제외함")
+
+    grounded_actions = []
+    removed_action_deadline = False
+    for action in assessment.actions:
+        if action.deadline and not date_is_grounded(action.deadline):
+            grounded_actions.append(action.model_copy(update={"deadline": None}))
+            removed_action_deadline = True
+        else:
+            grounded_actions.append(action)
+    if removed_action_deadline:
+        updates["actions"] = grounded_actions
+        uncertainties.append("일부 행동 마감일을 원문에서 확인하지 못해 제외함")
+
+    updates["uncertainties"] = list(dict.fromkeys(uncertainties))[:5]
+    return assessment.model_copy(update=updates)
+
+
 async def match_articles(
     articles: list[Article],
     config: dict,
-) -> tuple[list[ClassifiedNotice], str]:
+) -> MatchResult:
     """모델 추출과 정책 엔진을 결합하고 숨김 결과는 반환하지 않는다."""
     if not articles:
-        return [], "none"
+        return MatchResult([], "none", set(), 0, {})
 
-    openai_results = await analyze_with_openai(articles, config)
+    metrics: dict = {}
+    openai_results = await analyze_with_openai(articles, config, metrics=metrics)
+    failed_keys = {article.key for article in articles if article.key not in openai_results}
     used_openai = False
     used_rules = False
     classified: list[ClassifiedNotice] = []
+    suppressed_count = 0
     action_window_days = config.get("classification", {}).get("action_window_days", 21)
 
     for article in articles:
         raw = openai_results.get(article.key)
+        source: Literal["openai", "rules"]
         if raw is None:
             assessment = keyword_fallback(article, config)
             source = "rules"
@@ -186,6 +274,8 @@ async def match_articles(
                 assessment = keyword_fallback(article, config)
                 source = "rules"
                 used_rules = True
+        if source == "openai":
+            assessment = validate_assessment_grounding(article, assessment)
 
         result = classify_assessment(
             article,
@@ -195,6 +285,8 @@ async def match_articles(
         )
         if result.delivery != Delivery.SUPPRESS:
             classified.append(result)
+        else:
+            suppressed_count += 1
 
     method = (
         "openai+rules"
@@ -211,7 +303,9 @@ async def match_articles(
         ),
         reverse=True,
     )
-    return classified, method
+    metrics["openai_result_count"] = len(openai_results)
+    metrics["rule_fallback_count"] = len(failed_keys)
+    return MatchResult(classified, method, failed_keys, suppressed_count, metrics)
 
 
 __all__ = [
@@ -220,4 +314,5 @@ __all__ = [
     "build_prompt",
     "keyword_fallback",
     "match_articles",
+    "validate_assessment_grounding",
 ]

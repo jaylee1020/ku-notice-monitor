@@ -4,28 +4,63 @@ import asyncio
 import logging
 import re
 import ssl
+import time
+from dataclasses import dataclass
 from datetime import datetime
 from html import unescape
-from urllib.parse import urlsplit
+from urllib.parse import urljoin, urlsplit, urlunsplit
 
 import aiohttp
 import feedparser
 from tenacity import retry, retry_if_exception, retry_if_exception_type, stop_after_attempt, wait_exponential
 
-from constants import (
+from .constants import (
     ARTICLE_BODY_TIMEOUT,
     BOARD_CONTENT_CLASS,
     EMPTY_FEED_SENTINEL,
     FEED_FETCH_TIMEOUT,
     MAX_ARTICLE_BODY_LENGTH,
+    MAX_ARTICLE_HTML_SIZE,
     MAX_CONCURRENT_BODY_FETCHES,
+    MAX_FEED_SIZE,
     MAX_IMAGES_PER_ARTICLE,
     MIN_IMAGE_URL_LENGTH,
 )
-from models import Article, Attachment
-from net import DEFAULT_HEADERS, make_ssl_context, ssl_context_from_config
+from .models import Article, Attachment
+from .net import (
+    DEFAULT_HEADERS,
+    allowed_hosts_from_config,
+    download_bytes,
+    is_allowed_hostname,
+    make_ssl_context,
+    ssl_context_from_config,
+)
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class FeedStatus:
+    name: str
+    board_id: int
+    success: bool
+    article_count: int
+    elapsed_seconds: float
+    error: str | None = None
+
+
+@dataclass(frozen=True)
+class FeedBatch:
+    articles: list[Article]
+    statuses: list[FeedStatus]
+
+    @property
+    def successful_count(self) -> int:
+        return sum(status.success for status in self.statuses)
+
+    @property
+    def failed_count(self) -> int:
+        return len(self.statuses) - self.successful_count
 
 
 # ---------------------------------------------------------------------------
@@ -66,8 +101,9 @@ def extract_article_id(link: str) -> str:
 
 def normalize_link(link: str, base_url: str) -> str:
     """상대 링크를 절대 URL로 변환하고 쿼리 파라미터를 제거한다."""
-    link = link.split("?")[0]
-    return base_url + link if link.startswith("/") else link
+    resolved = urljoin(base_url.rstrip("/") + "/", link)
+    parts = urlsplit(resolved)
+    return urlunsplit((parts.scheme, parts.netloc, parts.path, "", ""))
 
 
 def base_url_of(url: str) -> str:
@@ -176,11 +212,16 @@ async def _fetch_feed_async(
     # (예: kuinc.konkuk.ac.kr 피드의 링크를 www.konkuk.ac.kr로 잘못 연결하지 않도록)
     base_url = base_url_of(url) or config["settings"]["base_url"]
 
-    async with session.get(
-        url, ssl=ssl_context, timeout=aiohttp.ClientTimeout(total=FEED_FETCH_TIMEOUT)
-    ) as resp:
-        resp.raise_for_status()
-        xml_data = await resp.read()
+    xml_data = await download_bytes(
+        session,
+        url,
+        ssl_context=ssl_context,
+        timeout=FEED_FETCH_TIMEOUT,
+        allowed_hosts=allowed_hosts_from_config(config),
+        max_size=MAX_FEED_SIZE,
+    )
+    if xml_data is None:
+        raise aiohttp.ClientError(f"RSS 다운로드 실패: {url}")
 
     if b"<rss" not in xml_data.lower():
         logger.warning("RSS 형식이 아닌 응답 - %s (board_id=%d, url=%s)", board_name, board_id, url)
@@ -196,30 +237,64 @@ async def _fetch_feed_async(
     return articles
 
 
-async def fetch_all_feeds(config: dict) -> list[Article]:
-    """모든 활성화된 피드에서 게시물을 비동기 병렬 수집한다."""
+async def fetch_all_feeds_detailed(config: dict) -> FeedBatch:
+    """모든 피드를 병렬 수집하고 피드별 성공·실패를 함께 반환한다."""
     ssl_verify = config.get("settings", {}).get("ssl_verify", True)
     if not ssl_verify:
         logger.warning("SSL 인증서 검증 비활성화 상태. ssl_verify: true로 변경하면 보안이 강화됩니다.")
     ssl_context = make_ssl_context(ssl_verify)
 
+    enabled = [
+        (name, feed)
+        for name, feed in config["feeds"].items()
+        if feed.get("enabled", True)
+    ]
+
+    async def timed_fetch(session, name: str, feed: dict):
+        started = time.monotonic()
+        try:
+            articles = await _fetch_feed_async(
+                session,
+                name,
+                feed["id"],
+                feed,
+                config,
+                ssl_context,
+            )
+            return articles, FeedStatus(
+                name=name,
+                board_id=feed["id"],
+                success=True,
+                article_count=len(articles),
+                elapsed_seconds=round(time.monotonic() - started, 3),
+            )
+        except Exception as exc:
+            logger.error("%s 피드 수집 실패: %s", name, exc)
+            return [], FeedStatus(
+                name=name,
+                board_id=feed["id"],
+                success=False,
+                article_count=0,
+                elapsed_seconds=round(time.monotonic() - started, 3),
+                error=f"{type(exc).__name__}: {str(exc)[:200]}",
+            )
+
     async with aiohttp.ClientSession(headers=DEFAULT_HEADERS) as session:
         results = await asyncio.gather(
-            *(
-                _fetch_feed_async(session, name, fc["id"], fc, config, ssl_context)
-                for name, fc in config["feeds"].items()
-                if fc.get("enabled", True)
-            ),
-            return_exceptions=True,
+            *(timed_fetch(session, name, feed) for name, feed in enabled),
         )
 
     all_articles: list[Article] = []
-    for result in results:
-        if isinstance(result, Exception):
-            logger.error("피드 수집 중 예외 발생: %s", result, exc_info=True)
-        else:
-            all_articles.extend(result)
-    return all_articles
+    statuses: list[FeedStatus] = []
+    for articles, status in results:
+        all_articles.extend(articles)
+        statuses.append(status)
+    return FeedBatch(all_articles, statuses)
+
+
+async def fetch_all_feeds(config: dict) -> list[Article]:
+    """기존 호출부 호환용으로 공지 목록만 반환한다."""
+    return (await fetch_all_feeds_detailed(config)).articles
 
 
 # ---------------------------------------------------------------------------
@@ -259,7 +334,12 @@ def _is_valid_content_image(url: str) -> bool:
     return not _TRACKING_IMAGE_PATTERNS.search(lower)
 
 
-def _extract_image_urls(content_div, base_url: str, soup=None) -> list[str]:
+def _extract_image_urls(
+    content_div,
+    base_url: str,
+    soup=None,
+    allowed_hosts: set[str] | None = None,
+) -> list[str]:
     """콘텐츠 div에서 이미지 URL을 추출한다 (lazy-load/srcset/og:image, 트래킹 필터 적용)."""
     image_urls: list[str] = []
     seen: set[str] = set()
@@ -268,8 +348,14 @@ def _extract_image_urls(content_div, base_url: str, soup=None) -> list[str]:
         """이미지를 등록하고, 최대치에 도달하면 True를 반환한다."""
         if not url:
             return False
-        resolved = normalize_link(url, base_url) if url.startswith("/") else url
-        if not resolved.startswith("http") or not _is_valid_content_image(resolved):
+        resolved = urljoin(base_url.rstrip("/") + "/", url)
+        parsed = urlsplit(resolved)
+        if parsed.scheme != "https" or not parsed.hostname:
+            return False
+        if allowed_hosts and not is_allowed_hostname(parsed.hostname, allowed_hosts):
+            logger.debug("허용되지 않은 이미지 호스트를 건너뜁니다: %s", parsed.hostname)
+            return False
+        if not _is_valid_content_image(resolved):
             return False
         if resolved not in seen:
             seen.add(resolved)
@@ -291,7 +377,11 @@ def _extract_image_urls(content_div, base_url: str, soup=None) -> list[str]:
     return image_urls
 
 
-def _extract_attachments(soup, base_url: str) -> list[Attachment]:
+def _extract_attachments(
+    soup,
+    base_url: str,
+    allowed_hosts: set[str] | None = None,
+) -> list[Attachment]:
     """페이지의 div.attachments에서 첨부파일 목록을 추출한다."""
     attach_div = soup.find("div", class_="attachments")
     if not attach_div:
@@ -305,9 +395,55 @@ def _extract_attachments(soup, base_url: str) -> list[Attachment]:
         filename = a_tag.get_text(strip=True)
         if not filename:
             continue
-        url = href if href.startswith("http") else base_url + href
+        url = urljoin(base_url.rstrip("/") + "/", href)
+        parsed = urlsplit(url)
+        if parsed.scheme != "https" or not parsed.hostname:
+            continue
+        if allowed_hosts and not is_allowed_hostname(parsed.hostname, allowed_hosts):
+            logger.debug("허용되지 않은 첨부 호스트를 건너뜁니다: %s", parsed.hostname)
+            continue
         attachments.append(Attachment(filename=filename, url=url))
     return attachments
+
+
+def _html_to_markdown(content_div) -> str:
+    """공지 본문의 제목·목록·표 관계를 보존하는 제한적 Markdown 변환."""
+    for table in content_div.find_all("table"):
+        rows: list[list[str]] = []
+        for tr in table.find_all("tr"):
+            cells = [
+                re.sub(r"\s+", " ", cell.get_text(" ", strip=True)).replace("|", "\\|")
+                for cell in tr.find_all(["th", "td"])
+            ]
+            if cells:
+                rows.append(cells)
+        if not rows:
+            table.decompose()
+            continue
+        width = max(len(row) for row in rows)
+        normalized = [row + [""] * (width - len(row)) for row in rows]
+        header = normalized[0]
+        markdown_rows = [
+            "| " + " | ".join(header) + " |",
+            "| " + " | ".join(["---"] * width) + " |",
+            *("| " + " | ".join(row) + " |" for row in normalized[1:]),
+        ]
+        table.replace_with("\n" + "\n".join(markdown_rows) + "\n")
+
+    for level in range(1, 7):
+        for heading in content_div.find_all(f"h{level}"):
+            text = heading.get_text(" ", strip=True)
+            heading.replace_with(f"\n{'#' * level} {text}\n" if text else "\n")
+    for item in content_div.find_all("li"):
+        text = item.get_text(" ", strip=True)
+        item.replace_with(f"\n- {text}" if text else "")
+    for br in content_div.find_all("br"):
+        br.replace_with("\n")
+
+    text = content_div.get_text(separator="\n", strip=True)
+    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
 
 
 async def _fetch_article_body_async(
@@ -316,27 +452,39 @@ async def _fetch_article_body_async(
     ssl_context: ssl.SSLContext,
     base_url: str,
     semaphore: asyncio.Semaphore,
+    allowed_hosts: set[str],
 ) -> tuple[str, list[str], list[Attachment]]:
     """게시물 페이지에서 본문 텍스트, 이미지 URL, 첨부파일 정보를 크롤링한다."""
     from bs4 import BeautifulSoup
 
     try:
         async with semaphore:
-            async with session.get(
-                url, ssl=ssl_context, timeout=aiohttp.ClientTimeout(total=ARTICLE_BODY_TIMEOUT)
-            ) as resp:
-                resp.raise_for_status()
-                html = await resp.text(encoding="utf-8", errors="replace")
+            html_data = await download_bytes(
+                session,
+                url,
+                ssl_context=ssl_context,
+                timeout=ARTICLE_BODY_TIMEOUT,
+                allowed_hosts=allowed_hosts,
+                max_size=MAX_ARTICLE_HTML_SIZE,
+            )
+        if html_data is None:
+            return "", [], []
+        html = html_data.decode("utf-8", errors="replace")
 
         soup = BeautifulSoup(html, "lxml")
-        attachments = _extract_attachments(soup, base_url)
+        attachments = _extract_attachments(soup, base_url, allowed_hosts)
 
         content_div = soup.find("div", class_=BOARD_CONTENT_CLASS)
         if not content_div:
             return "", [], attachments
 
-        text = re.sub(r"\s+", " ", content_div.get_text(separator=" ", strip=True)).strip()
-        image_urls = _extract_image_urls(content_div, base_url, soup=soup)
+        text = _html_to_markdown(content_div)
+        image_urls = _extract_image_urls(
+            content_div,
+            base_url,
+            soup=soup,
+            allowed_hosts=allowed_hosts,
+        )
         return text[:MAX_ARTICLE_BODY_LENGTH], image_urls, attachments
     except Exception as e:
         logger.warning("본문 크롤링 실패 - %s: %s", url, e)
@@ -361,6 +509,7 @@ async def enrich_articles_with_body(articles: list[Article], config: dict) -> No
     ssl_context = ssl_context_from_config(config)
     base_url = config["settings"]["base_url"]
     semaphore = asyncio.Semaphore(MAX_CONCURRENT_BODY_FETCHES)
+    allowed_hosts = allowed_hosts_from_config(config)
 
     link_articles = [a for a in articles if a.link]
     async with aiohttp.ClientSession(headers=DEFAULT_HEADERS) as session:
@@ -368,7 +517,12 @@ async def enrich_articles_with_body(articles: list[Article], config: dict) -> No
             *(
                 # 이미지/첨부파일 상대 경로는 게시물이 있는 호스트 기준으로 해석한다.
                 _fetch_article_body_async(
-                    session, a.link, ssl_context, base_url_of(a.link) or base_url, semaphore
+                    session,
+                    a.link,
+                    ssl_context,
+                    base_url_of(a.link) or base_url,
+                    semaphore,
+                    allowed_hosts,
                 )
                 for a in link_articles
             ),
@@ -376,7 +530,7 @@ async def enrich_articles_with_body(articles: list[Article], config: dict) -> No
         )
 
     for article, result in zip(link_articles, results):
-        if isinstance(result, Exception):
+        if isinstance(result, BaseException):
             logger.warning("본문 크롤링 예외 - %s: %s", article.link, result)
             continue
         body, image_urls, attachments = result
