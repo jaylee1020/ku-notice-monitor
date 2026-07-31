@@ -17,26 +17,7 @@ logger = logging.getLogger(__name__)
 
 # GitHub Actions 러너는 UTC이므로, 사용자에게 보이는 날짜/시각은 KST로 표기한다.
 _KST = ZoneInfo("Asia/Seoul")
-_ITEM_SEPARATOR = "\n\n────────\n\n"
-
-_CATEGORY_LABELS = {
-    "academic": ("🎓", "학사"),
-    "tuition": ("💳", "등록금"),
-    "scholarship": ("🎁", "장학"),
-    "career": ("💼", "취업·진로"),
-    "international": ("🌏", "국제교류"),
-    "event": ("🎉", "행사"),
-    "campus_life": ("🏫", "학생생활"),
-    "administrative": ("📋", "행정"),
-    "other": ("📌", "기타"),
-}
-
-_AUDIENCE_LABELS = {
-    "eligible": ("✅", "내 조건과 일치"),
-    "possibly_eligible": ("⚠️", "일부 조건 확인"),
-    "unknown": ("⚠️", "대상 확인 필요"),
-    "ineligible": ("⛔", "대상 아님"),
-}
+_ITEM_SEPARATOR = "\n\n"
 
 
 class TelegramDeliveryError(RuntimeError):
@@ -93,75 +74,61 @@ def _deadline_label(deadline: str | None) -> str | None:
         displayed = (
             f"{deadline_date.year}년 {deadline_date.month}월 {deadline_date.day}일"
         )
-    return f"{displayed} · {relative}"
+    return f"{displayed} ({relative})"
 
 
 def _build_items(matched: list[ClassifiedNotice]) -> str:
     items: list[str] = []
-    for match in matched:
+    for index, match in enumerate(matched, 1):
         article = match.article
-        category_icon, category_label = _CATEGORY_LABELS.get(
-            match.category, ("📌", match.category)
-        )
-        update_badge = " · <b>수정됨</b>" if article.is_update else ""
+        update_badge = " [수정]" if article.is_update else ""
         lines = [
             (
-                f"{category_icon} <b>{_html(category_label, 30)}</b>"
-                f" · {_html(article.board_name, 50)}{update_badge}"
-            ),
-            f"<b>{_html(article.title, 180)}</b>",
+                f"{index}. [{_html(article.board_name, 50)}] "
+                f"{_html(article.title, 180)}{update_badge}"
+            )
         ]
 
         if match.summary and match.summary != article.title:
-            lines.append(f"<i>{_html(match.summary, 220)}</i>")
+            lines.append(f"→ {_html(match.summary, 220)}")
 
-        audience_icon, audience_label = _AUDIENCE_LABELS.get(
-            match.audience_fit, ("⚠️", match.audience_fit)
-        )
-        lines.append(
-            f"\n{audience_icon} <b>{_html(audience_label, 40)}</b>"
-        )
-        if match.delivery == "review" and match.uncertainties:
-            lines.append(_html(match.uncertainties[0], 180))
-        elif match.reason:
-            lines.append(f"💡 {_html(match.reason, 180)}")
+        if match.delivery == "review":
+            detail = (
+                match.uncertainties[0] if match.uncertainties else match.reason
+            )
+            lines.append(f"확인 필요: {_html(detail, 180)}")
 
         if deadline := _deadline_label(match.deadline):
-            lines.append(f"⏰ <b>마감</b>  {_html(deadline, 50)}")
+            lines.append(f"마감: {_html(deadline, 50)}")
         if match.actions:
             actions = " · ".join(match.actions[:2])
-            lines.append(f"👉 <b>할 일</b>  {_html(actions, 180)}")
-        if match.benefits:
-            benefits = " · ".join(match.benefits[:2])
-            lines.append(f"🎁 <b>혜택</b>  {_html(benefits, 180)}")
+            lines.append(f"할 일: {_html(actions, 180)}")
 
         article_link = escape(article.link, quote=True)
-        lines.append(f'\n🔗 <a href="{article_link}">공지 열기 →</a>')
+        lines.append(f'<a href="{article_link}">공지 보기</a>')
         if article.attachments:
-            lines[-1] += f"  ·  📎 첨부 {len(article.attachments)}개"
+            lines[-1] += f" · 첨부 {len(article.attachments)}개"
         items.append("\n".join(lines))
     return _ITEM_SEPARATOR.join(items)
 
 
 def build_urgent_message(matched: list[ClassifiedNotice], total_new: int) -> str:
-    del total_new  # 전체 수보다 실제로 확인할 항목 수를 전면에 보여준다.
-    count = f" · {len(matched)}건" if len(matched) > 1 else ""
-    header = f"🚨 <b>지금 확인할 공지</b>{count}"
+    today = _now_kst().strftime("%Y-%m-%d")
+    header = f"{today} 새 공지 {total_new}건 중 관련 {len(matched)}건"
     return header + "\n\n" + _build_items(matched)
 
 
 def build_digest_message(matched: list[ClassifiedNotice]) -> str:
-    header = f"🗂 <b>오늘의 관심 공지</b> · {len(matched)}건"
+    today = _now_kst().strftime("%Y-%m-%d")
+    header = f"{today} 관심 공지 {len(matched)}건"
     return header + "\n\n" + _build_items(matched)
 
 
 def build_relevant_message(matched: list[ClassifiedNotice], total_new: int) -> str:
     """기존 호출부 호환용: 관련 공지를 일반 요약 형태로 생성한다."""
-    return (
-        f"📬 <b>새 관심 공지</b> · {len(matched)}건"
-        f" <i>(전체 신규 {total_new}건)</i>\n\n"
-        + _build_items(matched)
-    )
+    today = _now_kst().strftime("%Y-%m-%d")
+    header = f"{today} 새 공지 {total_new}건 중 관련 {len(matched)}건"
+    return header + "\n\n" + _build_items(matched)
 
 
 def build_no_new_message() -> str:
@@ -179,10 +146,7 @@ def build_no_relevant_message(total_new: int) -> str:
 def build_error_message(error_detail: str) -> str:
     """워크플로우 오류 알림 메시지"""
     today = _now_kst().strftime("%Y-%m-%d %H:%M")
-    return (
-        f"🔴 <b>모니터링 실패</b> · {today}\n"
-        f"{_html(error_detail, 1000)}"
-    )
+    return f"[오류] {today} 모니터링 실패\n{_html(error_detail, 1000)}"
 
 
 def build_first_run_message(seeded_count: int) -> str:

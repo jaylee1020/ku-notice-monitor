@@ -72,11 +72,13 @@ def test_build_urgent_message_has_deadline_and_actions(make_article, make_classi
         )
     ]
     msg = build_urgent_message(matched, 3)
-    assert "🚨" in msg
+    assert "새 공지 3건 중 관련 1건" in msg
     assert "2099년 12월 31일" in msg
     assert "수강바구니 확인" in msg
     assert "분류:" not in msg
     assert "이유:" not in msg
+    assert "내 조건과 일치" not in msg
+    assert "🚨" not in msg
 
 
 def test_build_digest_message_marks_updated_article(make_article, make_classified):
@@ -87,8 +89,8 @@ def test_build_digest_message_marks_updated_article(make_article, make_classifie
         )
     ]
     msg = build_digest_message(matched)
-    assert "🗂" in msg
-    assert "수정됨" in msg
+    assert "관심 공지 1건" in msg
+    assert "[수정]" in msg
 
 
 def test_review_message_explains_uncertainty(make_article, make_classified):
@@ -101,7 +103,7 @@ def test_review_message_explains_uncertainty(make_article, make_classified):
         )
     ]
     msg = build_urgent_message(matched, 1)
-    assert "<b>대상 확인 필요</b>" in msg
+    assert "확인 필요:" in msg
     assert "학번별 적용 기준 불명확" in msg
     assert "unknown" not in msg
 
@@ -120,7 +122,7 @@ def test_message_escapes_dynamic_html_and_uses_link(
     ]
     msg = build_urgent_message(matched, 1)
     assert "&lt;필독&gt; 등록금 &amp; 장학" in msg
-    assert "<i>A &lt; B</i>" in msg
+    assert "→ A &lt; B" in msg
     assert 'href="https://example.com/?a=1&amp;b=2"' in msg
     assert "https://example.com/?a=1&b=2\n" not in msg
 
