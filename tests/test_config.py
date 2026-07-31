@@ -5,7 +5,7 @@ from unittest.mock import patch
 
 import pytest
 
-from ku_notice_monitor.config import _load_json_env, validate_config
+from ku_notice_monitor.config import _load_json_env, _load_text_env, validate_config
 
 # --- _load_json_env ---
 
@@ -32,6 +32,12 @@ def test_load_json_env_not_dict():
     with patch.dict(os.environ, {"TEST_VAR": '["list"]'}):
         result = _load_json_env("TEST_VAR", {"fallback": True})
     assert result == {"fallback": True}
+
+
+def test_load_text_env_strips_natural_profile():
+    with patch.dict(os.environ, {"PROFILE_TEXT": "  나는 서울에 산다.  "}):
+        result = _load_text_env("PROFILE_TEXT")
+    assert result == "나는 서울에 산다."
 
 
 # --- validate_config ---
@@ -125,6 +131,13 @@ def test_validate_config_invalid_action_window():
     config = _make_valid_config()
     config["classification"]["action_window_days"] = 120
     with pytest.raises(ValueError, match="action_window_days"):
+        validate_config(config)
+
+
+def test_validate_config_rejects_non_boolean_speculative_policy():
+    config = _make_valid_config()
+    config["classification"]["suppress_speculative_opportunities"] = "yes"
+    with pytest.raises(ValueError, match="suppress_speculative_opportunities"):
         validate_config(config)
 
 

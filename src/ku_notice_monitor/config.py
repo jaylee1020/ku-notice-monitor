@@ -67,6 +67,7 @@ class AIConfig(SettingsModel):
 
 class ClassificationConfig(SettingsModel):
     action_window_days: int = Field(default=21, ge=0, le=90)
+    suppress_speculative_opportunities: bool = True
 
 
 class NotificationConfig(SettingsModel):
@@ -89,6 +90,7 @@ class RuntimeConfig(SettingsModel):
 
 
 class AppConfig(SettingsModel):
+    profile_text: str = Field(default="", max_length=12_000)
     profile: ProfileConfig
     keywords: KeywordConfig
     feeds: dict[str, FeedConfig]
@@ -117,6 +119,12 @@ def _load_json_env(var_name: str, fallback: dict) -> dict:
     return value
 
 
+def _load_text_env(var_name: str, fallback: str = "") -> str:
+    """자연어 설정을 내용 로깅 없이 환경변수에서 읽는다."""
+    raw = os.environ.get(var_name)
+    return raw.strip() if raw is not None else fallback
+
+
 def load_config() -> AppConfig:
     """config.yaml을 로드한 뒤 환경변수로 개인정보를 오버라이드한다."""
     load_dotenv(PROJECT_ROOT / ".env.local")
@@ -124,6 +132,10 @@ def load_config() -> AppConfig:
     with open(CONFIG_PATH, "r", encoding="utf-8") as f:
         config = yaml.safe_load(f)
 
+    config["profile_text"] = _load_text_env(
+        "PROFILE_TEXT",
+        str(config.get("profile_text", "")),
+    )
     config["profile"] = _load_json_env("PROFILE_JSON", config.get("profile", {}))
     config["keywords"] = _load_json_env("KEYWORDS_JSON", config.get("keywords", {}))
 
@@ -178,6 +190,15 @@ def _validate_classification(classification: dict) -> None:
         raise ValueError(
             "classification.action_window_days는 0~90 사이 정수여야 합니다: "
             f"{action_window!r}"
+        )
+    suppress_speculative = classification.get(
+        "suppress_speculative_opportunities",
+        True,
+    )
+    if not isinstance(suppress_speculative, bool):
+        raise ValueError(
+            "classification.suppress_speculative_opportunities는 bool이어야 합니다: "
+            f"{suppress_speculative!r}"
         )
 
 

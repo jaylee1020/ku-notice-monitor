@@ -214,6 +214,78 @@ def test_match_articles_openai_success(make_article):
     assert matched[0].delivery == "digest"
 
 
+def test_match_articles_suppresses_unsupported_ulsan_opportunity(make_article):
+    article = make_article(
+        title="울산광역시 대학생 학자금대출 이자지원",
+        description=(
+            "지원 대상은 본인의 주민등록상 주소가 울산광역시인 대학생 또는 "
+            "직계존속의 주민등록상 주소가 울산광역시인 대학생입니다."
+        ),
+    )
+    raw = _assessment(
+        category="scholarship",
+        audience_fit="possibly_eligible",
+        audience_reason="본인 또는 직계존속 주소 확인 필요",
+        interest_fit="high",
+        interest_reason="장학 관심",
+        obligation="optional",
+        consequence="financial_loss",
+        eligibility_paths=[
+            {
+                "label": "학생 본인 주소",
+                "conditions": [
+                    {
+                        "fact_key": "registered_residence",
+                        "operator": "equals",
+                        "expected_values": ["울산광역시"],
+                        "evidence": "본인의 주민등록상 주소가 울산광역시",
+                    }
+                ],
+            },
+            {
+                "label": "직계존속 주소",
+                "conditions": [
+                    {
+                        "fact_key": "family_registered_residence",
+                        "operator": "equals",
+                        "expected_values": ["울산광역시"],
+                        "evidence": "직계존속의 주민등록상 주소가 울산광역시",
+                    }
+                ],
+            },
+        ],
+        evidence=["울산광역시인 대학생"],
+    ).model_dump(mode="json")
+    config = _config()
+    config["profile_snapshot"] = {
+        "summary": "서울 거주 학생",
+        "facts": [
+            {
+                "key": "current_residence",
+                "value": "서울특별시",
+                "certainty": "explicit",
+                "source_quote": "서울특별시에 산다",
+            }
+        ],
+        "preferences": [
+            {
+                "kind": "do_not_infer",
+                "statement": "가족 주소를 추측하지 않음",
+                "source_quote": "가족 주소를 추측하지 마라",
+            }
+        ],
+    }
+    with patch(
+        "ku_notice_monitor.matcher.analyze_with_openai",
+        new_callable=AsyncMock,
+        return_value={article.key: raw},
+    ):
+        result = asyncio.run(match_articles([article], config))
+    assert result.notices == []
+    assert result.suppressed_count == 1
+    assert result.metrics["eligibility_override_count"] == 1
+
+
 def test_match_articles_partially_falls_back(make_article):
     openai_article = make_article(id="1", title="인턴 모집")
     failed_article = make_article(id="2", title="수강신청 안내")

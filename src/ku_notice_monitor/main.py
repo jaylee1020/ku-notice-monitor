@@ -31,6 +31,7 @@ from .notifier import (
     send_telegram_part,
     split_message,
 )
+from .profile import profile_document_fingerprint, resolve_profile_snapshot
 from .state import (
     clear_classification_retry,
     clear_pending_digest,
@@ -298,6 +299,9 @@ async def run() -> None:
         "suppressed_articles": 0,
         "analysis_metrics": {},
         "detail_refreshed": 0,
+        "profile_changed": False,
+        "profile_rechecked": 0,
+        "profile_metrics": {},
         "method": "none",
         "timing": {},
     }
@@ -307,6 +311,13 @@ async def run() -> None:
     state_path = str(PROJECT_ROOT / config["settings"]["state_file"])
     first_run = not Path(state_path).exists()
     state = load_state(state_path)
+    current_profile_hash = profile_document_fingerprint(config)
+    previous_profile_hash = state.get("profile_document_hash")
+    profile_changed = (
+        isinstance(previous_profile_hash, str)
+        and previous_profile_hash != current_profile_hash
+    )
+    stats["profile_changed"] = profile_changed
 
     retry_result = await _flush_pending_deliveries(state, state_path)
     stats["outbox_sent_parts"] += retry_result["sent_parts"]
@@ -341,6 +352,7 @@ async def run() -> None:
             dedup_key="first-run",
             metadata={"group_id": "first-run"},
         )
+        state["profile_document_hash"] = current_profile_hash
         _finalize_state(state, state_path, all_articles, stats, source_fingerprints)
         delivery_result = await _flush_pending_deliveries(state, state_path)
         stats["outbox_sent_parts"] += delivery_result["sent_parts"]
@@ -363,9 +375,20 @@ async def run() -> None:
         if refresh_due
         else []
     )
+    profile_recheck_articles = (
+        _select_detail_refresh_articles(all_articles, state, config)
+        if profile_changed
+        else []
+    )
+    stats["profile_rechecked"] = len(profile_recheck_articles)
     enrichment_by_key = {
         article.key: article
-        for article in [*preliminary_new, *retry_articles, *refresh_articles]
+        for article in [
+            *preliminary_new,
+            *retry_articles,
+            *refresh_articles,
+            *profile_recheck_articles,
+        ]
     }
     enrichment_targets = list(enrichment_by_key.values())
     if enrichment_targets:
@@ -394,11 +417,23 @@ async def run() -> None:
         )
 
     classification_by_key = {
-        article.key: article for article in [*new_articles, *retry_articles]
+        article.key: article
+        for article in [
+            *new_articles,
+            *retry_articles,
+            *profile_recheck_articles,
+        ]
     }
     classification_articles = list(classification_by_key.values())
 
     if classification_articles:
+        profile_metrics: dict[str, Any] = {}
+        profile_snapshot = await resolve_profile_snapshot(
+            config,
+            metrics=profile_metrics,
+        )
+        config["profile_snapshot"] = profile_snapshot.model_dump(mode="json")
+        stats["profile_metrics"] = profile_metrics
         started = time.monotonic()
         match_result = await match_articles(classification_articles, config)
         matched, method = match_result
@@ -461,6 +496,7 @@ async def run() -> None:
         )
 
     stats["digest_queued"] += await _flush_digest_if_due(state, config)
+    state["profile_document_hash"] = current_profile_hash
     _finalize_state(
         state,
         state_path,

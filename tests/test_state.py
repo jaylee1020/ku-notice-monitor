@@ -11,6 +11,7 @@ from ku_notice_monitor.state import (
     enqueue_digest,
     filter_new_articles,
     get_pending_digest,
+    load_state,
     mark_as_seen,
     record_delivery_failure,
     schedule_classification_retry,
@@ -161,3 +162,18 @@ def test_classification_retry_uses_bounded_backoff():
         state,
         now=datetime.fromisoformat("2026-08-01T11:00:00"),
     ) == {"234:1"}
+
+
+def test_state_v3_migrates_profile_hash_without_personal_data(tmp_path):
+    path = tmp_path / "state.json"
+    path.write_text(
+        '{"schema_version":3,"seen_ids":{},"article_fingerprints":{},'
+        '"enriched_fingerprints":{},"pending_digest":[],'
+        '"pending_deliveries":[],"delivery_history":{},'
+        '"classification_retries":{}}',
+        encoding="utf-8",
+    )
+    state = load_state(str(path))
+    assert state["schema_version"] == 4
+    assert state["profile_document_hash"] is None
+    assert "profile_snapshot" not in state
