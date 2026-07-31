@@ -14,7 +14,7 @@ from .models import Article, ClassifiedNotice
 
 logger = logging.getLogger(__name__)
 
-STATE_SCHEMA_VERSION = 3
+STATE_SCHEMA_VERSION = 4
 MAX_PENDING_DIGEST = 200
 MAX_PENDING_DELIVERIES = 500
 
@@ -40,6 +40,7 @@ def _initial_state() -> dict:
         "last_digest_enqueued_date": None,
         "last_digest_sent_date": None,
         "last_detail_refresh_at": None,
+        "profile_document_hash": None,
         "last_run": None,
     }
 
@@ -100,6 +101,9 @@ def load_state(state_path: str) -> dict:
         state.setdefault("delivery_history", {})
         state.setdefault("classification_retries", {})
         state.setdefault("last_detail_refresh_at", None)
+    # v3 → v4: 자연어 프로필 내용은 저장하지 않고 변경 감지 해시만 추가
+    if schema_version < 4:
+        state.setdefault("profile_document_hash", None)
 
     state["schema_version"] = schema_version
     state.setdefault("seen_ids", {})
@@ -111,7 +115,16 @@ def load_state(state_path: str) -> dict:
     state.setdefault("classification_retries", {})
     state.setdefault("last_digest_enqueued_date", None)
     state.setdefault("last_digest_sent_date", None)
+    state.setdefault("last_detail_refresh_at", None)
+    state.setdefault("profile_document_hash", None)
     state.setdefault("last_run", None)
+    if state["profile_document_hash"] is not None and not isinstance(
+        state["profile_document_hash"],
+        str,
+    ):
+        raise StateCorruptionError(
+            "state.profile_document_hash의 형식이 잘못되었습니다: str 또는 null 필요"
+        )
     expected_types = {
         "seen_ids": dict,
         "article_fingerprints": dict,

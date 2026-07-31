@@ -5,7 +5,9 @@ from enum import StrEnum
 
 from pydantic import BaseModel, Field, field_validator
 
-ASSESSMENT_SCHEMA_VERSION = 1
+from .profile_models import ProfileFactKey
+
+ASSESSMENT_SCHEMA_VERSION = 2
 
 
 class NoticeCategory(StrEnum):
@@ -63,6 +65,39 @@ class AttachmentNeed(StrEnum):
     REQUIRED = "required"
 
 
+class EligibilityOperator(StrEnum):
+    EQUALS = "equals"
+    ONE_OF = "one_of"
+    NOT_ONE_OF = "not_one_of"
+    CONTAINS = "contains"
+    AT_LEAST = "at_least"
+    AT_MOST = "at_most"
+
+
+class EligibilityMatch(StrEnum):
+    NOT_EVALUATED = "not_evaluated"
+    MATCH = "match"
+    PARTIAL = "partial"
+    UNKNOWN = "unknown"
+    CONFLICT = "conflict"
+
+
+class EligibilityCondition(BaseModel):
+    """프로필 사실 하나와 비교할 수 있는 공지의 원자적 자격 조건."""
+
+    fact_key: ProfileFactKey
+    operator: EligibilityOperator
+    expected_values: list[str] = Field(min_length=1, max_length=10)
+    evidence: str = Field(min_length=1, max_length=200)
+
+
+class EligibilityPath(BaseModel):
+    """모두 충족해야 하는 AND 조건 묶음. 여러 path는 서로 OR 관계."""
+
+    label: str = Field(min_length=1, max_length=120)
+    conditions: list[EligibilityCondition] = Field(min_length=1, max_length=12)
+
+
 class NoticeDate(BaseModel):
     kind: DateKind
     date: str
@@ -106,6 +141,8 @@ class NoticeAssessment(BaseModel):
     summary: str = Field(min_length=1, max_length=240)
     audience_fit: AudienceFit
     audience_reason: str = Field(min_length=1, max_length=200)
+    eligibility_paths: list[EligibilityPath] = Field(default_factory=list, max_length=8)
+    eligibility_match: EligibilityMatch = EligibilityMatch.NOT_EVALUATED
     interest_fit: InterestFit
     interest_reason: str = Field(min_length=1, max_length=160)
     obligation: Obligation

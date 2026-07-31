@@ -6,11 +6,14 @@ from dataclasses import dataclass
 from datetime import date, datetime
 from typing import Literal
 
-from .analysis_models import AudienceFit, NoticeAssessment
+from .analysis_models import AudienceFit, EligibilityMatch, NoticeAssessment
 from .classification import Delivery, classify_assessment
+from .eligibility import apply_profile_eligibility
 from .feeds import parse_pub_date
 from .models import Article, ClassifiedNotice
 from .openai_classifier import analyze_with_openai
+from .profile import legacy_profile_snapshot
+from .profile_models import ProfileSnapshot
 from .prompts import build_profile_text, build_prompt
 
 logger = logging.getLogger(__name__)
@@ -113,6 +116,14 @@ def keyword_fallback(article: Article, config: dict) -> NoticeAssessment:
         for key, value in profile.items()
         if key in {"major", "previous_major", "campus", "status"} and value
     ]
+    raw_snapshot = config.get("profile_snapshot")
+    if raw_snapshot:
+        snapshot = ProfileSnapshot.model_validate(raw_snapshot)
+        profile_terms.extend(
+            fact.value
+            for fact in snapshot.facts
+            if fact.value not in profile_terms
+        )
     audience_matches = _find_keywords(text, profile_terms)
     required = any(term in text for term in _REQUIRED_TERMS)
 
@@ -195,7 +206,11 @@ def validate_assessment_grounding(
         if _normalize_grounding_text(evidence) in normalized_source
     ]
     uncertainties = list(assessment.uncertainties)
-    updates: dict = {"evidence": valid_evidence}
+    updates: dict = {
+        "evidence": valid_evidence,
+        # 모델이 이 내부 필드를 직접 결정하지 못하게 항상 초기화한다.
+        "eligibility_match": EligibilityMatch.NOT_EVALUATED,
+    }
 
     if len(valid_evidence) != len(assessment.evidence):
         uncertainties.append("일부 인용 근거를 입력 원문에서 자동 확인하지 못함")
@@ -236,6 +251,20 @@ def validate_assessment_grounding(
         updates["actions"] = grounded_actions
         uncertainties.append("일부 행동 마감일을 원문에서 확인하지 못해 제외함")
 
+    grounded_paths = []
+    removed_path = False
+    for path in assessment.eligibility_paths:
+        if all(
+            _normalize_grounding_text(condition.evidence) in normalized_source
+            for condition in path.conditions
+        ):
+            grounded_paths.append(path)
+        else:
+            removed_path = True
+    if removed_path:
+        updates["eligibility_paths"] = grounded_paths
+        uncertainties.append("일부 자격 조건을 공지 원문에서 확인하지 못해 제외함")
+
     updates["uncertainties"] = list(dict.fromkeys(uncertainties))[:5]
     return assessment.model_copy(update=updates)
 
@@ -256,6 +285,16 @@ async def match_articles(
     classified: list[ClassifiedNotice] = []
     suppressed_count = 0
     action_window_days = config.get("classification", {}).get("action_window_days", 21)
+    suppress_speculative = config.get("classification", {}).get(
+        "suppress_speculative_opportunities",
+        True,
+    )
+    snapshot = (
+        ProfileSnapshot.model_validate(config["profile_snapshot"])
+        if config.get("profile_snapshot")
+        else legacy_profile_snapshot(config)
+    )
+    eligibility_overrides = 0
 
     for article in articles:
         raw = openai_results.get(article.key)
@@ -276,12 +315,17 @@ async def match_articles(
                 used_rules = True
         if source == "openai":
             assessment = validate_assessment_grounding(article, assessment)
+            before_fit = assessment.audience_fit
+            assessment = apply_profile_eligibility(assessment, snapshot)
+            if assessment.audience_fit != before_fit:
+                eligibility_overrides += 1
 
         result = classify_assessment(
             article,
             assessment,
             source=source,
             action_window_days=action_window_days,
+            suppress_speculative_opportunities=suppress_speculative,
         )
         if result.delivery != Delivery.SUPPRESS:
             classified.append(result)
@@ -305,6 +349,7 @@ async def match_articles(
     )
     metrics["openai_result_count"] = len(openai_results)
     metrics["rule_fallback_count"] = len(failed_keys)
+    metrics["eligibility_override_count"] = eligibility_overrides
     return MatchResult(classified, method, failed_keys, suppressed_count, metrics)
 
 

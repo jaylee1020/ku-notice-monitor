@@ -2,12 +2,18 @@
 
 # === 사용자 프로필 ===
 # 개인정보는 GitHub Secrets에 저장하고 환경변수로 주입합니다.
+# 권장 환경변수 PROFILE_TEXT 예시:
+#   나는 건국대학교 서울캠퍼스 컴퓨터공학부 2학년이다. 서울특별시에 거주한다.
+#   다른 지역 주민 전용 사업은 보내지 말고, 문서에 없는 가족 조건은 추측하지 마라.
+# 기존 PROFILE_JSON은 마이그레이션 호환용으로 계속 지원합니다.
 # 환경변수 PROFILE_JSON 예시:
 #   {"major":"컴퓨터공학부","previous_major":"KU자유전공학부","year":2,"campus":"서울","status":"재학"}
 # 환경변수 KEYWORDS_JSON 예시:
 #   {"high":["장학","등록금","수강신청"],"medium":["취업","인턴","공모전"]}
 #
 # 아래는 환경변수가 없을 때 사용되는 기본값입니다.
+profile_text: ""
+
 profile:
   major: ""
   previous_major: ""
@@ -65,6 +71,8 @@ ai:
 # === 전달 결정 정책 ===
 classification:
   action_window_days: 21       # 관련 행동 마감이 이 기간 안이면 즉시 알림
+  # 프로필에 근거가 없는 선택적 기회를 "혹시 해당될 수 있음"만으로 보내지 않습니다.
+  suppress_speculative_opportunities: true
 
 # === 알림 설정 ===
 notifications:

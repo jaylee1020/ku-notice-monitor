@@ -40,10 +40,25 @@
 | `OPENAI_API_KEY` | OpenAI Platform 프로젝트 API 키 | 권장 |
 | `TELEGRAM_BOT_TOKEN` | BotFather에서 발급한 텔레그램 봇 토큰 | 필수 |
 | `TELEGRAM_CHAT_ID` | 알림을 받을 텔레그램 채팅 ID | 필수 |
-| `PROFILE_JSON` | 학생 프로필 JSON | 선택 |
+| `PROFILE_TEXT` | 자연어로 작성한 사용자 사실·알림 선호 문서 | 권장 |
+| `PROFILE_JSON` | 기존 학생 프로필 JSON(마이그레이션 호환) | 선택 |
 | `KEYWORDS_JSON` | 폴백용 관심 키워드 JSON | 선택 |
 
-`PROFILE_JSON` 예시:
+`PROFILE_TEXT` 예시:
+
+```text
+나는 건국대학교 서울캠퍼스 컴퓨터공학부 2학년이다.
+서울특별시에 거주한다. 다른 지역 주민 전용 사업은 보내지 마라.
+부모 주소, 소득, 장학재단 이용 여부처럼 적지 않은 조건은 추측하지 마라.
+장학금, 수강신청, 복학, 병역 관련 공지는 중요하게 알려줘.
+```
+
+사용자가 쓴 문서는 실행 중에만 구조화되며 원문과 프로필 스냅샷은
+`monitor-state` 브랜치에 저장하지 않습니다. 내용이 바뀌었는지 확인하는 해시만
+상태에 보관합니다. `PROFILE_TEXT`가 없으면 기존 `PROFILE_JSON`과
+`KEYWORDS_JSON`을 사용합니다.
+
+기존 `PROFILE_JSON` 예시:
 
 ```json
 {
@@ -77,6 +92,7 @@ ai:
 
 classification:
   action_window_days: 21
+  suppress_speculative_opportunities: true
 
 notifications:
   digest_hour_kst: 21
@@ -85,6 +101,8 @@ notifications:
 
 - `reasoning_effort: low`: 사실 추출 정확도와 처리 비용의 균형값입니다.
 - `action_window_days`: 관련 행동 마감이 이 기간 안이면 즉시 알림으로 승격합니다.
+- `suppress_speculative_opportunities`: 프로필로 뒷받침되는 자격 경로가 없는
+  선택적 기회를 알림에서 제외합니다.
 - 이미지와 PDF의 `low` detail은 2차 첨부 분석의 토큰 사용을 줄입니다.
 - `notify_empty_runs: false`는 매시간 불필요한 “새 공지 없음” 메시지를 막습니다.
 

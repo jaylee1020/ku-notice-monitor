@@ -9,6 +9,7 @@ from .analysis_models import (
     AudienceFit,
     Consequence,
     DateKind,
+    EligibilityMatch,
     InterestFit,
     NoticeAssessment,
     Obligation,
@@ -55,6 +56,7 @@ def decide_delivery(
     *,
     today: date | None = None,
     action_window_days: int = 21,
+    suppress_speculative_opportunities: bool = True,
 ) -> tuple[Delivery, str]:
     """축별 판정을 비대칭 손실 정책으로 결합한다.
 
@@ -77,6 +79,16 @@ def decide_delivery(
     if assessment.audience_fit == AudienceFit.INELIGIBLE:
         return Delivery.SUPPRESS, f"명시된 대상 조건과 불일치: {assessment.audience_reason}"
 
+    if (
+        suppress_speculative_opportunities
+        and assessment.eligibility_match == EligibilityMatch.UNKNOWN
+        and not has_required_action
+    ):
+        return (
+            Delivery.SUPPRESS,
+            "프로필로 뒷받침되는 자격 경로가 없는 선택적 기회",
+        )
+
     if assessment.audience_fit == AudienceFit.UNKNOWN and (
         high_impact or has_required_action
     ):
@@ -85,11 +97,11 @@ def decide_delivery(
     if assessment.uncertainties and high_impact:
         return Delivery.REVIEW, "고위험 공지의 핵심 조건이 불명확하여 직접 확인 필요"
 
-    if high_impact and assessment.audience_fit in {
-        AudienceFit.ELIGIBLE,
-        AudienceFit.POSSIBLY_ELIGIBLE,
-    }:
+    if high_impact and assessment.audience_fit == AudienceFit.ELIGIBLE:
         return Delivery.IMMEDIATE, "학사·금전·행정상 직접 손실 가능성"
+
+    if high_impact and assessment.audience_fit == AudienceFit.POSSIBLY_ELIGIBLE:
+        return Delivery.REVIEW, "대상 조건이 일부만 확인된 고위험 공지"
 
     if has_required_action and assessment.audience_fit == AudienceFit.ELIGIBLE:
         if deadline_close:
@@ -126,11 +138,13 @@ def classify_assessment(
     source: Literal["openai", "rules", "legacy"],
     today: date | None = None,
     action_window_days: int = 21,
+    suppress_speculative_opportunities: bool = True,
 ) -> ClassifiedNotice:
     delivery, reason = decide_delivery(
         assessment,
         today=today,
         action_window_days=action_window_days,
+        suppress_speculative_opportunities=suppress_speculative_opportunities,
     )
     deadline = _nearest_deadline(assessment)
     return ClassifiedNotice(
