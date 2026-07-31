@@ -2,13 +2,13 @@
 
 import logging
 import os
-from datetime import datetime
+from datetime import date, datetime
 from zoneinfo import ZoneInfo
 
 from telegram import Bot
 
 from constants import MAX_TELEGRAM_MESSAGE_LENGTH
-from models import Article
+from models import ClassifiedNotice
 
 logger = logging.getLogger(__name__)
 
@@ -20,27 +20,68 @@ def _now_kst() -> datetime:
     return datetime.now(_KST)
 
 
-def build_relevant_message(
-    matched: list[tuple[Article, int, str]],
-    total_new: int,
-) -> str:
-    """관련 공지가 있을 때 텔레그램 메시지 생성"""
-    today = _now_kst().strftime("%Y-%m-%d")
-    header = f"{today} 새 공지 {total_new}건 중 관련 {len(matched)}건\n"
+def _deadline_label(deadline: str | None) -> str | None:
+    if not deadline:
+        return None
+    try:
+        deadline_date = date.fromisoformat(deadline)
+    except ValueError:
+        return deadline
+    days = (deadline_date - _now_kst().date()).days
+    if days == 0:
+        relative = "D-DAY"
+    elif days > 0:
+        relative = f"D-{days}"
+    else:
+        relative = f"D+{abs(days)}"
+    return f"{deadline} ({relative})"
 
+
+def _build_items(matched: list[ClassifiedNotice]) -> str:
     items: list[str] = []
-    for i, (article, score, reason) in enumerate(matched, 1):
+    for index, match in enumerate(matched, 1):
+        article = match.article
+        update_badge = " [수정]" if article.is_update else ""
+        review_badge = " [대상 확인 필요]" if match.delivery == "review" else ""
         item = (
-            f"\n{i}. [{article.board_name}] {article.title}\n"
-            f"→ {reason}\n"
-            f"{article.link}"
+            f"\n{index}. [{article.board_name}] "
+            f"{article.title}{update_badge}{review_badge}\n"
         )
+        if match.summary and match.summary != article.title:
+            item += f"요약: {match.summary}\n"
+        item += f"이유: {match.reason}\n"
+        if match.audience_fit != "eligible":
+            item += f"대상 판정: {match.audience_fit}\n"
+        if deadline := _deadline_label(match.deadline):
+            item += f"⏰ 마감: {deadline}\n"
+        if match.actions:
+            item += "✅ 할 일: " + " · ".join(match.actions) + "\n"
+        if match.uncertainties:
+            item += "⚠️ 확인 필요: " + " · ".join(match.uncertainties[:2]) + "\n"
+        item += article.link
         if article.attachments:
             filenames = ", ".join(att.filename for att in article.attachments)
             item += f"\n📎 {filenames}"
         items.append(item)
+    return "\n".join(items)
 
-    return header + "\n".join(items)
+
+def build_urgent_message(matched: list[ClassifiedNotice], total_new: int) -> str:
+    today = _now_kst().strftime("%Y-%m-%d %H:%M")
+    header = f"🚨 {today} 바로 확인할 공지 {len(matched)}건 (신규 {total_new}건)\n"
+    return header + _build_items(matched)
+
+
+def build_digest_message(matched: list[ClassifiedNotice]) -> str:
+    today = _now_kst().strftime("%Y-%m-%d")
+    header = f"🗂 {today} 관심 공지 요약 {len(matched)}건\n"
+    return header + _build_items(matched)
+
+
+def build_relevant_message(matched: list[ClassifiedNotice], total_new: int) -> str:
+    """기존 호출부 호환용: 관련 공지를 일반 요약 형태로 생성한다."""
+    today = _now_kst().strftime("%Y-%m-%d")
+    return f"{today} 새 공지 {total_new}건 중 관련 {len(matched)}건\n" + _build_items(matched)
 
 
 def build_no_new_message() -> str:
@@ -67,7 +108,7 @@ def build_first_run_message(seeded_count: int) -> str:
     return (
         f"{today} 모니터링을 시작합니다.\n"
         f"기존 공지 {seeded_count}건은 '확인함'으로 처리했으며, "
-        f"이후 등록되는 새 공지부터 관련도를 분석해 알려드립니다."
+        f"이후 등록되는 새 공지부터 대상 조건과 필요한 행동을 분석해 알려드립니다."
     )
 
 
@@ -132,12 +173,19 @@ async def send_telegram(text: str) -> None:
 
 
 async def notify_relevant(
-    matched: list[tuple[Article, int, str]],
+    matched: list[ClassifiedNotice],
     total_new: int,
 ) -> None:
-    """관련 공지를 텔레그램으로 전송"""
-    text = build_relevant_message(matched, total_new)
-    await send_telegram(text)
+    """기존 호출부 호환용 관련 공지 전송."""
+    await notify_digest(matched)
+
+
+async def notify_urgent(matched: list[ClassifiedNotice], total_new: int) -> None:
+    await send_telegram(build_urgent_message(matched, total_new))
+
+
+async def notify_digest(matched: list[ClassifiedNotice]) -> None:
+    await send_telegram(build_digest_message(matched))
 
 
 async def notify_no_new() -> None:

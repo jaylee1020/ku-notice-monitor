@@ -2,7 +2,7 @@ name: 건국대 공지 모니터링
 
 on:
   schedule:
-    - cron: '0 1 * * *'  # 매일 오전 10시 KST (UTC+9 → UTC 01:00)
+    - cron: '0 * * * *'  # 매시간 확인: 긴급 공지는 즉시, 일반 공지는 설정 시각에 요약
   workflow_dispatch:
 
 concurrency:
@@ -32,7 +32,7 @@ jobs:
       - name: Run monitor
         id: monitor
         env:
-          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           PROFILE_JSON: ${{ secrets.PROFILE_JSON }}

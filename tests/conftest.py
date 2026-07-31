@@ -5,20 +5,20 @@ from unittest.mock import MagicMock
 
 import pytest
 
-# google.genai와 telegram 모듈이 설치되지 않았거나 로드 불가한 환경에서도
+# 외부 SDK가 설치되지 않았거나 로드 불가한 환경에서도
 # 테스트가 실행될 수 있도록 mock 처리
 for mod_name in [
-    "google",
-    "google.genai",
+    "openai",
     "telegram",
     "feedparser",
     "aiohttp",
     "certifi",
+    "dotenv",
 ]:
     if mod_name not in sys.modules:
         sys.modules[mod_name] = MagicMock()
 
-from models import Article, Attachment  # noqa: E402
+from models import Article, Attachment, ClassifiedNotice  # noqa: E402
 
 
 @pytest.fixture
@@ -48,4 +48,21 @@ def make_attachment():
     """Attachment 팩토리 픽스처."""
     def _make(filename: str = "test.pdf", url: str = "https://example.com/download.do") -> Attachment:
         return Attachment(filename=filename, url=url)
+    return _make
+
+
+@pytest.fixture
+def make_classified(make_article):
+    """새 분류 결과 팩토리."""
+    def _make(**overrides) -> ClassifiedNotice:
+        article = overrides.pop("article", make_article())
+        defaults = dict(
+            article=article,
+            delivery="digest",
+            category="other",
+            summary=article.title,
+            reason="관심 공지",
+        )
+        defaults.update(overrides)
+        return ClassifiedNotice(**defaults)
     return _make

@@ -9,13 +9,18 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 from constants import STATE_RETENTION_DAYS
-from models import Article
+from models import Article, ClassifiedNotice
 
 logger = logging.getLogger(__name__)
 
 
 def _initial_state() -> dict:
-    return {"seen_ids": {}, "last_run": None}
+    return {
+        "seen_ids": {},
+        "article_fingerprints": {},
+        "pending_digest": [],
+        "last_run": None,
+    }
 
 
 def _normalize_seen_key(key: str) -> str:
@@ -51,15 +56,30 @@ def load_state(state_path: str) -> dict:
         return _initial_state()
 
     state.setdefault("seen_ids", {})
+    state.setdefault("article_fingerprints", {})
+    state.setdefault("pending_digest", [])
     state.setdefault("last_run", None)
     if not isinstance(state["seen_ids"], dict):
         state["seen_ids"] = {}
+    if not isinstance(state["article_fingerprints"], dict):
+        state["article_fingerprints"] = {}
+    if not isinstance(state["pending_digest"], list):
+        state["pending_digest"] = []
 
     normalized_seen: dict[str, str] = {}
     for k, v in state["seen_ids"].items():
         if isinstance(v, str):
             normalized_seen[_normalize_seen_key(str(k))] = v
     state["seen_ids"] = normalized_seen
+    state["article_fingerprints"] = {
+        _normalize_seen_key(str(k)): str(v)
+        for k, v in state["article_fingerprints"].items()
+        if isinstance(v, str)
+    }
+    state["pending_digest"] = [
+        item for item in state["pending_digest"]
+        if isinstance(item, dict) and isinstance(item.get("article"), dict)
+    ]
 
     return state
 
@@ -70,6 +90,11 @@ def save_state(state: dict, state_path: str) -> None:
     state["seen_ids"] = {
         str(k): v for k, v in state["seen_ids"].items()
         if isinstance(v, str) and v > cutoff
+    }
+    state["article_fingerprints"] = {
+        str(k): str(v)
+        for k, v in state.get("article_fingerprints", {}).items()
+        if k in state["seen_ids"] and isinstance(v, str)
     }
     state["last_run"] = datetime.now().isoformat()
 
@@ -94,16 +119,61 @@ def migrate_legacy_ids(articles: list[Article], seen: dict[str, str]) -> None:
 
 
 def filter_new_articles(articles: list[Article], state: dict) -> list[Article]:
-    """이미 확인한 공지를 제외하고 새 공지만 반환"""
+    """신규 또는 내용이 바뀐 공지를 반환하고 피드 중복을 제거한다."""
     seen = state.get("seen_ids", {})
+    fingerprints = state.setdefault("article_fingerprints", {})
 
     migrate_legacy_ids(articles, seen)
 
-    return [a for a in articles if a.key not in seen]
+    result_by_key: dict[str, Article] = {}
+    for article in articles:
+        if article.key not in seen:
+            result_by_key[article.key] = article
+            continue
+        previous = fingerprints.get(article.key)
+        if previous and previous != article.fingerprint:
+            article.is_update = True
+            result_by_key[article.key] = article
+    return list(result_by_key.values())
 
 
-def mark_as_seen(articles: list[Article], state: dict) -> None:
+def mark_as_seen(
+    articles: list[Article],
+    state: dict,
+    fingerprints: dict[str, str] | None = None,
+) -> None:
     """공지 ID를 state에 기록"""
     now = datetime.now().isoformat()
+    stored_fingerprints = state.setdefault("article_fingerprints", {})
     for a in articles:
         state["seen_ids"][a.key] = now
+        stored_fingerprints[a.key] = (
+            fingerprints.get(a.key, a.fingerprint) if fingerprints else a.fingerprint
+        )
+
+
+def enqueue_digest(matches: list[ClassifiedNotice], state: dict) -> None:
+    """일반 공지를 다음 일일 요약까지 중복 없이 보관한다."""
+    pending: dict[str, dict] = {}
+    for item in state.setdefault("pending_digest", []):
+        try:
+            pending[str(item["article"]["board_id"]) + ":" + str(item["article"]["id"])] = item
+        except (KeyError, TypeError):
+            continue
+    for match in matches:
+        pending[match.article.key] = match.to_dict()
+    state["pending_digest"] = list(pending.values())[-200:]
+
+
+def get_pending_digest(state: dict) -> list[ClassifiedNotice]:
+    results: list[ClassifiedNotice] = []
+    for item in state.get("pending_digest", []):
+        try:
+            results.append(ClassifiedNotice.from_dict(item))
+        except (KeyError, TypeError, ValueError):
+            logger.warning("손상된 요약 대기 항목을 건너뜁니다.")
+    return results
+
+
+def clear_pending_digest(state: dict) -> None:
+    state["pending_digest"] = []

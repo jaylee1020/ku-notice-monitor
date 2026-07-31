@@ -1,443 +1,347 @@
-"""matcher.py 단위 테스트"""
+"""축 분리형 공지 분류와 전달 정책 테스트."""
 
 import asyncio
+from datetime import date
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import pytest
+from pydantic import ValidationError
 
-from matcher import (
-    _extension_of,
-    _guess_attachment_mime_type,
-    _guess_mime_type,
-    _is_retryable_gemini_error,
-    _parse_gemini_json,
-    analyze_with_gemini,
-    build_profile_text,
-    build_prompt,
-    keyword_fallback,
-    match_articles,
-)
+import openai_classifier
+from analysis_models import NoticeAssessment, NoticeDate
+from classification import Delivery, classify_assessment, decide_delivery
+from matcher import keyword_fallback, match_articles
 from models import Attachment
+from openai_classifier import (
+    MediaPayload,
+    _build_input_content,
+    _classify_one,
+    _extension_of,
+    _guess_mime_type,
+    _is_retryable_openai_error,
+)
+from prompts import build_profile_text, build_prompt
 
-# --- build_profile_text ---
 
-
-def test_build_profile_text_full():
-    config = {
-        "profile": {"major": "컴퓨터공학부", "year": 2, "campus": "서울", "status": "재학"},
-        "keywords": {"high": ["장학"], "medium": ["취업"]},
+def _config(**ai_overrides):
+    ai = {
+        "model": "gpt-5.6-luna",
+        "reasoning_effort": "low",
+        "max_concurrency": 4,
+        "image_detail": "low",
+        "file_detail": "low",
     }
-    text = build_profile_text(config)
+    ai.update(ai_overrides)
+    return {
+        "ai": ai,
+        "classification": {"action_window_days": 21},
+        "profile": {
+            "major": "컴퓨터공학부",
+            "previous_major": "KU자유전공학부",
+            "year": 2,
+        },
+        "keywords": {"high": ["장학", "수강신청"], "medium": ["인턴"]},
+        "settings": {"ssl_verify": True},
+    }
+
+
+def _assessment(**overrides) -> NoticeAssessment:
+    data = {
+        "category": "other",
+        "summary": "공지 요약",
+        "audience_fit": "eligible",
+        "audience_reason": "전체 재학생 대상",
+        "interest_fit": "low",
+        "interest_reason": "관심사 불일치",
+        "obligation": "none",
+        "consequence": "none",
+        "dates": [],
+        "actions": [],
+        "benefits": [],
+        "evidence": ["전체 재학생"],
+        "uncertainties": [],
+        "attachment_need": "not_needed",
+    }
+    data.update(overrides)
+    return NoticeAssessment.model_validate(data)
+
+
+def test_build_profile_text_contains_profile_and_keywords():
+    text = build_profile_text(_config())
     assert "컴퓨터공학부" in text
+    assert "KU자유전공학부" in text
     assert "장학" in text
 
 
-def test_build_profile_text_empty():
-    config = {"profile": {}, "keywords": {}}
-    text = build_profile_text(config)
-    assert "프로필 미설정" in text
+def test_build_prompt_is_single_notice_and_marks_attachment_pass(make_article):
+    article = make_article(
+        title="수강신청 변경 안내",
+        description="8월 10일까지 신청",
+        is_update=True,
+        attachments=[Attachment("안내.pdf", "https://example.com/a.pdf")],
+    )
+    prompt = build_prompt(article, "테스트 프로필", attachments_included=True)
+    assert "수강신청 변경 안내" in prompt
+    assert "기존 공지 수정본" in prompt
+    assert "안내.pdf" in prompt
+    assert "직접 확인" in prompt
 
 
-# --- build_prompt ---
+def test_notice_assessment_keeps_axes_separate():
+    value = _assessment(
+        category="scholarship",
+        audience_fit="possibly_eligible",
+        interest_fit="high",
+        obligation="optional",
+        consequence="missed_opportunity",
+    )
+    assert value.audience_fit.value == "possibly_eligible"
+    assert value.interest_fit.value == "high"
 
 
-def test_build_prompt_contains_articles(make_article):
-    articles = [make_article(title="장학금 공지", board_name="장학공지")]
-    prompt = build_prompt(articles, "테스트 프로필")
-    assert "장학금 공지" in prompt
-    assert "장학공지" in prompt
-    assert "테스트 프로필" in prompt
-    assert "JSON" in prompt
+def test_notice_date_rejects_impossible_date():
+    with pytest.raises(ValidationError):
+        NoticeDate(kind="application_deadline", date="2026-02-30", label="마감")
 
 
-def test_build_prompt_with_images(make_article):
-    articles = [make_article(title="포스터 공지", images=["https://example.com/img.jpg"])]
-    prompt = build_prompt(articles, "테스트 프로필")
-    assert "이미지 1장" in prompt
-    assert "첨부된 파일의 내용도 함께 분석" in prompt
+def test_policy_immediate_for_eligible_high_impact():
+    delivery, reason = decide_delivery(
+        _assessment(consequence="academic_risk"),
+        today=date(2026, 8, 1),
+    )
+    assert delivery == Delivery.IMMEDIATE
+    assert "손실" in reason
 
 
-def test_build_prompt_without_media(make_article):
-    articles = [make_article(title="텍스트 공지")]
-    prompt = build_prompt(articles, "테스트 프로필")
-    assert "이미지" not in prompt
-    assert "첨부파일" not in prompt
+def test_policy_review_for_unknown_high_impact():
+    delivery, _ = decide_delivery(
+        _assessment(audience_fit="unknown", consequence="financial_loss"),
+        today=date(2026, 8, 1),
+    )
+    assert delivery == Delivery.REVIEW
 
 
-def test_build_prompt_with_attachments(make_article):
-    att = Attachment(filename="장학금안내.hwp", url="https://example.com/download.do")
-    articles = [make_article(title="장학금 공지", attachments=[att])]
-    prompt = build_prompt(articles, "테스트 프로필")
-    assert "장학금안내.hwp" in prompt
-    assert "첨부된 파일의 내용도 함께 분석" in prompt
+def test_policy_suppresses_explicitly_ineligible_notice():
+    delivery, _ = decide_delivery(
+        _assessment(audience_fit="ineligible", interest_fit="high"),
+        today=date(2026, 8, 1),
+    )
+    assert delivery == Delivery.SUPPRESS
 
 
-def test_build_prompt_with_images_and_attachments(make_article):
-    att = Attachment(filename="양식.pdf", url="https://example.com/download.do")
-    articles = [make_article(
-        title="공지",
-        images=["https://example.com/img.jpg"],
-        attachments=[att],
-    )]
-    prompt = build_prompt(articles, "테스트 프로필")
-    assert "이미지 1장" in prompt
-    assert "양식.pdf" in prompt
+def test_policy_digest_for_interest_without_obligation():
+    delivery, _ = decide_delivery(
+        _assessment(interest_fit="medium"),
+        today=date(2026, 8, 1),
+    )
+    assert delivery == Delivery.DIGEST
 
 
-# --- _guess_mime_type ---
+def test_policy_uses_deadline_window_not_relevance_score():
+    assessment = _assessment(
+        obligation="required",
+        dates=[
+            {
+                "kind": "application_deadline",
+                "date": "2026-08-10",
+                "label": "신청 마감",
+            }
+        ],
+    )
+    delivery, _ = decide_delivery(
+        assessment,
+        today=date(2026, 8, 1),
+        action_window_days=21,
+    )
+    assert delivery == Delivery.IMMEDIATE
 
 
-@pytest.mark.parametrize("url,expected", [
-    ("https://example.com/photo.jpg", "image/jpeg"),
-    ("https://example.com/photo.png", "image/png"),
-    ("https://example.com/image", "image/jpeg"),
-    ("https://example.com/photo.png?w=100", "image/png"),
-])
-def test_guess_mime_type(url, expected):
-    assert _guess_mime_type(url) == expected
+def test_classify_assessment_builds_domain_result(make_article):
+    result = classify_assessment(
+        make_article(title="장학금"),
+        _assessment(
+            category="scholarship",
+            interest_fit="high",
+            consequence="missed_opportunity",
+        ),
+        source="openai",
+        today=date(2026, 8, 1),
+    )
+    assert result.delivery == "digest"
+    assert result.category == "scholarship"
+    assert result.score == 3
 
 
-# --- _parse_gemini_json ---
+def test_keyword_fallback_is_conservative(make_article):
+    result = keyword_fallback(
+        make_article(
+            title="수강신청 마감 안내",
+            description="2026-08-10까지 신청",
+        ),
+        _config(),
+    )
+    assert result.consequence.value == "academic_risk"
+    assert result.audience_fit.value == "unknown"
+    assert result.uncertainties
 
 
-def test_parse_gemini_json_clean():
-    text = '[{"index": 1, "score": 5, "reason": "test"}]'
-    result = _parse_gemini_json(text)
-    assert len(result) == 1
-    assert result[0]["score"] == 5
+def test_match_articles_openai_success(make_article):
+    article = make_article(title="인턴 모집")
+    raw = _assessment(
+        category="career",
+        interest_fit="medium",
+        consequence="missed_opportunity",
+    ).model_dump(mode="json")
+    with patch(
+        "matcher.analyze_with_openai",
+        new_callable=AsyncMock,
+        return_value={article.key: raw},
+    ):
+        matched, method = asyncio.run(match_articles([article], _config()))
+    assert method == "openai"
+    assert matched[0].delivery == "digest"
 
 
-def test_parse_gemini_json_with_code_fence():
-    text = '```json\n[{"index": 1, "score": 3, "reason": "test"}]\n```'
-    result = _parse_gemini_json(text)
-    assert len(result) == 1
-
-
-def test_parse_gemini_json_not_array():
-    with pytest.raises(ValueError, match="JSON 배열"):
-        _parse_gemini_json('{"index": 1}')
-
-
-def test_parse_gemini_json_missing_fields():
-    with pytest.raises(ValueError, match="필수 필드"):
-        _parse_gemini_json('[{"index": 1}]')
-
-
-def test_parse_gemini_json_invalid_json():
-    with pytest.raises(Exception):
-        _parse_gemini_json("not json at all")
-
-
-def test_parse_gemini_json_none_raises():
-    with pytest.raises(ValueError, match="비어 있습니다"):
-        _parse_gemini_json(None)
-
-
-def test_parse_gemini_json_oneline_code_fence():
-    text = '```[{"index": 1, "score": 4, "reason": "test"}]```'
-    result = _parse_gemini_json(text)
-    assert len(result) == 1
-    assert result[0]["score"] == 4
-
-
-# --- keyword_fallback ---
-
-
-def test_keyword_fallback_high_match(make_article):
-    articles = [make_article(title="장학금 신청 안내")]
-    config = {"keywords": {"high": ["장학"], "medium": []}}
-    results = keyword_fallback(articles, config)
-    assert results[0]["score"] == 4
-    assert "장학" in results[0]["reason"]
-
-
-def test_keyword_fallback_medium_match(make_article):
-    articles = [make_article(title="취업 박람회")]
-    config = {"keywords": {"high": ["장학"], "medium": ["취업"]}}
-    results = keyword_fallback(articles, config)
-    assert results[0]["score"] == 3
-
-
-def test_keyword_fallback_no_match(make_article):
-    articles = [make_article(title="기숙사 청소 안내")]
-    config = {"keywords": {"high": ["장학"], "medium": ["취업"]}}
-    results = keyword_fallback(articles, config)
-    assert results[0]["score"] == 1
-
-
-def test_keyword_fallback_matches_attachment_filename(make_article):
-    att = Attachment(filename="장학금신청양식.hwp", url="https://example.com/download.do")
-    articles = [make_article(title="서류 제출 안내", attachments=[att])]
-    config = {"keywords": {"high": ["장학"], "medium": []}}
-    results = keyword_fallback(articles, config)
-    assert results[0]["score"] == 4
-    assert "장학" in results[0]["reason"]
-
-
-# --- _guess_attachment_mime_type ---
-
-
-@pytest.mark.parametrize("filename,expected", [
-    # 이미지
-    ("file.pdf", "application/pdf"),
-    ("file.jpg", "image/jpeg"),
-    ("file.jpeg", "image/jpeg"),
-    ("file.png", "image/png"),
-    ("file.webp", "image/webp"),
-    ("file.heic", "image/heic"),
-    # 비디오
-    ("clip.mp4", "video/mp4"),
-    ("clip.mov", "video/mov"),
-    ("clip.webm", "video/webm"),
-    # 오디오
-    ("sound.mp3", "audio/mp3"),
-    ("sound.wav", "audio/wav"),
-    ("sound.ogg", "audio/ogg"),
-    ("sound.m4a", "audio/mp4"),
-    # 텍스트
-    ("readme.txt", "text/plain"),
-    ("doc.md", "text/md"),
-    ("data.csv", "text/csv"),
-    ("page.html", "text/html"),
-    ("data.json", "application/json"),
-])
-def test_guess_attachment_mime_type_gemini_native(filename, expected):
-    """Gemini inline 지원 포맷은 환경에 관계없이 고정 매핑을 사용한다."""
-    assert _guess_attachment_mime_type(filename) == expected
-
-
-def test_guess_attachment_mime_type_unknown_extension():
-    # .hwp 등 Gemini 미지원 확장자는 시스템 mimetypes DB에 따라 달라짐.
-    # 핵심은 빈 문자열이 아닌 유효한 MIME 문자열을 반환하는 것.
-    result = _guess_attachment_mime_type("file.hwp")
-    assert isinstance(result, str) and "/" in result and result
-
-
-def test_guess_mime_type_handles_query_string():
-    """URL 쿼리스트링이 있어도 확장자를 올바르게 감지"""
-    assert _guess_mime_type("https://example.com/photo.webp?v=123") == "image/webp"
-    assert _guess_mime_type("https://example.com/photo.png#frag") == "image/png"
-
-
-@pytest.mark.parametrize("name,expected", [
-    ("photo.JPG", ".jpg"),
-    ("doc.PDF?v=1", ".pdf"),
-    ("file.tar.gz", ".gz"),
-    ("no-extension", ""),
-    ("https://example.com/path/file.webm#t=10", ".webm"),
-])
-def test_extension_of(name, expected):
-    assert _extension_of(name) == expected
-
-
-# --- match_articles ---
-
-
-def test_match_articles_gemini_success(make_article):
-    articles = [make_article(title="장학금"), make_article(id="2", title="기숙사")]
-    config = {"gemini": {"model": "test", "relevance_threshold": 3}, "profile": {}, "keywords": {}}
-    mock_results = [
-        {"index": 1, "score": 5, "reason": "장학 관련"},
-        {"index": 2, "score": 1, "reason": "무관"},
-    ]
-    with patch("matcher.analyze_with_gemini", new_callable=AsyncMock, return_value=mock_results):
-        matched, method = asyncio.get_event_loop().run_until_complete(match_articles(articles, config))
-    assert len(matched) == 1
-    assert matched[0][1] == 5
-    assert method == "gemini"
-
-
-def test_match_articles_gemini_fail_falls_back(make_article):
-    articles = [make_article(title="장학금 안내")]
-    config = {
-        "gemini": {"model": "test", "relevance_threshold": 3},
-        "profile": {},
-        "keywords": {"high": ["장학"], "medium": []},
-    }
-    with patch("matcher.analyze_with_gemini", new_callable=AsyncMock, return_value=[]):
-        matched, method = asyncio.get_event_loop().run_until_complete(match_articles(articles, config))
-    assert method == "keyword"
-    assert len(matched) == 1
-
-
-def test_match_articles_ties_break_by_newest_date(make_article):
-    """동점일 때 발행일시가 최신인 공지가 먼저 오도록 정렬된다."""
-    older = make_article(id="1", title="오래된 장학", pub_date="2026-01-01 09:00:00")
-    newer = make_article(id="2", title="최신 장학", pub_date="2026-05-01 09:00:00")
-    config = {"gemini": {"model": "test", "relevance_threshold": 3}, "profile": {}, "keywords": {}}
-    mock_results = [
-        {"index": 1, "score": 5, "reason": "동점"},
-        {"index": 2, "score": 5, "reason": "동점"},
-    ]
-    with patch("matcher.analyze_with_gemini", new_callable=AsyncMock, return_value=mock_results):
-        matched, _ = asyncio.get_event_loop().run_until_complete(match_articles([older, newer], config))
-    assert [a.id for a, _, _ in matched] == ["2", "1"]
+def test_match_articles_partially_falls_back(make_article):
+    openai_article = make_article(id="1", title="인턴 모집")
+    failed_article = make_article(id="2", title="수강신청 안내")
+    raw = _assessment(
+        category="career",
+        interest_fit="medium",
+        consequence="missed_opportunity",
+    ).model_dump(mode="json")
+    with patch(
+        "matcher.analyze_with_openai",
+        new_callable=AsyncMock,
+        return_value={openai_article.key: raw},
+    ):
+        matched, method = asyncio.run(
+            match_articles([openai_article, failed_article], _config())
+        )
+    assert method == "openai+rules"
+    assert any(item.source == "rules" for item in matched)
 
 
 def test_match_articles_empty():
-    matched, method = asyncio.get_event_loop().run_until_complete(
-        match_articles([], {"gemini": {"relevance_threshold": 3}})
-    )
+    matched, method = asyncio.run(match_articles([], _config()))
     assert matched == []
     assert method == "none"
 
 
-def test_match_articles_gemini_string_score_and_invalid_entries(make_article):
-    articles = [make_article(title="장학금")]
-    config = {"gemini": {"model": "test", "relevance_threshold": 3}, "profile": {}, "keywords": {}}
-    mock_results = [
-        {"index": "1", "score": "5", "reason": "문자열 점수"},
-        {"index": "x", "score": 5, "reason": "잘못된 index"},
-        {"index": 1, "score": "bad", "reason": "잘못된 score"},
+@pytest.mark.parametrize(
+    "name,expected",
+    [
+        ("file.PDF?download=1", ".pdf"),
+        ("image.JPG#x", ".jpg"),
+        ("no-extension", ""),
+    ],
+)
+def test_extension_of(name, expected):
+    assert _extension_of(name) == expected
+
+
+def test_guess_mime_type_uses_stable_mapping():
+    assert _guess_mime_type("notice.pdf") == "application/pdf"
+    assert _guess_mime_type("photo.JPG", image=True) == "image/jpeg"
+
+
+def test_build_input_content_uses_low_detail():
+    media = [
+        MediaPayload("photo.jpg", "image/jpeg", b"image", "image"),
+        MediaPayload("guide.pdf", "application/pdf", b"pdf", "file"),
     ]
-    with patch("matcher.analyze_with_gemini", new_callable=AsyncMock, return_value=mock_results):
-        matched, method = asyncio.get_event_loop().run_until_complete(match_articles(articles, config))
-
-    assert method == "gemini"
-    assert len(matched) == 1
-    assert matched[0][1] == 5
-
-
-# --- _is_retryable_gemini_error ---
+    content = _build_input_content("prompt", media, _config())
+    image = next(item for item in content if item["type"] == "input_image")
+    file_item = next(item for item in content if item["type"] == "input_file")
+    assert image["detail"] == "low"
+    assert image["image_url"].startswith("data:image/jpeg;base64,")
+    assert file_item["detail"] == "low"
+    assert file_item["file_data"].startswith("data:application/pdf;base64,")
 
 
-def test_is_retryable_gemini_error_network():
-    assert _is_retryable_gemini_error(asyncio.TimeoutError()) is True
-    assert _is_retryable_gemini_error(ConnectionError()) is True
-    assert _is_retryable_gemini_error(TimeoutError()) is True
+class _StatusError(Exception):
+    def __init__(self, status_code):
+        self.status_code = status_code
 
 
-def test_is_retryable_gemini_error_value_errors():
-    # JSON/스키마 오류는 재시도하지 않음
-    assert _is_retryable_gemini_error(ValueError("bad json")) is False
-    assert _is_retryable_gemini_error(KeyError("missing")) is False
-    assert _is_retryable_gemini_error(TypeError("bad")) is False
+def test_retryable_openai_error():
+    assert _is_retryable_openai_error(_StatusError(429)) is True
+    assert _is_retryable_openai_error(_StatusError(503)) is True
+    assert _is_retryable_openai_error(_StatusError(401)) is False
+    assert _is_retryable_openai_error(ValueError("bad schema")) is False
 
 
-def test_is_retryable_gemini_error_unknown_exception_not_retried():
-    # 분류되지 않은 예외는 무한 재시도 방지를 위해 기본 False
-    assert _is_retryable_gemini_error(RuntimeError("unknown")) is False
+def test_call_openai_api_returns_parsed_schema():
+    parsed = _assessment(interest_fit="medium")
+    response = SimpleNamespace(
+        output_parsed=parsed,
+        usage=SimpleNamespace(input_tokens=10, output_tokens=5, total_tokens=15),
+    )
+    client = SimpleNamespace(
+        responses=SimpleNamespace(parse=AsyncMock(return_value=response))
+    )
+    result = asyncio.run(
+        openai_classifier._call_openai_api(
+            client,
+            model_name="gpt-5.6-luna",
+            reasoning_effort="low",
+            content=[{"type": "input_text", "text": "test"}],
+        )
+    )
+    assert result.interest_fit.value == "medium"
+    kwargs = client.responses.parse.await_args.kwargs
+    assert kwargs["model"] == "gpt-5.6-luna"
+    assert kwargs["text_format"] is NoticeAssessment
+    assert kwargs["store"] is False
 
 
-# --- analyze_with_gemini 배치 index 오프셋 회귀 테스트 ---
+def test_classify_one_only_loads_attachments_when_required(make_article):
+    article = make_article(
+        attachments=[Attachment("guide.pdf", "https://example.com/guide.pdf")]
+    )
+    first = _assessment(attachment_need="required")
+    second = _assessment(attachment_need="not_needed", evidence=["첨부 확인"])
+    with patch(
+        "openai_classifier._analyze_article",
+        new_callable=AsyncMock,
+        side_effect=[first, second],
+    ) as analyze:
+        result = asyncio.run(
+            _classify_one(
+                object(),
+                article,
+                _config(),
+                asyncio.Semaphore(1),
+            )
+        )
+    assert result is not None
+    assert analyze.await_count == 2
+    assert analyze.await_args_list[0].kwargs["include_media"] is False
+    assert analyze.await_args_list[1].kwargs["include_media"] is True
 
 
-def test_analyze_with_gemini_multi_batch_index_offset(make_article, monkeypatch):
-    """2개 이상의 배치로 나뉠 때 전역 index가 올바르게 계산되는지 검증 (_extract_matched와 함께 동작)."""
-    from matcher import GEMINI_BATCH_SIZE, _extract_matched
-
-    # 25개 기사 → 3개 배치 (10/10/5)
-    articles = [make_article(id=str(i), title=f"공지 {i}") for i in range(25)]
-    # 각 배치별로 1번째 항목에 score=5, 나머지는 1을 부여
-    call_log: list[int] = []
-
-    async def fake_analyze_batch(client, model_name, batch, config):
-        call_log.append(len(batch))
-        return [
-            {"index": i + 1, "score": 5 if i == 0 else 1, "reason": "test"}
-            for i in range(len(batch))
-        ]
-
-    monkeypatch.setenv("GEMINI_API_KEY", "dummy")
-    import matcher
-    monkeypatch.setattr(matcher, "_analyze_batch", fake_analyze_batch)
-    # genai.Client는 MagicMock이므로 그대로 둠
-
-    config = {"gemini": {"model": "test", "relevance_threshold": 5}, "profile": {}, "keywords": {}}
-    results = asyncio.get_event_loop().run_until_complete(analyze_with_gemini(articles, config))
-
-    # 3개 배치가 호출되었는지 확인
-    assert call_log == [GEMINI_BATCH_SIZE, GEMINI_BATCH_SIZE, 5]
-
-    # threshold 5 이상인 항목만 추출 → 각 배치 첫 항목 (전역 index 1, 11, 21)
-    matched, valid = _extract_matched(results, articles, threshold=5)
-    matched_ids = sorted(a.id for a, _, _ in matched)
-    assert matched_ids == ["0", "10", "20"], f"배치 오프셋 계산 오류: {matched_ids}"
-    assert valid == 25
+def test_analyze_with_openai_without_key(make_article, monkeypatch):
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    result = asyncio.run(
+        openai_classifier.analyze_with_openai([make_article()], _config())
+    )
+    assert result == {}
 
 
-def test_analyze_with_gemini_partial_batch_failure_uses_keyword_for_failed_batch(make_article, monkeypatch):
-    """일부 배치만 실패하면 성공 배치는 유지하고, 실패 배치만 키워드 매칭으로 대체한다."""
-    from matcher import _extract_matched
+def test_analyze_with_openai_returns_results_by_article_key(
+    make_article,
+    monkeypatch,
+):
+    monkeypatch.setenv("OPENAI_API_KEY", "dummy")
+    articles = [make_article(id="1"), make_article(id="2")]
 
-    # 15개 → 2개 배치 (10/5). 두 번째 배치만 실패시킨다.
-    articles = [make_article(id=str(i), title=f"장학 공지 {i}") for i in range(15)]
+    async def fake_classify(client, article, config, semaphore):
+        return article.key, _assessment().model_dump(mode="json")
 
-    async def fake_analyze_batch(client, model_name, batch, config):
-        if len(batch) == 5:  # 두 번째 배치
-            raise RuntimeError("Gemini 호출 실패")
-        return [{"index": i + 1, "score": 5, "reason": "gemini"} for i in range(len(batch))]
-
-    monkeypatch.setenv("GEMINI_API_KEY", "dummy")
-    import matcher
-    monkeypatch.setattr(matcher, "_analyze_batch", fake_analyze_batch)
-
-    config = {
-        "gemini": {"model": "test", "relevance_threshold": 3},
-        "profile": {},
-        "keywords": {"high": ["장학"], "medium": []},
-    }
-    results = asyncio.get_event_loop().run_until_complete(analyze_with_gemini(articles, config))
-
-    # 15개 모두 점수가 매겨져야 한다 (성공 배치 10 + 키워드 폴백 5)
-    matched, valid = _extract_matched(results, articles, threshold=3)
-    assert valid == 15
-    matched_ids = sorted((int(a.id) for a, _, _ in matched))
-    assert matched_ids == list(range(15)), f"누락된 공지가 있음: {matched_ids}"
-
-
-def test_analyze_with_gemini_drops_out_of_batch_indices(make_article, monkeypatch):
-    """배치 크기를 벗어난 환각 index는 다른 배치의 공지로 매핑되지 않도록 버려져야 한다."""
-    from matcher import _extract_matched
-
-    # 15개 → 2개 배치 (10/5). 첫 배치가 index 11(범위 밖)을 환각으로 반환.
-    articles = [make_article(id=str(i), title=f"공지 {i}") for i in range(15)]
-
-    async def fake_analyze_batch(client, model_name, batch, config):
-        results = [{"index": i + 1, "score": 1, "reason": "test"} for i in range(len(batch))]
-        if len(batch) == 10:  # 첫 번째 배치에 범위 밖 index 추가
-            results.append({"index": 11, "score": 5, "reason": "환각"})
-        return results
-
-    monkeypatch.setenv("GEMINI_API_KEY", "dummy")
-    import matcher
-    monkeypatch.setattr(matcher, "_analyze_batch", fake_analyze_batch)
-
-    config = {"gemini": {"model": "test", "relevance_threshold": 5}, "profile": {}, "keywords": {}}
-    results = asyncio.get_event_loop().run_until_complete(analyze_with_gemini(articles, config))
-
-    # 환각 index(11)가 두 번째 배치의 첫 공지(전역 index 11)로 새지 않아야 한다
-    matched, valid = _extract_matched(results, articles, threshold=5)
-    assert matched == [], f"환각 index가 다른 배치 공지로 매핑됨: {[a.id for a, _, _ in matched]}"
-    assert valid == 15
-
-
-def test_analyze_with_gemini_all_batches_fail_returns_empty(make_article, monkeypatch):
-    """모든 배치가 실패하면 빈 리스트를 반환해 호출부의 전체 키워드 폴백으로 넘긴다."""
-    articles = [make_article(id=str(i), title=f"공지 {i}") for i in range(3)]
-
-    async def always_fail(client, model_name, batch, config):
-        raise RuntimeError("실패")
-
-    monkeypatch.setenv("GEMINI_API_KEY", "dummy")
-    import matcher
-    monkeypatch.setattr(matcher, "_analyze_batch", always_fail)
-
-    config = {"gemini": {"model": "test", "relevance_threshold": 3}, "profile": {}, "keywords": {}}
-    results = asyncio.get_event_loop().run_until_complete(analyze_with_gemini(articles, config))
-    assert results == []
-
-
-def test_match_articles_gemini_invalid_results_fallback_to_keyword(make_article):
-    articles = [make_article(title="장학금 안내")]
-    config = {
-        "gemini": {"model": "test", "relevance_threshold": 3},
-        "profile": {},
-        "keywords": {"high": ["장학"], "medium": []},
-    }
-    mock_results = [{"index": "x", "score": "bad", "reason": "형식 오류"}]
-    with patch("matcher.analyze_with_gemini", new_callable=AsyncMock, return_value=mock_results):
-        matched, method = asyncio.get_event_loop().run_until_complete(match_articles(articles, config))
-
-    assert method == "keyword"
-    assert len(matched) == 1
+    monkeypatch.setattr(openai_classifier, "_classify_one", fake_classify)
+    monkeypatch.setattr(openai_classifier, "AsyncOpenAI", lambda **kwargs: object())
+    results = asyncio.run(
+        openai_classifier.analyze_with_openai(articles, _config())
+    )
+    assert set(results) == {article.key for article in articles}

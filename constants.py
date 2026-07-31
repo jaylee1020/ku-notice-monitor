@@ -9,7 +9,7 @@ MAX_ARTICLE_BODY_LENGTH = 4000
 MAX_IMAGES_PER_ARTICLE = 6
 IMAGE_DOWNLOAD_TIMEOUT = 15
 
-# 프롬프트에 포함할 설명 텍스트 절삭 길이 (Gemini에 전달)
+# 프롬프트에 포함할 설명 텍스트 절삭 길이
 PROMPT_DESCRIPTION_MAX_LENGTH = 2000
 
 # 이미지 필터 (트래킹 픽셀/아이콘 배제)
@@ -17,58 +17,40 @@ MIN_IMAGE_URL_LENGTH = 10
 
 # 첨부파일
 ATTACHMENT_DOWNLOAD_TIMEOUT = 45
-MAX_ATTACHMENT_SIZE = 20 * 1024 * 1024  # 20MB (Gemini inline 한도)
+MAX_ATTACHMENT_SIZE = 20 * 1024 * 1024
+MAX_TOTAL_MEDIA_SIZE = 45 * 1024 * 1024
 
-# Gemini가 inline 바이너리로 직접 처리할 수 있는 파일 확장자
-# 참고: https://ai.google.dev/gemini-api/docs/file-prompting-strategies
-GEMINI_IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".heic", ".heif"}
-GEMINI_VIDEO_EXTENSIONS = {".mp4", ".mpeg", ".mov", ".avi", ".flv", ".mpg", ".webm", ".wmv", ".3gp", ".3gpp"}
-GEMINI_AUDIO_EXTENSIONS = {".wav", ".mp3", ".aiff", ".aac", ".ogg", ".flac", ".m4a"}
-GEMINI_DOCUMENT_EXTENSIONS = {".pdf"}
-GEMINI_TEXT_EXTENSIONS = {".txt", ".md", ".csv", ".html", ".htm", ".xml", ".rtf", ".json"}
-GEMINI_NATIVE_EXTENSIONS = (
-    GEMINI_IMAGE_EXTENSIONS
-    | GEMINI_VIDEO_EXTENSIONS
-    | GEMINI_AUDIO_EXTENSIONS
-    | GEMINI_DOCUMENT_EXTENSIONS
-    | GEMINI_TEXT_EXTENSIONS
-)
+# Responses API에 직접 전달하는 미디어 형식.
+OPENAI_IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".gif", ".webp"}
+OPENAI_FILE_EXTENSIONS = {
+    ".pdf", ".txt", ".md", ".csv", ".tsv", ".html", ".htm", ".xml", ".rtf", ".json",
+    ".doc", ".docx", ".ppt", ".pptx", ".xls", ".xlsx",
+}
+OPENAI_NATIVE_EXTENSIONS = OPENAI_IMAGE_EXTENSIONS | OPENAI_FILE_EXTENSIONS
 
 # 확장자별 기본 MIME (mimetypes DB가 환경마다 달라서 고정값 테이블 유지)
-GEMINI_EXTENSION_MIME_OVERRIDES = {
+OPENAI_EXTENSION_MIME_OVERRIDES = {
     ".pdf": "application/pdf",
     ".jpg": "image/jpeg",
     ".jpeg": "image/jpeg",
     ".png": "image/png",
     ".gif": "image/gif",
     ".webp": "image/webp",
-    ".heic": "image/heic",
-    ".heif": "image/heif",
-    ".mp4": "video/mp4",
-    ".mpeg": "video/mpeg",
-    ".mpg": "video/mpeg",
-    ".mov": "video/mov",
-    ".avi": "video/avi",
-    ".flv": "video/x-flv",
-    ".webm": "video/webm",
-    ".wmv": "video/wmv",
-    ".3gp": "video/3gpp",
-    ".3gpp": "video/3gpp",
-    ".wav": "audio/wav",
-    ".mp3": "audio/mp3",
-    ".aiff": "audio/aiff",
-    ".aac": "audio/aac",
-    ".ogg": "audio/ogg",
-    ".flac": "audio/flac",
-    ".m4a": "audio/mp4",
     ".txt": "text/plain",
-    ".md": "text/md",
+    ".md": "text/markdown",
     ".csv": "text/csv",
+    ".tsv": "text/tab-separated-values",
     ".html": "text/html",
     ".htm": "text/html",
     ".xml": "text/xml",
     ".rtf": "text/rtf",
     ".json": "application/json",
+    ".doc": "application/msword",
+    ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    ".ppt": "application/vnd.ms-powerpoint",
+    ".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+    ".xls": "application/vnd.ms-excel",
+    ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
 }
 
 # 상태 관리
@@ -85,8 +67,8 @@ MAX_CONCURRENT_ATTACHMENT_DOWNLOADS = 5
 # 수백 건이 동시에 요청되는 것을 막는다.
 MAX_CONCURRENT_BODY_FETCHES = 8
 
-# Gemini 배치 크기
-GEMINI_BATCH_SIZE = 10
+# 공지별 독립 분석 동시성. 한 공지 실패가 다른 공지 판정을 오염시키지 않게 한다.
+AI_MAX_CONCURRENCY = 4
 
 # 텔레그램
 MAX_TELEGRAM_MESSAGE_LENGTH = 4096
