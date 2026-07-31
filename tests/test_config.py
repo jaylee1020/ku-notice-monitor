@@ -5,7 +5,7 @@ from unittest.mock import patch
 
 import pytest
 
-from ku_notice_monitor.config import _load_json_env, _load_text_env, validate_config
+from ku_notice_monitor.config import AIConfig, _load_json_env, _load_text_env, validate_config
 
 # --- _load_json_env ---
 
@@ -50,7 +50,7 @@ def _make_valid_config():
         "feeds": {"테스트": {"id": 234, "enabled": True}},
         "ai": {
             "model": "gpt-5.6-luna",
-            "reasoning_effort": "low",
+            "reasoning_effort": "medium",
             "max_concurrency": 4,
             "request_timeout_seconds": 45,
             "image_detail": "low",
@@ -69,6 +69,10 @@ def _make_valid_config():
 
 def test_validate_config_valid():
     validate_config(_make_valid_config())
+
+
+def test_ai_config_defaults_to_medium_reasoning():
+    assert AIConfig(model="gpt-5.6-luna").reasoning_effort == "medium"
 
 
 def test_validate_config_missing_section():

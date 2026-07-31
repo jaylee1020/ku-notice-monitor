@@ -26,7 +26,7 @@ def _config(profile_text=""):
         "keywords": {"high": ["장학"], "medium": ["인턴"]},
         "ai": {
             "model": "gpt-5.6-luna",
-            "reasoning_effort": "low",
+            "reasoning_effort": "medium",
             "request_timeout_seconds": 45,
         },
     }
@@ -115,4 +115,3 @@ def test_resolve_natural_profile_uses_structured_output(monkeypatch):
     assert snapshot.facts[0].key.value == "current_residence"
     assert metrics["source"] == "natural_language"
     assert metrics["total_tokens"] == 123
-

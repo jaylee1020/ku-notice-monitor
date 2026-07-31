@@ -58,7 +58,7 @@ class FeedConfig(SettingsModel):
 
 class AIConfig(SettingsModel):
     model: str
-    reasoning_effort: Literal["none", "low", "medium", "high", "xhigh", "max"] = "low"
+    reasoning_effort: Literal["none", "low", "medium", "high", "xhigh", "max"] = "medium"
     max_concurrency: int = Field(default=4, ge=1, le=20)
     request_timeout_seconds: int = Field(default=45, ge=5, le=120)
     image_detail: Literal["low", "high", "auto"] = "low"
@@ -163,7 +163,7 @@ def _validate_ai(ai: dict) -> None:
         raise ValueError("ai 섹션에 필수 필드 'model'이 없습니다.")
     if not isinstance(ai["model"], str) or not ai["model"].strip():
         raise ValueError("ai.model은 비어있지 않은 문자열이어야 합니다.")
-    effort = ai.get("reasoning_effort", "low")
+    effort = ai.get("reasoning_effort", "medium")
     if effort not in {"none", "low", "medium", "high", "xhigh", "max"}:
         raise ValueError(f"ai.reasoning_effort가 올바르지 않습니다: {effort!r}")
 
