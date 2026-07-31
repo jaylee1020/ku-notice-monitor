@@ -16,6 +16,7 @@ from ku_notice_monitor.notifier import (
     build_relevant_message,
     build_urgent_message,
     send_telegram,
+    send_telegram_part,
     split_message,
 )
 
@@ -56,8 +57,7 @@ def test_build_relevant_message_with_attachments(make_article, make_classified):
         )
     ]
     msg = build_relevant_message(matched, 5)
-    assert "안내문.hwp" in msg
-    assert "양식.pdf" in msg
+    assert "첨부 2개" in msg
 
 
 def test_build_urgent_message_has_deadline_and_actions(make_article, make_classified):
@@ -73,8 +73,10 @@ def test_build_urgent_message_has_deadline_and_actions(make_article, make_classi
     ]
     msg = build_urgent_message(matched, 3)
     assert "🚨" in msg
-    assert "2099-12-31" in msg
+    assert "2099년 12월 31일" in msg
     assert "수강바구니 확인" in msg
+    assert "분류:" not in msg
+    assert "이유:" not in msg
 
 
 def test_build_digest_message_marks_updated_article(make_article, make_classified):
@@ -86,7 +88,7 @@ def test_build_digest_message_marks_updated_article(make_article, make_classifie
     ]
     msg = build_digest_message(matched)
     assert "🗂" in msg
-    assert "[수정]" in msg
+    assert "수정됨" in msg
 
 
 def test_review_message_explains_uncertainty(make_article, make_classified):
@@ -99,8 +101,28 @@ def test_review_message_explains_uncertainty(make_article, make_classified):
         )
     ]
     msg = build_urgent_message(matched, 1)
-    assert "[대상 확인 필요]" in msg
+    assert "<b>대상 확인 필요</b>" in msg
     assert "학번별 적용 기준 불명확" in msg
+    assert "unknown" not in msg
+
+
+def test_message_escapes_dynamic_html_and_uses_link(
+    make_article, make_classified
+):
+    matched = [
+        make_classified(
+            article=make_article(
+                title="<필독> 등록금 & 장학",
+                link="https://example.com/?a=1&b=2",
+            ),
+            summary="A < B",
+        )
+    ]
+    msg = build_urgent_message(matched, 1)
+    assert "&lt;필독&gt; 등록금 &amp; 장학" in msg
+    assert "<i>A &lt; B</i>" in msg
+    assert 'href="https://example.com/?a=1&amp;b=2"' in msg
+    assert "https://example.com/?a=1&b=2\n" not in msg
 
 
 # --- build_no_new_message ---
@@ -171,6 +193,20 @@ def test_send_telegram_reports_complete_delivery():
     assert result.complete is True
     assert result.sent_parts == 1
     send.assert_awaited_once_with("hello")
+
+
+def test_send_telegram_part_uses_compact_html(monkeypatch):
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "token")
+    monkeypatch.setenv("TELEGRAM_CHAT_ID", "chat")
+    bot = AsyncMock()
+    with patch("ku_notice_monitor.notifier.Bot", return_value=bot):
+        asyncio.run(send_telegram_part("<b>hello</b>"))
+    bot.send_message.assert_awaited_once_with(
+        chat_id="chat",
+        text="<b>hello</b>",
+        parse_mode="HTML",
+        disable_web_page_preview=True,
+    )
 
 
 def test_send_telegram_raises_on_partial_failure():

@@ -2,8 +2,10 @@
 
 import logging
 import os
+import re
 from dataclasses import dataclass
 from datetime import date, datetime
+from html import escape
 from zoneinfo import ZoneInfo
 
 from telegram import Bot
@@ -15,6 +17,26 @@ logger = logging.getLogger(__name__)
 
 # GitHub Actions 러너는 UTC이므로, 사용자에게 보이는 날짜/시각은 KST로 표기한다.
 _KST = ZoneInfo("Asia/Seoul")
+_ITEM_SEPARATOR = "\n\n────────\n\n"
+
+_CATEGORY_LABELS = {
+    "academic": ("🎓", "학사"),
+    "tuition": ("💳", "등록금"),
+    "scholarship": ("🎁", "장학"),
+    "career": ("💼", "취업·진로"),
+    "international": ("🌏", "국제교류"),
+    "event": ("🎉", "행사"),
+    "campus_life": ("🏫", "학생생활"),
+    "administrative": ("📋", "행정"),
+    "other": ("📌", "기타"),
+}
+
+_AUDIENCE_LABELS = {
+    "eligible": ("✅", "내 조건과 일치"),
+    "possibly_eligible": ("⚠️", "일부 조건 확인"),
+    "unknown": ("⚠️", "대상 확인 필요"),
+    "ineligible": ("⛔", "대상 아님"),
+}
 
 
 class TelegramDeliveryError(RuntimeError):
@@ -39,6 +61,18 @@ def _now_kst() -> datetime:
     return datetime.now(_KST)
 
 
+def _compact(value: str, limit: int) -> str:
+    """메시지용 텍스트를 한 줄로 정리하고 지나치게 긴 내용은 줄인다."""
+    clean = re.sub(r"\s+", " ", value).strip()
+    if len(clean) <= limit:
+        return clean
+    return clean[: limit - 1].rstrip() + "…"
+
+
+def _html(value: str, limit: int) -> str:
+    return escape(_compact(value, limit), quote=True)
+
+
 def _deadline_label(deadline: str | None) -> str | None:
     if not deadline:
         return None
@@ -53,75 +87,81 @@ def _deadline_label(deadline: str | None) -> str | None:
         relative = f"D-{days}"
     else:
         relative = f"D+{abs(days)}"
-    return f"{deadline} ({relative})"
+    if deadline_date.year == _now_kst().year:
+        displayed = f"{deadline_date.month}월 {deadline_date.day}일"
+    else:
+        displayed = (
+            f"{deadline_date.year}년 {deadline_date.month}월 {deadline_date.day}일"
+        )
+    return f"{displayed} · {relative}"
 
 
 def _build_items(matched: list[ClassifiedNotice]) -> str:
-    category_labels = {
-        "academic": "학사",
-        "tuition": "등록금",
-        "scholarship": "장학",
-        "career": "취업·진로",
-        "international": "국제교류",
-        "event": "행사",
-        "campus_life": "학생생활",
-        "administrative": "행정",
-        "other": "기타",
-    }
     items: list[str] = []
-    for index, match in enumerate(matched, 1):
+    for match in matched:
         article = match.article
-        update_badge = " [수정]" if article.is_update else ""
-        review_badge = " [대상 확인 필요]" if match.delivery == "review" else ""
-        item = (
-            f"\n{index}. [{article.board_name}] "
-            f"{article.title}{update_badge}{review_badge}\n"
+        category_icon, category_label = _CATEGORY_LABELS.get(
+            match.category, ("📌", match.category)
         )
+        update_badge = " · <b>수정됨</b>" if article.is_update else ""
+        lines = [
+            (
+                f"{category_icon} <b>{_html(category_label, 30)}</b>"
+                f" · {_html(article.board_name, 50)}{update_badge}"
+            ),
+            f"<b>{_html(article.title, 180)}</b>",
+        ]
+
         if match.summary and match.summary != article.title:
-            item += f"요약: {match.summary}\n"
-        item += f"분류: {category_labels.get(match.category, match.category)}\n"
-        item += f"이유: {match.reason}\n"
-        if match.audience_fit != "eligible":
-            audience_labels = {
-                "possibly_eligible": "대상일 가능성 있음",
-                "ineligible": "대상 아님",
-                "unknown": "대상 여부 확인 필요",
-            }
-            item += f"대상 판정: {audience_labels.get(match.audience_fit, match.audience_fit)}\n"
+            lines.append(f"<i>{_html(match.summary, 220)}</i>")
+
+        audience_icon, audience_label = _AUDIENCE_LABELS.get(
+            match.audience_fit, ("⚠️", match.audience_fit)
+        )
+        lines.append(
+            f"\n{audience_icon} <b>{_html(audience_label, 40)}</b>"
+        )
+        if match.delivery == "review" and match.uncertainties:
+            lines.append(_html(match.uncertainties[0], 180))
+        elif match.reason:
+            lines.append(f"💡 {_html(match.reason, 180)}")
+
         if deadline := _deadline_label(match.deadline):
-            item += f"⏰ 마감: {deadline}\n"
+            lines.append(f"⏰ <b>마감</b>  {_html(deadline, 50)}")
         if match.actions:
-            item += "✅ 할 일: " + " · ".join(match.actions) + "\n"
+            actions = " · ".join(match.actions[:2])
+            lines.append(f"👉 <b>할 일</b>  {_html(actions, 180)}")
         if match.benefits:
-            item += "🎁 혜택: " + " · ".join(match.benefits[:2]) + "\n"
-        if match.evidence:
-            item += "🔎 근거: " + " · ".join(match.evidence[:2]) + "\n"
-        if match.uncertainties:
-            item += "⚠️ 확인 필요: " + " · ".join(match.uncertainties[:2]) + "\n"
-        item += article.link
+            benefits = " · ".join(match.benefits[:2])
+            lines.append(f"🎁 <b>혜택</b>  {_html(benefits, 180)}")
+
+        article_link = escape(article.link, quote=True)
+        lines.append(f'\n🔗 <a href="{article_link}">공지 열기 →</a>')
         if article.attachments:
-            filenames = ", ".join(att.filename for att in article.attachments)
-            item += f"\n📎 {filenames}"
-        items.append(item)
-    return "\n".join(items)
+            lines[-1] += f"  ·  📎 첨부 {len(article.attachments)}개"
+        items.append("\n".join(lines))
+    return _ITEM_SEPARATOR.join(items)
 
 
 def build_urgent_message(matched: list[ClassifiedNotice], total_new: int) -> str:
-    today = _now_kst().strftime("%Y-%m-%d %H:%M")
-    header = f"🚨 {today} 바로 확인할 공지 {len(matched)}건 (신규 {total_new}건)\n"
-    return header + _build_items(matched)
+    del total_new  # 전체 수보다 실제로 확인할 항목 수를 전면에 보여준다.
+    count = f" · {len(matched)}건" if len(matched) > 1 else ""
+    header = f"🚨 <b>지금 확인할 공지</b>{count}"
+    return header + "\n\n" + _build_items(matched)
 
 
 def build_digest_message(matched: list[ClassifiedNotice]) -> str:
-    today = _now_kst().strftime("%Y-%m-%d")
-    header = f"🗂 {today} 관심 공지 요약 {len(matched)}건\n"
-    return header + _build_items(matched)
+    header = f"🗂 <b>오늘의 관심 공지</b> · {len(matched)}건"
+    return header + "\n\n" + _build_items(matched)
 
 
 def build_relevant_message(matched: list[ClassifiedNotice], total_new: int) -> str:
     """기존 호출부 호환용: 관련 공지를 일반 요약 형태로 생성한다."""
-    today = _now_kst().strftime("%Y-%m-%d")
-    return f"{today} 새 공지 {total_new}건 중 관련 {len(matched)}건\n" + _build_items(matched)
+    return (
+        f"📬 <b>새 관심 공지</b> · {len(matched)}건"
+        f" <i>(전체 신규 {total_new}건)</i>\n\n"
+        + _build_items(matched)
+    )
 
 
 def build_no_new_message() -> str:
@@ -139,7 +179,10 @@ def build_no_relevant_message(total_new: int) -> str:
 def build_error_message(error_detail: str) -> str:
     """워크플로우 오류 알림 메시지"""
     today = _now_kst().strftime("%Y-%m-%d %H:%M")
-    return f"[오류] {today} 모니터링 실패\n{error_detail}"
+    return (
+        f"🔴 <b>모니터링 실패</b> · {today}\n"
+        f"{_html(error_detail, 1000)}"
+    )
 
 
 def build_first_run_message(seeded_count: int) -> str:
@@ -202,7 +245,12 @@ async def send_telegram_part(text: str) -> None:
         raise ValueError("텔레그램 메시지 한 조각이 길이 제한을 초과했습니다.")
     token, chat_id = _telegram_credentials()
     bot = Bot(token=token)
-    await bot.send_message(chat_id=chat_id, text=text)
+    await bot.send_message(
+        chat_id=chat_id,
+        text=text,
+        parse_mode="HTML",
+        disable_web_page_preview=True,
+    )
 
 
 async def send_telegram(text: str) -> DeliveryResult:
