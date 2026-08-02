@@ -20,6 +20,7 @@ dependencies = [
     "aiohttp>=3.9",
     "certifi>=2024.2",
     "tenacity>=8.0",
+    "pdf-inspector==0.2.6",
     "syhwp==0.0.7",
 ]
 

@@ -22,7 +22,8 @@
 - `immediate` / `digest` / `review` / `suppress` 전달 정책
 - 신청·서류·납부·행사 날짜를 종류별로 추출하고 가장 가까운 행동 마감 D-day 표시
 - 학생이 해야 할 구체적인 행동 요약
-- 이미지·PDF와 격리 변환된 HWP/HWPX 입력
+- 이미지와 첨부 분석, 격리 변환된 HWP/HWPX 입력
+- 텍스트 PDF는 `pdf-inspector`로 로컬 Markdown 변환하고 스캔·혼합 PDF는 원본 입력
 - 허용 도메인·공인 IP·리디렉션 검증과 스트리밍 다운로드 상한
 - 키워드 폴백, 부분 실패 복구, 지수 백오프
 - 본문 수정 감지, 피드별 상태 검사와 중복 제거
@@ -130,7 +131,8 @@ src/ku_notice_monitor/
   analysis_models.py   OpenAI Structured Outputs 스키마
   classification.py    전달 결정을 내리는 정책 엔진
   openai_classifier.py Responses API·선택적 첨부 분석
-  document_extract.py  HWP/HWPX 격리 변환
+  document_extract.py  HWP/HWPX·PDF 격리 변환
+  pdf_extract_worker.py  텍스트 PDF 판별·Markdown 추출 워커
   prompts.py           근거 중심 사실 추출 프롬프트
   matcher.py           AI/규칙 폴백·근거 검증·정책 조율
   feeds.py             RSS·본문·이미지·첨부 수집
