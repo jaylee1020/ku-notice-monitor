@@ -11,6 +11,7 @@ from pydantic import ValidationError
 from ku_notice_monitor import openai_classifier
 from ku_notice_monitor.analysis_models import NoticeAssessment, NoticeDate
 from ku_notice_monitor.classification import Delivery, classify_assessment, decide_delivery
+from ku_notice_monitor.document_extract import DocumentExtractionError
 from ku_notice_monitor.matcher import keyword_fallback, match_articles, validate_assessment_grounding
 from ku_notice_monitor.models import Attachment
 from ku_notice_monitor.openai_classifier import (
@@ -21,6 +22,7 @@ from ku_notice_monitor.openai_classifier import (
     _guess_mime_type,
     _is_retryable_openai_error,
     _media_items,
+    _prepare_pdf_payload,
 )
 from ku_notice_monitor.prompts import build_profile_text, build_prompt, select_relevant_excerpt
 
@@ -338,6 +340,46 @@ def test_hwp_attachments_are_selected_for_safe_conversion(make_article):
     )
     items = _media_items(article)
     assert [item[3] for item in items] == ["hwp", "hwp"]
+
+
+def test_pdf_attachments_are_selected_for_local_inspection(make_article):
+    article = make_article(
+        attachments=[Attachment("안내.pdf", "https://www.konkuk.ac.kr/guide.pdf")]
+    )
+    assert _media_items(article)[0][3] == "pdf"
+
+
+def test_prepare_pdf_payload_uses_local_markdown():
+    with patch(
+        "ku_notice_monitor.openai_classifier.extract_pdf_markdown",
+        return_value="# 지원 자격",
+    ):
+        payload = _prepare_pdf_payload("안내.pdf", b"%PDF")
+    assert payload.filename == "안내.pdf.md"
+    assert payload.mime_type == "text/markdown"
+    assert payload.data == "# 지원 자격".encode()
+
+
+def test_prepare_pdf_payload_keeps_native_pdf_for_scans():
+    with patch(
+        "ku_notice_monitor.openai_classifier.extract_pdf_markdown",
+        return_value=None,
+    ):
+        payload = _prepare_pdf_payload("스캔.pdf", b"%PDF-scan")
+    assert payload.filename == "스캔.pdf"
+    assert payload.mime_type == "application/pdf"
+    assert payload.data == b"%PDF-scan"
+
+
+def test_prepare_pdf_payload_keeps_native_pdf_when_local_parser_fails():
+    with patch(
+        "ku_notice_monitor.openai_classifier.extract_pdf_markdown",
+        side_effect=DocumentExtractionError("parser failed"),
+    ):
+        payload = _prepare_pdf_payload("손상.pdf", b"%PDF-broken")
+    assert payload.filename == "손상.pdf"
+    assert payload.mime_type == "application/pdf"
+    assert payload.data == b"%PDF-broken"
 
 
 def test_build_input_content_uses_low_detail():

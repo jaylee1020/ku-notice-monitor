@@ -31,7 +31,11 @@ from .constants import (
     OPENAI_HWP_EXTENSIONS,
     OPENAI_IMAGE_EXTENSIONS,
 )
-from .document_extract import DocumentExtractionError, extract_hwp_markdown
+from .document_extract import (
+    DocumentExtractionError,
+    extract_hwp_markdown,
+    extract_pdf_markdown,
+)
 from .models import Article
 from .net import (
     DEFAULT_HEADERS,
@@ -90,7 +94,7 @@ def _media_items(article: Article) -> list[tuple[str, str, str, str]]:
             attachment.url,
             attachment.filename,
             _guess_mime_type(attachment.filename),
-            "file",
+            "pdf" if attachment.ext == ".pdf" else "file",
         )
         for attachment in article.attachments
         if attachment.ext in OPENAI_FILE_EXTENSIONS
@@ -106,6 +110,24 @@ def _media_items(article: Article) -> list[tuple[str, str, str, str]]:
         if attachment.ext in OPENAI_HWP_EXTENSIONS
     )
     return items
+
+
+def _prepare_pdf_payload(filename: str, data: bytes) -> MediaPayload:
+    """텍스트 PDF는 Markdown으로 줄이고, 그 외에는 원본을 보존한다."""
+    try:
+        markdown = extract_pdf_markdown(data)
+    except DocumentExtractionError as exc:
+        logger.warning("%s 로컬 PDF 변환 실패, 원본 사용: %s", filename, exc)
+        markdown = None
+    if markdown is None:
+        return MediaPayload(filename, "application/pdf", data, "file")
+    logger.info("%s를 로컬 Markdown으로 변환했습니다.", filename)
+    return MediaPayload(
+        f"{filename}.md",
+        "text/markdown",
+        markdown.encode("utf-8"),
+        "file",
+    )
 
 
 async def _download_media(
@@ -156,6 +178,8 @@ async def _download_media(
                 markdown.encode("utf-8"),
                 "file",
             )
+        if kind == "pdf":
+            return await asyncio.to_thread(_prepare_pdf_payload, filename, data)
         return MediaPayload(filename, mime_type, data, kind)
 
     async with aiohttp.ClientSession(headers=DEFAULT_HEADERS) as session:
