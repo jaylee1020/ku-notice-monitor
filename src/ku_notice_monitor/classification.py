@@ -146,6 +146,13 @@ def classify_assessment(
         action_window_days=action_window_days,
         suppress_speculative_opportunities=suppress_speculative_opportunities,
     )
+    if (
+        source == "rules"
+        and assessment.consequence == Consequence.MISSED_OPPORTUNITY
+        and delivery in {Delivery.IMMEDIATE, Delivery.REVIEW}
+    ):
+        delivery = Delivery.DIGEST
+        reason = "자동 분석된 선택적 기회는 일일 요약에서 확인"
     deadline = _nearest_deadline(assessment)
     return ClassifiedNotice(
         article=article,

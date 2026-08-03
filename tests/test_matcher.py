@@ -186,6 +186,23 @@ def test_classify_assessment_builds_domain_result(make_article):
     assert result.score == 3
 
 
+def test_rule_fallback_caps_uncertain_optional_opportunity_at_digest(make_article):
+    result = classify_assessment(
+        make_article(title="공모전 지원 안내"),
+        _assessment(
+            category="career",
+            audience_fit="unknown",
+            obligation="required",
+            consequence="missed_opportunity",
+        ),
+        source="rules",
+        today=date(2026, 8, 1),
+    )
+
+    assert result.delivery == "digest"
+    assert "일일 요약" in result.reason
+
+
 def test_keyword_fallback_is_conservative(make_article):
     result = keyword_fallback(
         make_article(
@@ -197,6 +214,110 @@ def test_keyword_fallback_is_conservative(make_article):
     assert result.consequence.value == "academic_risk"
     assert result.audience_fit.value == "unknown"
     assert result.uncertainties
+
+
+def test_keyword_fallback_does_not_turn_application_requirements_into_duty(
+    make_article,
+):
+    config = _config()
+    config["keywords"]["medium"].append("채용")
+    article = make_article(
+        title="국제대학 행정지원직 채용 공고",
+        description="지원서 필수 제출, 졸업예정자 지원 가능",
+    )
+
+    assessment = keyword_fallback(article, config)
+
+    assert assessment.category.value == "career"
+    assert assessment.obligation.value == "optional"
+    assert assessment.consequence.value == "missed_opportunity"
+    assert assessment.actions == []
+    assert "OpenAI" not in " ".join(assessment.uncertainties)
+    assert "실패" not in " ".join(assessment.uncertainties)
+
+
+def test_failed_optional_opportunity_analysis_goes_to_digest(make_article):
+    config = _config()
+    config["keywords"]["medium"].append("채용")
+    article = make_article(
+        title="국제대학 행정지원직 채용 공고",
+        description="지원서 필수 제출",
+    )
+    with patch(
+        "ku_notice_monitor.matcher.analyze_with_openai",
+        new_callable=AsyncMock,
+        return_value={},
+    ):
+        result = asyncio.run(match_articles([article], config))
+
+    assert result.notices[0].delivery == "digest"
+    assert result.notices[0].source == "rules"
+
+
+def test_failed_contest_analysis_does_not_become_required_review(make_article):
+    config = _config()
+    config["keywords"]["medium"].append("공모전")
+    article = make_article(
+        title=(
+            "(서울시) 2026 서울영커리언스 챌린지 실무형 직무혁신 "
+            "성과 팀 공모전 모집"
+        ),
+        board_name="대학일자리플러스",
+        description="졸업예정자 지원 가능, 참여 동의 필수",
+    )
+    with patch(
+        "ku_notice_monitor.matcher.analyze_with_openai",
+        new_callable=AsyncMock,
+        return_value={},
+    ):
+        result = asyncio.run(match_articles([article], config))
+
+    assert result.notices[0].category == "event"
+    assert result.notices[0].obligation == "optional"
+    assert result.notices[0].delivery == "digest"
+
+
+def test_failed_high_impact_analysis_still_requires_review(make_article):
+    article = make_article(
+        title="수강신청 필수 확인",
+        description="수강신청 내역을 반드시 확인하세요.",
+    )
+    with patch(
+        "ku_notice_monitor.matcher.analyze_with_openai",
+        new_callable=AsyncMock,
+        return_value={},
+    ):
+        result = asyncio.run(match_articles([article], _config()))
+
+    assert result.notices[0].delivery == "review"
+    assert result.notices[0].consequence == "academic_risk"
+
+
+@pytest.mark.parametrize(
+    "title,description,expected_consequence",
+    [
+        ("장학금 반환 안내", "오지급 장학금 반환 필수", "financial_loss"),
+        ("현장실습 안내", "학점등록 필수", "academic_risk"),
+        ("교환학생 안내", "학점인정 신청 필수", "academic_risk"),
+    ],
+)
+def test_failed_mixed_opportunity_keeps_direct_loss_review(
+    make_article,
+    title,
+    description,
+    expected_consequence,
+):
+    article = make_article(title=title, description=description)
+    with patch(
+        "ku_notice_monitor.matcher.analyze_with_openai",
+        new_callable=AsyncMock,
+        return_value={},
+    ):
+        result = asyncio.run(match_articles([article], _config()))
+
+    assert result.notices[0].delivery == "review"
+    assert result.notices[0].obligation == "required"
+    assert result.notices[0].consequence == expected_consequence
 
 
 def test_match_articles_openai_success(make_article):

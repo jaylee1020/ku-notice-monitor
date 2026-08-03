@@ -20,10 +20,27 @@ logger = logging.getLogger(__name__)
 
 _REQUIRED_TERMS = {"필수", "의무", "수강신청", "등록금", "휴학", "복학", "졸업"}
 _ACADEMIC_RISK_TERMS = {"수강신청", "학사경고", "졸업", "휴학", "복학", "학점"}
-_FINANCIAL_TERMS = {"등록금", "납부", "환불"}
+_DIRECT_ACADEMIC_RISK_TERMS = {
+    "수강신청",
+    "학사경고",
+    "휴학",
+    "복학",
+    "학점등록",
+    "학점인정",
+    "졸업요건",
+    "졸업사정",
+}
+_FINANCIAL_TERMS = {"등록금", "납부", "환불", "반환"}
 _SCHOLARSHIP_TERMS = {"장학", "학자금"}
 _CAREER_TERMS = {"채용", "인턴", "취업", "현장실습"}
 _INTERNATIONAL_TERMS = {"교환학생", "국제교류", "어학연수", "유학"}
+_EVENT_TERMS = {"행사", "특강", "공모전", "경진대회", "챌린지", "대외활동"}
+_OPTIONAL_OPPORTUNITY_CATEGORIES = {
+    "scholarship",
+    "career",
+    "international",
+    "event",
+}
 _DATE_PATTERN = re.compile(r"(20\d{2})[.\-/년]\s*(\d{1,2})[.\-/월]\s*(\d{1,2})일?")
 
 
@@ -67,12 +84,12 @@ def _fallback_category(text: str) -> str:
         return "career"
     if any(term in text for term in _INTERNATIONAL_TERMS):
         return "international"
+    if any(term in text for term in _EVENT_TERMS):
+        return "event"
     if any(term in text for term in _FINANCIAL_TERMS):
         return "tuition"
     if any(term in text for term in _ACADEMIC_RISK_TERMS | {"학사", "수업"}):
         return "academic"
-    if "행사" in text or "특강" in text:
-        return "event"
     return "other"
 
 
@@ -125,15 +142,24 @@ def keyword_fallback(article: Article, config: dict) -> NoticeAssessment:
             if fact.value not in profile_terms
         )
     audience_matches = _find_keywords(text, profile_terms)
-    required = any(term in text for term in _REQUIRED_TERMS)
+    category = _fallback_category(text)
+    direct_academic_risk = any(term in text for term in _DIRECT_ACADEMIC_RISK_TERMS)
+    direct_financial_risk = any(term in text for term in _FINANCIAL_TERMS)
 
     consequence = "none"
-    if any(term in text for term in _ACADEMIC_RISK_TERMS):
-        consequence = "academic_risk"
-    elif any(term in text for term in _FINANCIAL_TERMS):
+    if direct_financial_risk:
         consequence = "financial_loss"
-    elif any(term in text for term in _SCHOLARSHIP_TERMS | _CAREER_TERMS | _INTERNATIONAL_TERMS):
+    elif direct_academic_risk:
+        consequence = "academic_risk"
+    elif category in _OPTIONAL_OPPORTUNITY_CATEGORIES:
         consequence = "missed_opportunity"
+
+    # 채용·장학·교류·행사의 "필수"는 대개 지원을 선택한 사람의 제출 요건이다.
+    # 다만 등록금·학적·학점처럼 직접 손실 신호가 함께 있으면 보수적으로 유지한다.
+    required = (
+        any(term in text for term in _REQUIRED_TERMS)
+        and consequence != "missed_opportunity"
+    )
 
     matched = high or medium
     evidence = [f"키워드 일치: {item}" for item in (high + medium + audience_matches)[:5]]
@@ -157,7 +183,7 @@ def keyword_fallback(article: Article, config: dict) -> NoticeAssessment:
 
     return NoticeAssessment.model_validate(
         {
-            "category": _fallback_category(text),
+            "category": category,
             "summary": article.title,
             "audience_fit": "eligible" if audience_matches else "unknown",
             "audience_reason": (
@@ -177,7 +203,7 @@ def keyword_fallback(article: Article, config: dict) -> NoticeAssessment:
             "actions": actions,
             "benefits": [],
             "evidence": evidence,
-            "uncertainties": ["OpenAI 분석 실패로 대상 조건을 완전히 확인하지 못함"],
+            "uncertainties": ["자동 분석만으로 대상 조건을 확정하지 못함"],
             "attachment_need": "useful" if article.attachments else "not_needed",
         }
     )

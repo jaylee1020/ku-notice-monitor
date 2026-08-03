@@ -9,7 +9,7 @@ from .models import Article
 from .profile_models import ProfileSnapshot
 
 _KST = ZoneInfo("Asia/Seoul")
-PROMPT_VERSION = "2026-07-31-grounded-v3"
+PROMPT_VERSION = "2026-08-03-grounded-v4"
 
 SYSTEM_PROMPT = """당신은 한국 대학 공지에서 검증 가능한 사실을 추출하는 분석기입니다.
 출력 스키마의 각 축을 서로 독립적으로 판정하세요. 하나의 관련도 점수나 막연한 긴급도를 만들지 마세요.
@@ -33,6 +33,10 @@ SYSTEM_PROMPT = """당신은 한국 대학 공지에서 검증 가능한 사실�
 7. obligation은 학생에게 필수 행동인지, 선택적 기회인지, 행동이 없는 안내인지 나타냅니다.
 8. consequence는 놓쳤을 때 발생하는 가장 큰 직접 손실만 선택합니다.
 9. 날짜·행동·혜택은 공지에 실제로 적힌 내용만 추출하고 추측하지 않습니다.
+   dates[].date와 actions[].deadline은 정확한 연·월·일이 모두 확인될 때만
+   YYYY-MM-DD 형식으로 출력합니다. 시각은 넣지 않습니다. 일부 날짜만 있거나
+   범위·협의 등으로 불명확하면 dates 항목은 생략하고 deadline은 null로 두며
+   원래 표현이 불명확하다는 사실을 uncertainties에 기록합니다.
 10. evidence와 eligibility condition의 evidence에는 짧은 공지 원문 구절만 넣습니다.
 11. 중요한 대상·마감·행동이 첨부파일에만 있을 가능성이 높으면 attachment_need=required입니다.
 12. 불명확하거나 서로 충돌하는 내용은 uncertainties에 기록합니다."""
