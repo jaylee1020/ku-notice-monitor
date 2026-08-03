@@ -13,9 +13,10 @@ from ku_notice_monitor.main import (
     _digest_is_due,
     _flush_digest_if_due,
     _flush_pending_deliveries,
+    _queue_urgent_notifications,
     _validate_feed_health,
 )
-from ku_notice_monitor.state import enqueue_digest
+from ku_notice_monitor.state import enqueue_delivery, enqueue_digest
 
 
 def _config(hour=21):
@@ -49,6 +50,92 @@ def test_flush_digest_moves_to_outbox_and_clears(make_classified):
     assert state["pending_digest"] == []
     assert state["last_digest_enqueued_date"] == "2026-08-01"
     assert len(state["pending_deliveries"]) == 1
+
+
+def test_urgent_notices_are_queued_as_one_deduplicated_message(
+    make_article,
+    make_classified,
+):
+    first = make_article(id="1", title="수강신청 확인")
+    second = make_article(id="2", title="등록금 납부 확인")
+    urgent = [
+        make_classified(article=first, delivery="review"),
+        make_classified(article=second, delivery="immediate"),
+    ]
+    fingerprints = {
+        first.key: first.fingerprint,
+        second.key: second.fingerprint,
+    }
+    state = {"pending_deliveries": [], "delivery_history": {}}
+
+    queued = _queue_urgent_notifications(state, urgent, 6, fingerprints)
+    queued_again = _queue_urgent_notifications(state, urgent, 6, fingerprints)
+    queued_reordered = _queue_urgent_notifications(
+        state,
+        list(reversed(urgent)),
+        0,
+        fingerprints,
+    )
+
+    assert queued == 1
+    assert queued_again == 0
+    assert queued_reordered == 0
+    assert len(state["pending_deliveries"]) == 1
+    message = state["pending_deliveries"][0]["text"]
+    assert "새 공지 6건 중 관련 2건" in message
+    assert "1. [" in message
+    assert "2. [" in message
+    assert "수강신청 확인" in message
+    assert "등록금 납부 확인" in message
+
+
+def test_urgent_dedup_filters_completed_subset_from_later_batch(
+    tmp_path,
+    make_article,
+    make_classified,
+):
+    first = make_article(id="1", title="공지 A")
+    second = make_article(id="2", title="공지 B")
+    third = make_article(id="3", title="공지 C")
+    notice_a = make_classified(article=first, delivery="review")
+    notice_b = make_classified(article=second, delivery="immediate")
+    notice_c = make_classified(article=third, delivery="review")
+    fingerprints = {
+        article.key: article.fingerprint
+        for article in (first, second, third)
+    }
+    state = {
+        "seen_ids": {},
+        "article_fingerprints": {},
+        "enriched_fingerprints": {},
+        "pending_digest": [],
+        "pending_deliveries": [],
+        "delivery_history": {},
+        "urgent_notice_history": {},
+        "classification_retries": {},
+    }
+    path = str(tmp_path / "state.json")
+
+    assert _queue_urgent_notifications(
+        state,
+        [notice_a, notice_b],
+        2,
+        fingerprints,
+    ) == 1
+    with patch("ku_notice_monitor.main.send_telegram_part", new_callable=AsyncMock):
+        asyncio.run(_flush_pending_deliveries(state, path))
+
+    assert len(state["urgent_notice_history"]) == 2
+    assert _queue_urgent_notifications(state, [notice_a], 0, fingerprints) == 0
+    assert _queue_urgent_notifications(
+        state,
+        [notice_a, notice_c],
+        1,
+        fingerprints,
+    ) == 1
+    message = state["pending_deliveries"][0]["text"]
+    assert "공지 A" not in message
+    assert "공지 C" in message
 
 
 def test_outbox_success_removes_delivery(tmp_path):
@@ -101,6 +188,63 @@ def test_outbox_failure_is_retained(tmp_path):
     assert result["failed_parts"] == 1
     assert len(state["pending_deliveries"]) == 1
     assert state["pending_deliveries"][0]["attempts"] == 1
+
+
+def test_multipart_outbox_retries_in_order(tmp_path):
+    state = {
+        "seen_ids": {},
+        "article_fingerprints": {},
+        "enriched_fingerprints": {},
+        "pending_digest": [],
+        "pending_deliveries": [],
+        "delivery_history": {},
+        "classification_retries": {},
+    }
+    enqueue_delivery(
+        ["첫 조각", "둘째 조각", "셋째 조각"],
+        state,
+        kind="urgent",
+        dedup_key="urgent-batch",
+        metadata={"group_id": "urgent-batch"},
+    )
+    path = str(tmp_path / "state.json")
+
+    with patch(
+        "ku_notice_monitor.main.send_telegram_part",
+        new_callable=AsyncMock,
+        side_effect=[None, RuntimeError("temporary")],
+    ) as send:
+        first = asyncio.run(_flush_pending_deliveries(state, path))
+
+    assert first == {"sent_parts": 1, "failed_parts": 1, "digest_notices_sent": 0}
+    assert [item["text"] for item in state["pending_deliveries"]] == [
+        "둘째 조각",
+        "셋째 조각",
+    ]
+    assert send.await_count == 2
+
+    with patch(
+        "ku_notice_monitor.main.send_telegram_part",
+        new_callable=AsyncMock,
+    ) as send_too_early:
+        second = asyncio.run(_flush_pending_deliveries(state, path))
+
+    assert second["sent_parts"] == 0
+    send_too_early.assert_not_awaited()
+
+    state["pending_deliveries"][0]["next_attempt_at"] = None
+    with patch(
+        "ku_notice_monitor.main.send_telegram_part",
+        new_callable=AsyncMock,
+    ) as retry_send:
+        third = asyncio.run(_flush_pending_deliveries(state, path))
+
+    assert third["sent_parts"] == 2
+    assert [call.args[0] for call in retry_send.await_args_list] == [
+        "둘째 조각",
+        "셋째 조각",
+    ]
+    assert state["pending_deliveries"] == []
 
 
 def test_feed_health_rejects_all_failed():

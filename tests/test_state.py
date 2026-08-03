@@ -137,6 +137,27 @@ def test_completed_delivery_is_not_queued_again():
     assert state["pending_deliveries"] == []
 
 
+def test_delivery_dedup_is_stable_when_rendered_text_changes():
+    state = {"pending_deliveries": [], "delivery_history": {}}
+    first_id = enqueue_delivery(
+        ["새 공지 6건 중 관련 1건"],
+        state,
+        kind="urgent",
+        dedup_key="notice-1",
+    )[0]
+    complete_delivery(state, first_id)
+
+    second_ids = enqueue_delivery(
+        ["새 공지 0건 중 관련 1건"],
+        state,
+        kind="urgent",
+        dedup_key="notice-1",
+    )
+
+    assert second_ids == [first_id]
+    assert state["pending_deliveries"] == []
+
+
 def test_outbox_failure_records_backoff():
     state = {"pending_deliveries": []}
     delivery_id = enqueue_delivery(
@@ -174,6 +195,7 @@ def test_state_v3_migrates_profile_hash_without_personal_data(tmp_path):
         encoding="utf-8",
     )
     state = load_state(str(path))
-    assert state["schema_version"] == 4
+    assert state["schema_version"] == 5
     assert state["profile_document_hash"] is None
+    assert state["urgent_notice_history"] == {}
     assert "profile_snapshot" not in state

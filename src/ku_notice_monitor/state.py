@@ -14,7 +14,7 @@ from .models import Article, ClassifiedNotice
 
 logger = logging.getLogger(__name__)
 
-STATE_SCHEMA_VERSION = 4
+STATE_SCHEMA_VERSION = 5
 MAX_PENDING_DIGEST = 200
 MAX_PENDING_DELIVERIES = 500
 
@@ -36,6 +36,7 @@ def _initial_state() -> dict:
         "pending_digest": [],
         "pending_deliveries": [],
         "delivery_history": {},
+        "urgent_notice_history": {},
         "classification_retries": {},
         "last_digest_enqueued_date": None,
         "last_digest_sent_date": None,
@@ -104,6 +105,9 @@ def load_state(state_path: str) -> dict:
     # v3 → v4: 자연어 프로필 내용은 저장하지 않고 변경 감지 해시만 추가
     if schema_version < 4:
         state.setdefault("profile_document_hash", None)
+    # v4 → v5: 묶음이 달라져도 공지별 즉시 알림 중복을 막는 완료 기록 추가
+    if schema_version < 5:
+        state.setdefault("urgent_notice_history", {})
 
     state["schema_version"] = schema_version
     state.setdefault("seen_ids", {})
@@ -112,6 +116,7 @@ def load_state(state_path: str) -> dict:
     state.setdefault("pending_digest", [])
     state.setdefault("pending_deliveries", [])
     state.setdefault("delivery_history", {})
+    state.setdefault("urgent_notice_history", {})
     state.setdefault("classification_retries", {})
     state.setdefault("last_digest_enqueued_date", None)
     state.setdefault("last_digest_sent_date", None)
@@ -132,6 +137,7 @@ def load_state(state_path: str) -> dict:
         "pending_digest": list,
         "pending_deliveries": list,
         "delivery_history": dict,
+        "urgent_notice_history": dict,
         "classification_retries": dict,
     }
     for field, expected_type in expected_types.items():
@@ -179,6 +185,11 @@ def load_state(state_path: str) -> dict:
         for k, v in state["delivery_history"].items()
         if isinstance(v, str)
     }
+    state["urgent_notice_history"] = {
+        str(k): str(v)
+        for k, v in state["urgent_notice_history"].items()
+        if isinstance(v, str)
+    }
     state["classification_retries"] = {
         _normalize_seen_key(str(k)): value
         for k, value in state["classification_retries"].items()
@@ -209,6 +220,11 @@ def save_state(state: dict, state_path: str) -> None:
     state["delivery_history"] = {
         str(k): v
         for k, v in state.get("delivery_history", {}).items()
+        if isinstance(v, str) and v > cutoff
+    }
+    state["urgent_notice_history"] = {
+        str(k): v
+        for k, v in state.get("urgent_notice_history", {}).items()
         if isinstance(v, str) and v > cutoff
     }
     retry_cutoff = (datetime.now() - timedelta(days=14)).isoformat()
@@ -346,15 +362,24 @@ def enqueue_delivery(
     ids: list[str] = []
     created_at = datetime.now().isoformat()
     for index, text in enumerate(parts):
-        raw_id = f"{kind}\0{dedup_key}\0{index}\0{text}".encode("utf-8")
+        raw_id = f"{kind}\0{dedup_key}\0{index}".encode("utf-8")
         delivery_id = hashlib.sha256(raw_id).hexdigest()
+        legacy_raw_id = f"{kind}\0{dedup_key}\0{index}\0{text}".encode("utf-8")
+        legacy_delivery_id = hashlib.sha256(legacy_raw_id).hexdigest()
         ids.append(delivery_id)
-        if delivery_id in existing_ids or delivery_id in history:
+        if (
+            delivery_id in existing_ids
+            or delivery_id in history
+            or legacy_delivery_id in existing_ids
+            or legacy_delivery_id in history
+        ):
             continue
         new_items.append(
             {
                 "id": delivery_id,
                 "kind": kind,
+                "dedup_key": dedup_key,
+                "part_index": index,
                 "text": text,
                 "created_at": created_at,
                 "attempts": 0,

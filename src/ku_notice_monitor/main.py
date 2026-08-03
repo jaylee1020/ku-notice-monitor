@@ -20,13 +20,13 @@ from .feeds import (
     parse_pub_date,
 )
 from .matcher import match_articles
-from .models import Article
+from .models import Article, ClassifiedNotice
 from .notifier import (
     build_digest_message,
     build_first_run_message,
     build_no_new_message,
     build_no_relevant_message,
-    build_urgent_message,
+    build_urgent_messages,
     notify_error,
     send_telegram_part,
     split_message,
@@ -190,20 +190,84 @@ def _queue_message(
     return len(state["pending_deliveries"]) - before
 
 
+def _queue_urgent_notifications(
+    state: dict,
+    urgent: list[ClassifiedNotice],
+    total_new: int,
+    source_fingerprints: dict[str, str],
+) -> int:
+    """한 실행에서 나온 즉시·검토 공지를 하나의 읽기 쉬운 알림으로 묶는다."""
+    if not urgent:
+        return 0
+    delivery_priority = {"immediate": 0, "review": 1}
+    pending_notice_tokens = {
+        str(token)
+        for delivery in state.get("pending_deliveries", [])
+        for token in delivery.get("metadata", {}).get("notice_tokens", [])
+    }
+    delivered_notice_tokens = state.setdefault("urgent_notice_history", {})
+
+    candidates: list[tuple[ClassifiedNotice, str]] = []
+    for item in urgent:
+        token = _batch_key(
+            "urgent-notice",
+            [
+                item.article.key,
+                source_fingerprints.get(item.article.key, item.article.fingerprint),
+                item.delivery,
+            ],
+        )
+        if token in pending_notice_tokens or token in delivered_notice_tokens:
+            continue
+        candidates.append((item, token))
+
+    ordered_candidates = sorted(
+        candidates,
+        key=lambda item: (
+            delivery_priority.get(item[0].delivery, 2),
+            item[0].article.key,
+        ),
+    )
+    if not ordered_candidates:
+        return 0
+
+    ordered_urgent = [item for item, _ in ordered_candidates]
+    notice_tokens = [token for _, token in ordered_candidates]
+    urgent_key = _batch_key("urgent", notice_tokens)
+    before = len(state.setdefault("pending_deliveries", []))
+    enqueue_delivery(
+        build_urgent_messages(ordered_urgent, total_new),
+        state,
+        kind="urgent",
+        dedup_key=urgent_key,
+        metadata={
+            "group_id": f"urgent:{urgent_key}",
+            "notice_count": len(ordered_urgent),
+            "notice_tokens": notice_tokens,
+        },
+    )
+    return len(state["pending_deliveries"]) - before
+
+
 async def _flush_pending_deliveries(state: dict, state_path: str) -> dict[str, int]:
     """현재 전송 가능한 outbox를 처리하고 각 결과를 즉시 영구 저장한다."""
     result = {"sent_parts": 0, "failed_parts": 0, "digest_notices_sent": 0}
-    failed_groups: set[str] = set()
+    blocked_groups: set[str] = set()
+    due_ids = {str(item.get("id")) for item in due_deliveries(state)}
 
-    for item in list(due_deliveries(state)):
+    for item in list(state.get("pending_deliveries", [])):
         metadata = item.get("metadata", {})
         group_id = str(metadata.get("group_id") or item["id"])
-        if group_id in failed_groups:
+        if group_id in blocked_groups:
+            continue
+        if str(item.get("id")) not in due_ids:
+            # 앞 조각의 재시도 시각 전에는 같은 메시지의 뒤 조각도 보내지 않는다.
+            blocked_groups.add(group_id)
             continue
         try:
             await send_telegram_part(item["text"])
         except Exception as exc:
-            failed_groups.add(group_id)
+            blocked_groups.add(group_id)
             record_delivery_failure(state, item["id"], str(exc))
             save_state(state, state_path)
             result["failed_parts"] += 1
@@ -227,6 +291,11 @@ async def _flush_pending_deliveries(state: dict, state_path: str) -> dict[str, i
                 result["digest_notices_sent"] += int(
                     completed_meta.get("notice_count", 0)
                 )
+            elif completed["kind"] == "urgent":
+                delivered_at = datetime.now().isoformat()
+                history = state.setdefault("urgent_notice_history", {})
+                for token in completed_meta.get("notice_tokens", []):
+                    history[str(token)] = delivered_at
         save_state(state, state_path)
 
     return result
@@ -462,22 +531,12 @@ async def run() -> None:
         stats["digest_queued"] = len(digest)
 
         if urgent:
-            for item in urgent:
-                urgent_key = _batch_key(
-                    "urgent",
-                    [
-                        item.article.key,
-                        source_fingerprints[item.article.key],
-                        item.delivery,
-                    ],
-                )
-                stats["outbox_queued_parts"] += _queue_message(
-                    state,
-                    build_urgent_message([item], len(new_articles)),
-                    kind="urgent",
-                    dedup_key=urgent_key,
-                    metadata={"group_id": f"urgent:{urgent_key}"},
-                )
+            stats["outbox_queued_parts"] += _queue_urgent_notifications(
+                state,
+                urgent,
+                len(new_articles),
+                source_fingerprints,
+            )
         if digest:
             enqueue_digest(digest, state)
         if not matched and config["notifications"].get("notify_empty_runs", False):

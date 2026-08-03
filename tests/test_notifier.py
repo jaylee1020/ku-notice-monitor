@@ -15,6 +15,7 @@ from ku_notice_monitor.notifier import (
     build_no_relevant_message,
     build_relevant_message,
     build_urgent_message,
+    build_urgent_messages,
     send_telegram,
     send_telegram_part,
     split_message,
@@ -79,6 +80,31 @@ def test_build_urgent_message_has_deadline_and_actions(make_article, make_classi
     assert "이유:" not in msg
     assert "내 조건과 일치" not in msg
     assert "🚨" not in msg
+
+
+def test_long_urgent_batch_splits_on_notice_boundaries_with_header(
+    make_article,
+    make_classified,
+):
+    matched = [
+        make_classified(
+            article=make_article(id=str(index), title=f"긴 공지 {index} " + "가" * 170),
+            delivery="review",
+            summary="요약 " + "나" * 210,
+            uncertainties=["확인할 조건 " + "다" * 160],
+            actions=["원문 확인 " + "라" * 160],
+        )
+        for index in range(1, 13)
+    ]
+
+    parts = build_urgent_messages(matched, 12)
+
+    assert len(parts) > 1
+    assert all(part.startswith("2026-") for part in parts)
+    assert all("새 공지 12건 중 관련 12건" in part for part in parts)
+    assert all(len(part) <= MAX_TELEGRAM_MESSAGE_LENGTH for part in parts)
+    combined = "\n".join(parts)
+    assert all(f"긴 공지 {index}" in combined for index in range(1, 13))
 
 
 def test_build_digest_message_marks_updated_article(make_article, make_classified):

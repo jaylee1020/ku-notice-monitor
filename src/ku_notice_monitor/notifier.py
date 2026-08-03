@@ -78,44 +78,82 @@ def _deadline_label(deadline: str | None) -> str | None:
 
 
 def _build_items(matched: list[ClassifiedNotice]) -> str:
-    items: list[str] = []
-    for index, match in enumerate(matched, 1):
-        article = match.article
-        update_badge = " [수정]" if article.is_update else ""
-        lines = [
-            (
-                f"{index}. [{_html(article.board_name, 50)}] "
-                f"{_html(article.title, 180)}{update_badge}"
-            )
-        ]
+    return _ITEM_SEPARATOR.join(
+        _build_item(match, index)
+        for index, match in enumerate(matched, 1)
+    )
 
-        if match.summary and match.summary != article.title:
-            lines.append(f"→ {_html(match.summary, 220)}")
 
-        if match.delivery == "review":
-            detail = (
-                match.uncertainties[0] if match.uncertainties else match.reason
-            )
-            lines.append(f"확인 필요: {_html(detail, 180)}")
+def _build_item(match: ClassifiedNotice, index: int) -> str:
+    article = match.article
+    update_badge = " [수정]" if article.is_update else ""
+    lines = [
+        (
+            f"{index}. [{_html(article.board_name, 50)}] "
+            f"{_html(article.title, 180)}{update_badge}"
+        )
+    ]
 
-        if deadline := _deadline_label(match.deadline):
-            lines.append(f"마감: {_html(deadline, 50)}")
-        if match.actions:
-            actions = " · ".join(match.actions[:2])
-            lines.append(f"할 일: {_html(actions, 180)}")
+    if match.summary and match.summary != article.title:
+        lines.append(f"→ {_html(match.summary, 220)}")
 
-        article_link = escape(article.link, quote=True)
-        lines.append(f'<a href="{article_link}">공지 보기</a>')
-        if article.attachments:
-            lines[-1] += f" · 첨부 {len(article.attachments)}개"
-        items.append("\n".join(lines))
-    return _ITEM_SEPARATOR.join(items)
+    if match.delivery == "review":
+        detail = match.uncertainties[0] if match.uncertainties else match.reason
+        lines.append(f"확인 필요: {_html(detail, 180)}")
+
+    if deadline := _deadline_label(match.deadline):
+        lines.append(f"마감: {_html(deadline, 50)}")
+    if match.actions:
+        actions = " · ".join(match.actions[:2])
+        lines.append(f"할 일: {_html(actions, 180)}")
+
+    article_link = escape(article.link, quote=True)
+    lines.append(f'<a href="{article_link}">공지 보기</a>')
+    if article.attachments:
+        lines[-1] += f" · 첨부 {len(article.attachments)}개"
+    return "\n".join(lines)
 
 
 def build_urgent_message(matched: list[ClassifiedNotice], total_new: int) -> str:
     today = _now_kst().strftime("%Y-%m-%d")
     header = f"{today} 새 공지 {total_new}건 중 관련 {len(matched)}건"
     return header + "\n\n" + _build_items(matched)
+
+
+def build_urgent_messages(
+    matched: list[ClassifiedNotice],
+    total_new: int,
+) -> list[str]:
+    """긴 즉시 알림을 공지 경계에서 나누고 각 조각에 헤더를 유지한다."""
+    today = _now_kst().strftime("%Y-%m-%d")
+    header = f"{today} 새 공지 {total_new}건 중 관련 {len(matched)}건"
+    parts: list[str] = []
+    current_items: list[str] = []
+
+    for index, match in enumerate(matched, 1):
+        item = _build_item(match, index)
+        candidate_items = [*current_items, item]
+        candidate = header + "\n\n" + _ITEM_SEPARATOR.join(candidate_items)
+        if len(candidate) <= MAX_TELEGRAM_MESSAGE_LENGTH:
+            current_items = candidate_items
+            continue
+
+        if current_items:
+            parts.append(header + "\n\n" + _ITEM_SEPARATOR.join(current_items))
+            current_items = []
+
+        single = header + "\n\n" + item
+        if len(single) > MAX_TELEGRAM_MESSAGE_LENGTH:
+            # 정상 공지는 한 항목이 제한을 넘지 않지만 비정상적으로 긴 URL도 안전하게 처리한다.
+            body_limit = MAX_TELEGRAM_MESSAGE_LENGTH - len(header) - 2
+            for body in _split_text(item, body_limit):
+                parts.append(header + "\n\n" + body)
+        else:
+            current_items = [item]
+
+    if current_items:
+        parts.append(header + "\n\n" + _ITEM_SEPARATOR.join(current_items))
+    return parts
 
 
 def build_digest_message(matched: list[ClassifiedNotice]) -> str:
@@ -159,9 +197,7 @@ def build_first_run_message(seeded_count: int) -> str:
     )
 
 
-def split_message(text: str) -> list[str]:
-    """텔레그램 메시지 길이 제한에 맞게 분할"""
-    limit = MAX_TELEGRAM_MESSAGE_LENGTH
+def _split_text(text: str, limit: int) -> list[str]:
     if len(text) <= limit:
         return [text]
 
@@ -190,6 +226,11 @@ def split_message(text: str) -> list[str]:
         messages.append(current)
 
     return messages
+
+
+def split_message(text: str) -> list[str]:
+    """텔레그램 메시지 길이 제한에 맞게 분할"""
+    return _split_text(text, MAX_TELEGRAM_MESSAGE_LENGTH)
 
 
 def _telegram_credentials() -> tuple[str, str]:
