@@ -52,7 +52,7 @@ def test_flush_digest_moves_to_outbox_and_clears(make_classified):
     assert len(state["pending_deliveries"]) == 1
 
 
-def test_urgent_notices_are_queued_as_one_deduplicated_message(
+def test_urgent_notices_are_queued_as_separate_deduplicated_messages(
     make_article,
     make_classified,
 ):
@@ -77,16 +77,16 @@ def test_urgent_notices_are_queued_as_one_deduplicated_message(
         fingerprints,
     )
 
-    assert queued == 1
+    assert queued == 2
     assert queued_again == 0
     assert queued_reordered == 0
-    assert len(state["pending_deliveries"]) == 1
-    message = state["pending_deliveries"][0]["text"]
-    assert "새 공지 6건 중 관련 2건" in message
-    assert "1. [" in message
-    assert "2. [" in message
-    assert "수강신청 확인" in message
-    assert "등록금 납부 확인" in message
+    assert len(state["pending_deliveries"]) == 2
+    messages = [item["text"] for item in state["pending_deliveries"]]
+    assert all("새 공지 6건 중 관련 1건" in message for message in messages)
+    assert all("1. [" in message for message in messages)
+    assert all("2. [" not in message for message in messages)
+    assert sum("수강신청 확인" in message for message in messages) == 1
+    assert sum("등록금 납부 확인" in message for message in messages) == 1
 
 
 def test_urgent_dedup_filters_completed_subset_from_later_batch(
@@ -121,7 +121,7 @@ def test_urgent_dedup_filters_completed_subset_from_later_batch(
         [notice_a, notice_b],
         2,
         fingerprints,
-    ) == 1
+    ) == 2
     with patch("ku_notice_monitor.main.send_telegram_part", new_callable=AsyncMock):
         asyncio.run(_flush_pending_deliveries(state, path))
 

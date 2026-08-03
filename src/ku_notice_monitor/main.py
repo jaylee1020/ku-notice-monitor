@@ -196,7 +196,7 @@ def _queue_urgent_notifications(
     total_new: int,
     source_fingerprints: dict[str, str],
 ) -> int:
-    """한 실행에서 나온 즉시·검토 공지를 하나의 읽기 쉬운 알림으로 묶는다."""
+    """즉시·검토 공지를 공지별 메시지로 나누어 중복 없이 큐에 넣는다."""
     if not urgent:
         return 0
     delivery_priority = {"immediate": 0, "review": 1}
@@ -231,22 +231,23 @@ def _queue_urgent_notifications(
     if not ordered_candidates:
         return 0
 
-    ordered_urgent = [item for item, _ in ordered_candidates]
-    notice_tokens = [token for _, token in ordered_candidates]
-    urgent_key = _batch_key("urgent", notice_tokens)
-    before = len(state.setdefault("pending_deliveries", []))
-    enqueue_delivery(
-        build_urgent_messages(ordered_urgent, total_new),
-        state,
-        kind="urgent",
-        dedup_key=urgent_key,
-        metadata={
-            "group_id": f"urgent:{urgent_key}",
-            "notice_count": len(ordered_urgent),
-            "notice_tokens": notice_tokens,
-        },
-    )
-    return len(state["pending_deliveries"]) - before
+    queued_parts = 0
+    for item, notice_token in ordered_candidates:
+        urgent_key = _batch_key("urgent", [notice_token])
+        before = len(state.setdefault("pending_deliveries", []))
+        enqueue_delivery(
+            build_urgent_messages([item], total_new),
+            state,
+            kind="urgent",
+            dedup_key=urgent_key,
+            metadata={
+                "group_id": f"urgent:{urgent_key}",
+                "notice_count": 1,
+                "notice_tokens": [notice_token],
+            },
+        )
+        queued_parts += len(state["pending_deliveries"]) - before
+    return queued_parts
 
 
 async def _flush_pending_deliveries(state: dict, state_path: str) -> dict[str, int]:
