@@ -17,7 +17,8 @@ from tenacity import retry, retry_if_exception, retry_if_exception_type, stop_af
 
 from .constants import (
     ARTICLE_BODY_TIMEOUT,
-    BOARD_CONTENT_CLASS,
+    BOARD_ATTACHMENT_CLASSES,
+    BOARD_CONTENT_CLASSES,
     EMPTY_FEED_SENTINEL,
     FEED_FETCH_TIMEOUT,
     MAX_ARTICLE_BODY_LENGTH,
@@ -411,13 +412,22 @@ def _extract_image_urls(
     return image_urls
 
 
+def _find_first_div(soup, classes: tuple[str, ...]):
+    """후보 클래스 순서대로 찾아 처음 발견한 div를 반환한다."""
+    for class_name in classes:
+        node = soup.find("div", class_=class_name)
+        if node is not None:
+            return node
+    return None
+
+
 def _extract_attachments(
     soup,
     base_url: str,
     allowed_hosts: set[str] | None = None,
 ) -> list[Attachment]:
-    """페이지의 div.attachments에서 첨부파일 목록을 추출한다."""
-    attach_div = soup.find("div", class_="attachments")
+    """페이지의 첨부 영역(div.view-file 또는 구형 div.attachments)에서 첨부파일을 추출한다."""
+    attach_div = _find_first_div(soup, BOARD_ATTACHMENT_CLASSES)
     if not attach_div:
         return []
 
@@ -509,7 +519,7 @@ async def _fetch_article_body_async(
 
         soup = BeautifulSoup(html, "lxml")
         attachments = _extract_attachments(soup, base_url, allowed_hosts)
-        content_div = soup.find("div", class_=BOARD_CONTENT_CLASS)
+        content_div = _find_first_div(soup, BOARD_CONTENT_CLASSES)
         if not content_div:
             if not attachments:
                 # 오류 페이지처럼 본문도 첨부도 없는 응답은 실패로 본다.

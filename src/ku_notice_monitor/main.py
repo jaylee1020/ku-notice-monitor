@@ -69,6 +69,7 @@ from .state import (
     load_state,
     mark_as_seen,
     record_delivery_failure,
+    reset_enriched_fingerprints_if_parser_changed,
     save_state,
     schedule_classification_retry,
     seed_new_boards,
@@ -738,6 +739,7 @@ async def run() -> None:
 
     if first_run and config["settings"].get("seed_on_first_run", True) and all_articles:
         state["known_boards"] = sorted(successful_boards)
+        reset_enriched_fingerprints_if_parser_changed(state)
         stats["method"] = "seed"
         stats["outbox_queued_parts"] += _queue_message(
             state,
@@ -765,6 +767,11 @@ async def run() -> None:
             kind="status",
             dedup_key=_batch_key("new-boards", [str(board) for board in seeded_boards]),
         )
+
+    if reset_enriched_fingerprints_if_parser_changed(state):
+        # 새 방식으로 읽은 본문을 이전 지문과 비교하지 않도록 이번 실행을 새 기준으로 삼는다.
+        logger.info("상세 본문 추출 방식이 바뀌어 상세 지문 기준을 다시 잡습니다.")
+        stats["detail_fingerprints_reset"] = True
 
     refresh_due = _detail_refresh_is_due(state, config)
     targets = _select_targets(

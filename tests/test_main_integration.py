@@ -436,3 +436,48 @@ def test_main_marks_error_notified_so_workflow_does_not_repeat(tmp_path, monkeyp
 
     assert (tmp_path / main_module.ERROR_NOTIFIED_MARKER).exists()
     assert "건너뛰었습니다" in notify.await_args.kwargs["title"]
+
+
+def test_parser_change_does_not_mark_every_recent_notice_as_updated(tmp_path, make_article):
+    """본문 추출 방식이 바뀐 첫 실행에서 이전 상세 지문과 비교해 수정 알림을 쏟지 않는다."""
+    article = make_article(
+        description="RSS 요약",
+        link="https://www.konkuk.ac.kr/bbs/konkuk/234/1/artclView.do",
+        pub_date="2099-01-01 09:00:00.0",
+    )
+    state = _initial_state()
+    del state["detail_parser_version"]  # 이전 파서로 만든 상태
+    mark_as_seen([article], state)
+    state["known_boards"] = [234]
+    # 예전 파서가 빈 본문으로 만든 상세 지문.
+    state["enriched_fingerprints"] = {article.key: "old-empty-body-fingerprint"}
+    state_path = tmp_path / "state.json"
+    state_path.write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
+
+    async def fake_enrich(articles, _config):
+        for item in articles:
+            item.description = "새 파서가 읽은 긴 본문"
+        return {item.key for item in articles}
+
+    batch = FeedBatch([article], [FeedStatus("학사", 234, True, 1, 0.1)])
+    with (
+        patch("ku_notice_monitor.main.PROJECT_ROOT", tmp_path),
+        patch("ku_notice_monitor.main.load_config", return_value=_config()),
+        patch(
+            "ku_notice_monitor.main.fetch_all_feeds_detailed",
+            new_callable=AsyncMock,
+            return_value=batch,
+        ),
+        patch("ku_notice_monitor.main.enrich_articles_with_body", side_effect=fake_enrich),
+        patch("ku_notice_monitor.main.match_articles", new_callable=AsyncMock) as match,
+        patch("ku_notice_monitor.main._digest_is_due", return_value=False),
+        patch("ku_notice_monitor.main.send_telegram_part", new_callable=AsyncMock) as send,
+    ):
+        asyncio.run(run())
+
+    match.assert_not_awaited()
+    send.assert_not_awaited()
+    stored = json.loads(state_path.read_text(encoding="utf-8"))
+    assert stored["detail_parser_version"] == 2
+    assert stored["enriched_fingerprints"][article.key] != "old-empty-body-fingerprint"
+    assert stored["last_run_stats"]["updated_articles"] == 0

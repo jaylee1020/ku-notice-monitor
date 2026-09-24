@@ -8,6 +8,10 @@ on:
         description: '추가로 확인할 RSS URL (공백으로 구분)'
         required: false
         default: ''
+      inspect:
+        description: '구조를 확인할 공지 상세 URL (공백으로 구분)'
+        required: false
+        default: ''
       scan_konkuk:
         description: 'www.konkuk.ac.kr 게시판 ID 범위 (예: 230-260)'
         required: false
@@ -38,7 +42,14 @@ jobs:
         env:
           URLS: ${{ inputs.urls }}
           SCAN: ${{ inputs.scan_konkuk }}
+          INSPECT: ${{ inputs.inspect }}
         run: |
+          if [ -n "$INSPECT" ]; then
+            inspect_args=()
+            for url in $INSPECT; do inspect_args+=(--inspect "$url"); done
+            uv run --no-sync python scripts/check_feeds.py "${inspect_args[@]}"
+            exit 0
+          fi
           args=()
           [ -n "$SCAN" ] && args+=(--scan-konkuk "$SCAN")
           # shellcheck disable=SC2086

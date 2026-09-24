@@ -2,7 +2,10 @@
 
 # 피드 파싱
 EMPTY_FEED_SENTINEL = "no exist data"
-BOARD_CONTENT_CLASS = "hwp_editor_board_content"
+# 공지 상세 페이지의 본문·첨부 영역. 2026-09 개편 이후에는 view-con / view-file을
+# 쓰고, 그 전 구조(hwp_editor_board_content / attachments)도 함께 지원한다.
+BOARD_CONTENT_CLASSES = ("hwp_editor_board_content", "view-con")
+BOARD_ATTACHMENT_CLASSES = ("attachments", "view-file")
 
 # 본문 수집 (멀티모달 컨텍스트를 위한 넉넉한 상한)
 MAX_ARTICLE_BODY_LENGTH = 12000
