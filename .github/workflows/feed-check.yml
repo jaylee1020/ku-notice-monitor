@@ -1,0 +1,48 @@
+name: 피드 점검
+
+# 게시판 주소가 바뀌었는지, 새 게시판을 추가해도 되는지 확인할 때 수동으로 실행한다.
+on:
+  workflow_dispatch:
+    inputs:
+      urls:
+        description: '추가로 확인할 RSS URL (공백으로 구분)'
+        required: false
+        default: ''
+      scan_konkuk:
+        description: 'www.konkuk.ac.kr 게시판 ID 범위 (예: 230-260)'
+        required: false
+        default: ''
+  push:
+    branches: [claude/notification-readability-fixes-cfuv7u]
+    paths: [.github/workflows/feed-check.yml, scripts/check_feeds.py]
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: '3.12'
+
+      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          version: '0.11.29'
+          enable-cache: true
+
+      - run: uv sync --locked --python '3.12'
+
+      - name: Check feeds
+        env:
+          URLS: ${{ inputs.urls || 'https://cse.konkuk.ac.kr/bbs/cse/775/rssList.do https://www.konkuk.ac.kr/bbs/cse/775/rssList.do https://job.konkuk.ac.kr/bbs/job/4083/rssList.do https://www.konkuk.ac.kr/bbs/job/4083/rssList.do' }}
+          SCAN: ${{ inputs.scan_konkuk || '225-260' }}
+        run: |
+          args=()
+          [ -n "$SCAN" ] && args+=(--scan-konkuk "$SCAN")
+          # shellcheck disable=SC2086
+          uv run --no-sync python scripts/check_feeds.py "${args[@]}" $URLS
