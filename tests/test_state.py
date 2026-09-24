@@ -199,3 +199,44 @@ def test_state_v3_migrates_profile_hash_without_personal_data(tmp_path):
     assert state["profile_document_hash"] is None
     assert state["urgent_notice_history"] == {}
     assert "profile_snapshot" not in state
+
+
+# --- 새 게시판 시드 ---
+
+
+def test_seed_new_boards_marks_existing_posts_of_added_board(make_article):
+    from ku_notice_monitor.state import seed_new_boards
+
+    old = make_article(id="1", board_id=234)
+    added = [make_article(id=str(i), board_id=775) for i in range(10, 13)]
+    state = {"seen_ids": {old.key: "2026-09-20T00:00:00"}, "article_fingerprints": {}}
+
+    seeded = seed_new_boards([old, *added], {234, 775}, state)
+
+    assert seeded == {775: 3}
+    assert all(article.key in state["seen_ids"] for article in added)
+    assert state["known_boards"] == [234, 775]
+    # 다음 실행에는 같은 게시판을 다시 시드하지 않는다.
+    later = make_article(id="99", board_id=775)
+    assert seed_new_boards([later], {234, 775}, state) == {}
+    assert later.key not in state["seen_ids"]
+
+
+def test_seed_new_boards_skips_failed_board_until_first_success(make_article):
+    from ku_notice_monitor.state import seed_new_boards
+
+    state = {"seen_ids": {"234:1": "2026-09-20T00:00:00"}, "article_fingerprints": {}}
+    assert seed_new_boards([], {234}, state) == {}
+    assert state["known_boards"] == [234]
+    added = make_article(id="5", board_id=775)
+    assert seed_new_boards([added], {234, 775}, state) == {775: 1}
+
+
+def test_seed_new_boards_does_nothing_without_history(make_article):
+    from ku_notice_monitor.state import seed_new_boards
+
+    state = {"seen_ids": {}, "article_fingerprints": {}}
+    article = make_article(id="1", board_id=775)
+    assert seed_new_boards([article], {775}, state) == {}
+    assert article.key not in state["seen_ids"]
+    assert state["known_boards"] == [775]

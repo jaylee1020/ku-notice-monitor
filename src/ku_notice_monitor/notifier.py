@@ -390,6 +390,16 @@ def build_source_recovered_message(consecutive_runs: int) -> str:
     )
 
 
+def build_new_boards_message(seeded: dict[str, int]) -> str:
+    """새로 추가된 게시판을 알림 없이 시드했음을 알린다."""
+    boards = ", ".join(f"{escape(name)}(기존 공지 {count}건)" for name, count in seeded.items())
+    return (
+        "<b>[안내] 새 게시판 확인을 시작합니다</b>\n"
+        f"{boards}\n"
+        "기존 공지는 '확인함'으로 처리했고, 앞으로 올라오는 공지부터 분석해 알려 드립니다."
+    )
+
+
 def build_first_run_message(seeded_count: int) -> str:
     """최초 실행 시드 처리 안내 메시지"""
     today = now_kst().strftime("%Y-%m-%d")

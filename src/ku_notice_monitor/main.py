@@ -37,6 +37,7 @@ from .notifier import (
     TelegramNotConfiguredError,
     build_digest_messages,
     build_first_run_message,
+    build_new_boards_message,
     build_no_new_message,
     build_no_relevant_message,
     build_source_outage_message,
@@ -69,6 +70,7 @@ from .state import (
     record_delivery_failure,
     save_state,
     schedule_classification_retry,
+    seed_new_boards,
 )
 from .util import KST, now_kst
 
@@ -731,8 +733,10 @@ async def run() -> None:
     stats["outbox_queued_parts"] += _clear_source_outage(state)
     all_articles = feed_batch.articles
     source_fingerprints = {article.key: article.fingerprint for article in all_articles}
+    successful_boards = {status.board_id for status in feed_batch.statuses if status.success}
 
     if first_run and config["settings"].get("seed_on_first_run", True) and all_articles:
+        state["known_boards"] = sorted(successful_boards)
         stats["method"] = "seed"
         stats["outbox_queued_parts"] += _queue_message(
             state,
@@ -745,6 +749,21 @@ async def run() -> None:
         await _finish(state, state_path, stats, all_articles, source_fingerprints)
         _raise_for_delivery_configuration(stats)
         return
+
+    seeded_boards = seed_new_boards(
+        all_articles, successful_boards, state, fingerprints=source_fingerprints
+    )
+    if seeded_boards:
+        names = {status.board_id: status.name for status in feed_batch.statuses}
+        seeded_by_name = {names[board]: count for board, count in sorted(seeded_boards.items())}
+        stats["seeded_boards"] = seeded_by_name
+        logger.info("새 게시판의 기존 공지를 알림 없이 확인 처리했습니다: %s", seeded_by_name)
+        stats["outbox_queued_parts"] += _queue_message(
+            state,
+            build_new_boards_message(seeded_by_name),
+            kind="status",
+            dedup_key=_batch_key("new-boards", [str(board) for board in seeded_boards]),
+        )
 
     refresh_due = _detail_refresh_is_due(state, config)
     targets = _select_targets(

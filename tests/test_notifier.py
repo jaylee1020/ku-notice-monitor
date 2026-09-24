@@ -517,3 +517,9 @@ def test_source_outage_and_recovery_messages(monkeypatch):
     assert "9월 24일(목) 10:55부터 2회 연속" in msg
     assert "응답 시간 초과 9개" in msg
     assert "복구되었습니다" in notifier.build_source_recovered_message(3)
+
+
+def test_new_boards_message_lists_seeded_boards():
+    msg = notifier.build_new_boards_message({"컴퓨터공학부": 10})
+    assert "컴퓨터공학부(기존 공지 10건)" in msg
+    assert "앞으로 올라오는 공지부터" in msg
