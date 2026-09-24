@@ -4,7 +4,10 @@ import asyncio
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
+import pytest
+
 from ku_notice_monitor.profile import (
+    ProfileResolutionError,
     _ground_snapshot,
     legacy_profile_snapshot,
     profile_document_fingerprint,
@@ -96,22 +99,36 @@ def test_resolve_natural_profile_uses_structured_output(monkeypatch):
         }
     )
     response = SimpleNamespace(
+        output_parsed=parsed,
         usage=SimpleNamespace(total_tokens=123),
         _request_id="req_profile",
     )
+    client = AsyncMock()
+    client.responses.parse = AsyncMock(return_value=response)
     monkeypatch.setenv("OPENAI_API_KEY", "test-key")
     metrics = {}
-    with (
-        patch("ku_notice_monitor.profile.AsyncOpenAI"),
-        patch(
-            "ku_notice_monitor.profile._parse_profile_document",
-            new_callable=AsyncMock,
-            return_value=(parsed, response),
-        ),
-    ):
+    with patch("ku_notice_monitor.profile.make_client", return_value=client):
         snapshot = asyncio.run(
             resolve_profile_snapshot(_config(document), metrics=metrics)
         )
     assert snapshot.facts[0].key.value == "current_residence"
     assert metrics["source"] == "natural_language"
     assert metrics["total_tokens"] == 123
+    assert client.responses.parse.await_args.kwargs["text_format"] is ProfileSnapshot
+    client.close.assert_awaited_once()
+
+
+def test_resolve_natural_profile_wraps_api_failure(monkeypatch):
+    client = AsyncMock()
+    client.responses.parse = AsyncMock(side_effect=ValueError("schema mismatch"))
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    with patch("ku_notice_monitor.profile.make_client", return_value=client):
+        with pytest.raises(ProfileResolutionError, match="schema mismatch"):
+            asyncio.run(resolve_profile_snapshot(_config("나는 서울에 산다.")))
+    client.close.assert_awaited_once()
+
+
+def test_natural_profile_without_api_key_is_resolution_error(monkeypatch):
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    with pytest.raises(ProfileResolutionError):
+        asyncio.run(resolve_profile_snapshot(_config("나는 서울에 산다.")))

@@ -17,6 +17,8 @@ logger = logging.getLogger(__name__)
 STATE_SCHEMA_VERSION = 5
 MAX_PENDING_DIGEST = 200
 MAX_PENDING_DELIVERIES = 500
+# 지수 백오프(최대 6시간)로 약 3~4일간 재시도한 뒤에도 실패하면 포기한다.
+MAX_DELIVERY_ATTEMPTS = 16
 
 
 class StateCorruptionError(RuntimeError):
@@ -72,7 +74,7 @@ def load_state(state_path: str) -> dict:
         return _initial_state()
 
     try:
-        with open(path, "r", encoding="utf-8") as f:
+        with open(path, encoding="utf-8") as f:
             state = json.load(f)
     except (json.JSONDecodeError, OSError) as e:
         raise StateCorruptionError(
@@ -362,9 +364,9 @@ def enqueue_delivery(
     ids: list[str] = []
     created_at = datetime.now().isoformat()
     for index, text in enumerate(parts):
-        raw_id = f"{kind}\0{dedup_key}\0{index}".encode("utf-8")
+        raw_id = f"{kind}\0{dedup_key}\0{index}".encode()
         delivery_id = hashlib.sha256(raw_id).hexdigest()
-        legacy_raw_id = f"{kind}\0{dedup_key}\0{index}\0{text}".encode("utf-8")
+        legacy_raw_id = f"{kind}\0{dedup_key}\0{index}\0{text}".encode()
         legacy_delivery_id = hashlib.sha256(legacy_raw_id).hexdigest()
         ids.append(delivery_id)
         if (
@@ -418,18 +420,31 @@ def record_delivery_failure(
     delivery_id: str,
     error: str,
     now: datetime | None = None,
-) -> None:
-    """실패 횟수와 지수 백오프 재시도 시각을 기록한다."""
+    *,
+    retry_after_seconds: int | None = None,
+) -> int:
+    """실패 횟수와 지수 백오프 재시도 시각을 기록하고 누적 시도 횟수를 반환한다."""
     current = now or datetime.now()
     for item in state.get("pending_deliveries", []):
         if item.get("id") != delivery_id:
             continue
         attempts = int(item.get("attempts", 0)) + 1
-        delay_minutes = min(5 * (2 ** (attempts - 1)), 360)
+        delay = timedelta(minutes=min(5 * (2 ** (attempts - 1)), 360))
+        if retry_after_seconds:
+            delay = max(delay, timedelta(seconds=retry_after_seconds))
         item["attempts"] = attempts
         item["last_error"] = error[:500]
-        item["next_attempt_at"] = (current + timedelta(minutes=delay_minutes)).isoformat()
-        return
+        item["next_attempt_at"] = (current + delay).isoformat()
+        return attempts
+    return 0
+
+
+def drop_delivery(state: dict, delivery_id: str) -> dict | None:
+    """다시 보내도 성공할 수 없는 항목을 제거한다.
+
+    같은 메시지가 다시 큐에 들어와 무한 반복되지 않도록 완료 기록에도 남긴다.
+    """
+    return complete_delivery(state, delivery_id)
 
 
 def complete_delivery(state: dict, delivery_id: str) -> dict | None:

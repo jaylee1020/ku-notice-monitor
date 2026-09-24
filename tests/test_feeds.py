@@ -18,6 +18,7 @@ from ku_notice_monitor.feeds import (
     _strip_html,
     _to_int,
     base_url_of,
+    enrich_articles_with_body,
     extract_article_id,
     fetch_all_feeds_detailed,
     is_empty_feed_item,
@@ -567,3 +568,54 @@ def test_fetch_all_feeds_reports_partial_failure(make_article):
     assert batch.successful_count == 1
     assert batch.failed_count == 1
     assert batch.statuses[1].error.startswith("TimeoutError")
+
+
+# --- 상세 본문 보강 ---
+
+_ARTICLE_HTML = """
+<html><body>
+<div class="hwp_editor_board_content"><p>2026-09-30까지 신청</p></div>
+<div class="attachments"><a href="/bbs/konkuk/234/1/download.do">안내.pdf</a></div>
+</body></html>
+""".encode()
+
+
+def _enrich_config():
+    return {
+        "feeds": {},
+        "settings": {
+            "ssl_verify": True,
+            "base_url": "https://www.konkuk.ac.kr",
+            "allowed_download_hosts": ["konkuk.ac.kr"],
+        },
+    }
+
+
+def test_enrich_reports_only_successfully_crawled_articles(make_article):
+    ok = make_article(id="1", description="RSS", link="https://www.konkuk.ac.kr/notice/1")
+    failed = make_article(id="2", description="RSS", link="https://www.konkuk.ac.kr/notice/2")
+
+    async def fake_download(_session, url, **_kwargs):
+        return _ARTICLE_HTML if url.endswith("/1") else None
+
+    with patch("ku_notice_monitor.feeds.download_bytes", side_effect=fake_download):
+        enriched = asyncio.run(enrich_articles_with_body([ok, failed], _enrich_config()))
+
+    assert enriched == {ok.key}
+    assert "2026-09-30까지 신청" in ok.description
+    assert [att.filename for att in ok.attachments] == ["안내.pdf"]
+    # 실패한 공지는 RSS 내용 그대로 남아야 한다.
+    assert failed.description == "RSS"
+    assert failed.attachments == []
+
+
+def test_enrich_treats_page_without_body_or_attachments_as_failure(make_article):
+    article = make_article(link="https://www.konkuk.ac.kr/notice/1")
+
+    async def fake_download(*_args, **_kwargs):
+        return b"<html><body>error</body></html>"
+
+    with patch("ku_notice_monitor.feeds.download_bytes", side_effect=fake_download):
+        enriched = asyncio.run(enrich_articles_with_body([article], _enrich_config()))
+
+    assert enriched == set()

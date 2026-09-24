@@ -11,10 +11,10 @@ from .classification import Delivery, classify_assessment
 from .eligibility import apply_profile_eligibility
 from .feeds import parse_pub_date
 from .models import Article, ClassifiedNotice
-from .openai_classifier import analyze_with_openai
+from .openai_classifier import AnalysisOutcome, analyze_with_openai
 from .profile import legacy_profile_snapshot
 from .profile_models import ProfileSnapshot
-from .prompts import build_profile_text, build_prompt
+from .util import is_grounded, normalize_for_match
 
 logger = logging.getLogger(__name__)
 
@@ -51,11 +51,6 @@ class MatchResult:
     failed_keys: set[str]
     suppressed_count: int
     metrics: dict
-
-    def __iter__(self):
-        """기존의 ``matched, method = ...`` 호출과 호환한다."""
-        yield self.notices
-        yield self.method
 
 
 def _sort_date(article: Article) -> datetime:
@@ -209,27 +204,31 @@ def keyword_fallback(article: Article, config: dict) -> NoticeAssessment:
     )
 
 
-def _normalize_grounding_text(value: str) -> str:
-    return re.sub(r"[^0-9a-z가-힣]+", "", value.lower())
-
-
 def validate_assessment_grounding(
     article: Article,
     assessment: NoticeAssessment,
+    *,
+    attachment_text: str = "",
 ) -> NoticeAssessment:
-    """모델의 인용·날짜가 실제 입력 텍스트에 존재하는지 보수적으로 확인한다."""
+    """모델의 인용·날짜가 실제 입력 텍스트에 존재하는지 보수적으로 확인한다.
+
+    2차 분석에서 로컬로 텍스트 변환한 첨부(HWP·텍스트 PDF)도 모델이 본 원문이므로
+    근거 원문에 포함한다. 이미지·스캔 PDF처럼 텍스트로 검증할 수 없는 입력에서만
+    나온 근거는 보수적으로 제외된다.
+    """
     source = " ".join(
         [
             article.title,
             article.description,
             *(attachment.filename for attachment in article.attachments),
+            attachment_text,
         ]
     )
-    normalized_source = _normalize_grounding_text(source)
+    normalized_source = normalize_for_match(source)
     valid_evidence = [
         evidence
         for evidence in assessment.evidence
-        if _normalize_grounding_text(evidence) in normalized_source
+        if is_grounded(evidence, normalized_source)
     ]
     uncertainties = list(assessment.uncertainties)
     updates: dict = {
@@ -281,7 +280,7 @@ def validate_assessment_grounding(
     removed_path = False
     for path in assessment.eligibility_paths:
         if all(
-            _normalize_grounding_text(condition.evidence) in normalized_source
+            is_grounded(condition.evidence, normalized_source)
             for condition in path.conditions
         ):
             grounded_paths.append(path)
@@ -298,14 +297,26 @@ def validate_assessment_grounding(
 async def match_articles(
     articles: list[Article],
     config: dict,
+    *,
+    use_ai: bool = True,
 ) -> MatchResult:
-    """모델 추출과 정책 엔진을 결합하고 숨김 결과는 반환하지 않는다."""
+    """모델 추출과 정책 엔진을 결합하고 숨김 결과는 반환하지 않는다.
+
+    ``use_ai=False``는 개인화 프로필을 확보하지 못한 실행에서 사용한다. 이때 모든
+    공지는 보수적 규칙으로 판정되고 ``failed_keys``로 돌려보내져 재분석된다.
+    """
     if not articles:
         return MatchResult([], "none", set(), 0, {})
 
     metrics: dict = {}
-    openai_results = await analyze_with_openai(articles, config, metrics=metrics)
-    failed_keys = {article.key for article in articles if article.key not in openai_results}
+    openai_results: dict[str, AnalysisOutcome] = (
+        await analyze_with_openai(articles, config, metrics=metrics) if use_ai else {}
+    )
+    failed_keys = {
+        article.key
+        for article in articles
+        if article.key not in openai_results or openai_results[article.key].partial
+    }
     used_openai = False
     used_rules = False
     classified: list[ClassifiedNotice] = []
@@ -323,24 +334,20 @@ async def match_articles(
     eligibility_overrides = 0
 
     for article in articles:
-        raw = openai_results.get(article.key)
+        outcome = openai_results.get(article.key)
         source: Literal["openai", "rules"]
-        if raw is None:
+        if outcome is None:
             assessment = keyword_fallback(article, config)
             source = "rules"
             used_rules = True
         else:
-            try:
-                assessment = NoticeAssessment.model_validate(raw)
-                source = "openai"
-                used_openai = True
-            except (TypeError, ValueError) as exc:
-                logger.warning("%s 구조화 결과 검증 실패, 규칙으로 대체: %s", article.key, exc)
-                assessment = keyword_fallback(article, config)
-                source = "rules"
-                used_rules = True
-        if source == "openai":
-            assessment = validate_assessment_grounding(article, assessment)
+            source = "openai"
+            used_openai = True
+            assessment = validate_assessment_grounding(
+                article,
+                outcome.assessment,
+                attachment_text=outcome.attachment_text,
+            )
             before_fit = assessment.audience_fit
             assessment = apply_profile_eligibility(assessment, snapshot)
             if assessment.audience_fit != before_fit:
@@ -374,16 +381,6 @@ async def match_articles(
         reverse=True,
     )
     metrics["openai_result_count"] = len(openai_results)
-    metrics["rule_fallback_count"] = len(failed_keys)
+    metrics["rule_fallback_count"] = len(articles) - len(openai_results)
     metrics["eligibility_override_count"] = eligibility_overrides
     return MatchResult(classified, method, failed_keys, suppressed_count, metrics)
-
-
-__all__ = [
-    "analyze_with_openai",
-    "build_profile_text",
-    "build_prompt",
-    "keyword_fallback",
-    "match_articles",
-    "validate_assessment_grounding",
-]

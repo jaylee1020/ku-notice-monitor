@@ -1,7 +1,7 @@
 """스마트 알림 스케줄 테스트."""
 
 import asyncio
-from datetime import datetime
+from datetime import datetime, timedelta
 from unittest.mock import AsyncMock, patch
 from zoneinfo import ZoneInfo
 
@@ -16,7 +16,8 @@ from ku_notice_monitor.main import (
     _queue_urgent_notifications,
     _validate_feed_health,
 )
-from ku_notice_monitor.state import enqueue_delivery, enqueue_digest
+from ku_notice_monitor.notifier import TelegramDeliveryError, TelegramNotConfiguredError
+from ku_notice_monitor.state import MAX_DELIVERY_ATTEMPTS, enqueue_delivery, enqueue_digest
 
 
 def _config(hour=21):
@@ -216,7 +217,9 @@ def test_multipart_outbox_retries_in_order(tmp_path):
     ) as send:
         first = asyncio.run(_flush_pending_deliveries(state, path))
 
-    assert first == {"sent_parts": 1, "failed_parts": 1, "digest_notices_sent": 0}
+    assert first["sent_parts"] == 1
+    assert first["failed_parts"] == 1
+    assert first["dropped_parts"] == 0
     assert [item["text"] for item in state["pending_deliveries"]] == [
         "둘째 조각",
         "셋째 조각",
@@ -273,3 +276,116 @@ def test_feed_health_accepts_healthy_partial_collection(make_article):
         {"settings": {"min_feed_success_ratio": 0.6}},
     )
     assert ratio == pytest.approx(2 / 3)
+
+
+def _outbox_state(*texts, group="urgent-1"):
+    state = {
+        "seen_ids": {},
+        "article_fingerprints": {},
+        "enriched_fingerprints": {},
+        "pending_digest": [],
+        "pending_deliveries": [],
+        "delivery_history": {},
+        "urgent_notice_history": {},
+        "classification_retries": {},
+    }
+    enqueue_delivery(
+        list(texts),
+        state,
+        kind="urgent",
+        dedup_key=group,
+        metadata={"group_id": group, "notice_tokens": [f"token-{group}"]},
+    )
+    return state
+
+
+def test_permanently_rejected_part_is_dropped_and_rest_is_sent(tmp_path):
+    state = _outbox_state("깨진 조각", "정상 조각")
+    with patch(
+        "ku_notice_monitor.main.send_telegram_part",
+        new_callable=AsyncMock,
+        side_effect=[TelegramDeliveryError("bad request", permanent=True), None],
+    ):
+        result = asyncio.run(_flush_pending_deliveries(state, str(tmp_path / "s.json")))
+
+    assert result["dropped_parts"] == 1
+    assert result["sent_parts"] == 1
+    assert state["pending_deliveries"] == []
+    # 완료로 기록해 같은 공지가 다시 큐에 들어오지 않게 한다.
+    assert "token-urgent-1" in state["urgent_notice_history"]
+
+
+def test_delivery_is_abandoned_after_max_attempts(tmp_path):
+    state = _outbox_state("계속 실패")
+    state["pending_deliveries"][0]["attempts"] = MAX_DELIVERY_ATTEMPTS - 1
+    with patch(
+        "ku_notice_monitor.main.send_telegram_part",
+        new_callable=AsyncMock,
+        side_effect=TelegramDeliveryError("network down"),
+    ):
+        result = asyncio.run(_flush_pending_deliveries(state, str(tmp_path / "s.json")))
+
+    assert result["dropped_parts"] == 1
+    assert state["pending_deliveries"] == []
+
+
+def test_configuration_error_keeps_messages_without_counting_attempts(tmp_path):
+    state = _outbox_state("첫 공지", group="a")
+    enqueue_delivery(["둘째 공지"], state, kind="urgent", dedup_key="b", metadata={"group_id": "b"})
+    with patch(
+        "ku_notice_monitor.main.send_telegram_part",
+        new_callable=AsyncMock,
+        side_effect=TelegramDeliveryError("chat not found", configuration=True),
+    ) as send:
+        result = asyncio.run(_flush_pending_deliveries(state, str(tmp_path / "s.json")))
+
+    send.assert_awaited_once()
+    assert result["configuration_error"]
+    assert [item["attempts"] for item in state["pending_deliveries"]] == [0, 0]
+
+
+def test_missing_credentials_keep_outbox_untouched(tmp_path):
+    state = _outbox_state("보존")
+    with patch(
+        "ku_notice_monitor.main.send_telegram_part",
+        new_callable=AsyncMock,
+        side_effect=TelegramNotConfiguredError("no token"),
+    ):
+        result = asyncio.run(_flush_pending_deliveries(state, str(tmp_path / "s.json")))
+
+    assert result["configuration_error"] is None
+    assert state["pending_deliveries"][0]["attempts"] == 0
+
+
+def test_rate_limit_waits_at_least_retry_after(tmp_path):
+    state = _outbox_state("속도 제한")
+    with patch(
+        "ku_notice_monitor.main.send_telegram_part",
+        new_callable=AsyncMock,
+        side_effect=TelegramDeliveryError("429", retry_after=3600),
+    ):
+        asyncio.run(_flush_pending_deliveries(state, str(tmp_path / "s.json")))
+
+    item = state["pending_deliveries"][0]
+    retry_at = datetime.fromisoformat(item["next_attempt_at"])
+    assert retry_at - datetime.now() > timedelta(minutes=55)
+
+
+def test_long_digest_is_queued_as_self_contained_parts(make_article, make_classified):
+    state = {"pending_digest": []}
+    enqueue_digest(
+        [
+            make_classified(
+                article=make_article(id=str(index), title="공지 " + "가" * 170),
+                summary="요약 " + "나" * 210,
+            )
+            for index in range(1, 25)
+        ],
+        state,
+    )
+    now = datetime(2026, 8, 1, 21, 15, tzinfo=ZoneInfo("Asia/Seoul"))
+    asyncio.run(_flush_digest_if_due(state, _config(), now=now))
+
+    parts = [item["text"] for item in state["pending_deliveries"]]
+    assert len(parts) > 1
+    assert all(part[:4].isdigit() and "관심 공지 24건" in part for part in parts)

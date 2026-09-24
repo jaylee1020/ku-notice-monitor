@@ -49,6 +49,15 @@ def _normalize_exact_date(value: str) -> str | None:
     return parsed.isoformat() if parsed.isoformat() == candidate else None
 
 
+def _require_calendar_date(value: str) -> str:
+    """패턴은 맞지만 존재하지 않는 날짜(예: 2월 30일)를 거부한다."""
+    try:
+        parsed = date.fromisoformat(value)
+    except ValueError:
+        raise ValueError("date must be a real calendar date in YYYY-MM-DD") from None
+    return parsed.isoformat()
+
+
 class NoticeCategory(StrEnum):
     ACADEMIC = "academic"
     TUITION = "tuition"
@@ -145,13 +154,7 @@ class NoticeDate(BaseModel):
     @field_validator("date")
     @classmethod
     def validate_date(cls, value: str) -> str:
-        try:
-            parsed = date.fromisoformat(value)
-        except ValueError:
-            raise ValueError("date must use YYYY-MM-DD")
-        if parsed.isoformat() != value:
-            raise ValueError("date must use YYYY-MM-DD")
-        return parsed.isoformat()
+        return _require_calendar_date(value)
 
 
 class NoticeAction(BaseModel):
@@ -162,15 +165,7 @@ class NoticeAction(BaseModel):
     @field_validator("deadline")
     @classmethod
     def validate_deadline(cls, value: str | None) -> str | None:
-        if value is None:
-            return None
-        try:
-            parsed = date.fromisoformat(value)
-        except ValueError:
-            raise ValueError("deadline must use YYYY-MM-DD")
-        if parsed.isoformat() != value:
-            raise ValueError("deadline must use YYYY-MM-DD")
-        return parsed.isoformat()
+        return None if value is None else _require_calendar_date(value)
 
 
 class NoticeAssessment(BaseModel):

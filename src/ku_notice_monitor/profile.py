@@ -1,16 +1,10 @@
 """자연어 프로필을 최소화된 구조화 사실로 변환한다."""
 
-import asyncio
 import hashlib
 import json
 import logging
-import os
-import re
-from typing import Any
 
-from openai import AsyncOpenAI
-from tenacity import retry, retry_if_exception, stop_after_attempt, wait_exponential
-
+from .llm import make_client, openai_configured, parse_structured
 from .profile_models import (
     FactCertainty,
     PreferenceKind,
@@ -19,6 +13,7 @@ from .profile_models import (
     ProfilePreference,
     ProfileSnapshot,
 )
+from .util import is_grounded, normalize_for_match
 
 logger = logging.getLogger(__name__)
 
@@ -70,22 +65,18 @@ def profile_document_fingerprint(config: dict) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
-def _normalize_grounding_text(value: str) -> str:
-    return re.sub(r"[^0-9a-z가-힣]+", "", value.lower())
-
-
 def _ground_snapshot(document: str, snapshot: ProfileSnapshot) -> ProfileSnapshot:
     """원문에서 직접 확인되지 않는 모델 추출값을 제거한다."""
-    normalized_document = _normalize_grounding_text(document)
+    normalized_document = normalize_for_match(document)
     facts = [
         fact
         for fact in snapshot.facts
-        if _normalize_grounding_text(fact.source_quote) in normalized_document
+        if is_grounded(fact.source_quote, normalized_document)
     ]
     preferences = [
         preference
         for preference in snapshot.preferences
-        if _normalize_grounding_text(preference.source_quote) in normalized_document
+        if is_grounded(preference.source_quote, normalized_document)
     ]
     dropped = (
         len(snapshot.facts) - len(facts)
@@ -138,58 +129,16 @@ def legacy_profile_snapshot(config: dict) -> ProfileSnapshot:
     return ProfileSnapshot(summary=summary, facts=facts, preferences=preferences)
 
 
-def _is_retryable_profile_error(exc: BaseException) -> bool:
-    if isinstance(exc, (asyncio.TimeoutError, TimeoutError, ConnectionError)):
-        return True
-    if isinstance(exc, (ValueError, TypeError, KeyError)):
-        return False
-    status = getattr(exc, "status_code", None)
-    return isinstance(status, int) and (status == 429 or 500 <= status < 600)
-
-
-@retry(
-    retry=retry_if_exception(_is_retryable_profile_error),
-    stop=stop_after_attempt(3),
-    wait=wait_exponential(multiplier=1, min=2, max=16),
-    reraise=True,
-)
-async def _parse_profile_document(
-    client: AsyncOpenAI,
-    *,
-    document: str,
-    model_name: str,
-    reasoning_effort: str,
-) -> tuple[ProfileSnapshot, Any]:
-    reasoning: Any = {"effort": reasoning_effort}
-    response = await client.responses.parse(
-        model=model_name,
-        input=[
-            {"role": "system", "content": PROFILE_SYSTEM_PROMPT},
-            {
-                "role": "user",
-                "content": (
-                    "<profile_document>\n"
-                    + document
-                    + "\n</profile_document>\n"
-                    "이 문서 하나에서 프로필을 추출하세요."
-                ),
-            },
-        ],
-        reasoning=reasoning,
-        text_format=ProfileSnapshot,
-        store=False,
-    )
-    if response.output_parsed is None:
-        raise ProfileResolutionError("OpenAI 응답에 구조화된 프로필이 없습니다.")
-    return response.output_parsed, response
-
-
 async def resolve_profile_snapshot(
     config: dict,
     *,
     metrics: dict | None = None,
 ) -> ProfileSnapshot:
-    """자연어 문서를 실행 메모리에서만 구조화하고 원문 근거를 검증한다."""
+    """자연어 문서를 실행 메모리에서만 구조화하고 원문 근거를 검증한다.
+
+    ``ProfileResolutionError``가 발생하면 호출자는 개인화 판정을 신뢰할 수 없으므로
+    공지를 확정 판정하지 말고 재시도 대상으로 남겨야 한다.
+    """
     document = str(config.get("profile_text", "")).strip()
     if not document:
         snapshot = legacy_profile_snapshot(config)
@@ -205,31 +154,36 @@ async def resolve_profile_snapshot(
             )
         return snapshot
 
-    if not os.environ.get("OPENAI_API_KEY"):
+    if not openai_configured():
         raise ProfileResolutionError(
             "PROFILE_TEXT를 구조화할 OPENAI_API_KEY가 설정되지 않았습니다."
         )
 
-    client = AsyncOpenAI(
-        api_key=os.environ["OPENAI_API_KEY"],
-        timeout=config["ai"].get("request_timeout_seconds", 45),
-        max_retries=0,
-    )
+    usage: dict = {}
+    client = make_client(config)
     try:
-        snapshot, response = await _parse_profile_document(
+        snapshot = await parse_structured(
             client,
-            document=document,
-            model_name=config["ai"]["model"],
-            reasoning_effort=config["ai"].get("reasoning_effort", "medium"),
+            config=config,
+            system_prompt=PROFILE_SYSTEM_PROMPT,
+            user_content=(
+                "<profile_document>\n"
+                + document
+                + "\n</profile_document>\n"
+                "이 문서 하나에서 프로필을 추출하세요."
+            ),
+            output_type=ProfileSnapshot,
+            cache_key=f"ku-profile:{PROFILE_PROMPT_VERSION}",
+            metrics=usage,
         )
     except Exception as exc:
         raise ProfileResolutionError(
             f"자연어 프로필을 안전하게 구조화하지 못했습니다: {exc}"
         ) from exc
+    finally:
+        await client.close()
 
     grounded = _ground_snapshot(document, snapshot)
-    usage = getattr(response, "usage", None)
-    total_tokens = getattr(usage, "total_tokens", 0) or 0
     if metrics is not None:
         metrics.update(
             {
@@ -237,12 +191,9 @@ async def resolve_profile_snapshot(
                 "prompt_version": PROFILE_PROMPT_VERSION,
                 "fact_count": len(grounded.facts),
                 "preference_count": len(grounded.preferences),
-                "total_tokens": total_tokens,
+                "total_tokens": usage.get("total_tokens", 0),
             }
         )
-    request_id = getattr(response, "_request_id", None)
-    if request_id:
-        logger.info("프로필 구조화 OpenAI request_id=%s", request_id)
     logger.info(
         "자연어 프로필 구조화 완료: 사실 %d개, 선호 %d개",
         len(grounded.facts),

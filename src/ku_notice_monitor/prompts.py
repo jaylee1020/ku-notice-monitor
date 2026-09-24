@@ -1,14 +1,12 @@
 """사실 추출과 개인화 판정을 분리해 유도하는 공지 분석 프롬프트."""
 
 import re
-from datetime import datetime
-from zoneinfo import ZoneInfo
 
 from .constants import PROMPT_DESCRIPTION_MAX_LENGTH
 from .models import Article
 from .profile_models import ProfileSnapshot
+from .util import now_kst
 
-_KST = ZoneInfo("Asia/Seoul")
 PROMPT_VERSION = "2026-08-03-grounded-v4"
 
 SYSTEM_PROMPT = """당신은 한국 대학 공지에서 검증 가능한 사실을 추출하는 분석기입니다.
@@ -125,7 +123,7 @@ def build_prompt(
     unreadable_attachments: list[str] | None = None,
 ) -> str:
     """공지 하나를 독립적으로 분석하는 입력을 만든다."""
-    today = datetime.now(_KST).date().isoformat()
+    today = now_kst().date().isoformat()
     description = select_relevant_excerpt(article.description) or "본문 없음"
     attachments = ", ".join(att.filename for att in article.attachments) or "없음"
     media_note = (

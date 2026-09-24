@@ -73,8 +73,5 @@ MAX_CONCURRENT_ATTACHMENT_DOWNLOADS = 5
 # 수백 건이 동시에 요청되는 것을 막는다.
 MAX_CONCURRENT_BODY_FETCHES = 8
 
-# 공지별 독립 분석 동시성. 한 공지 실패가 다른 공지 판정을 오염시키지 않게 한다.
-AI_MAX_CONCURRENCY = 4
-
 # 텔레그램
 MAX_TELEGRAM_MESSAGE_LENGTH = 4096

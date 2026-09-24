@@ -34,8 +34,7 @@ def extract_hwp_markdown(data: bytes, extension: str, timeout: int = 20) -> str:
                 [sys.executable, "-m", "syhwp", str(source)],
                 cwd=temp_dir,
                 check=False,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
+                capture_output=True,
                 timeout=timeout,
             )
         except subprocess.TimeoutExpired as exc:
@@ -71,8 +70,7 @@ def extract_pdf_markdown(data: bytes, timeout: int = 20) -> str | None:
                 ],
                 cwd=temp_dir,
                 check=False,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
+                capture_output=True,
                 timeout=timeout,
             )
         except subprocess.TimeoutExpired as exc:

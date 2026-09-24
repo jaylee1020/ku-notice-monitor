@@ -11,3 +11,5 @@ search_state.json
 .coverage
 htmlcov/
 *.egg-info/
+# 런타임 상태는 monitor-state 브랜치에만 저장한다.
+state.json

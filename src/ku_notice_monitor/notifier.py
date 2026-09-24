@@ -1,45 +1,52 @@
-"""텔레그램 봇 알림 모듈"""
+"""텔레그램 메시지 구성과 전송."""
 
 import logging
 import os
 import re
-from dataclasses import dataclass
-from datetime import date, datetime
-from html import escape
-from zoneinfo import ZoneInfo
+from datetime import date
+from html import escape, unescape
 
-from telegram import Bot
+import aiohttp
 
 from .constants import MAX_TELEGRAM_MESSAGE_LENGTH
 from .models import ClassifiedNotice
+from .util import now_kst
 
 logger = logging.getLogger(__name__)
 
-# GitHub Actions 러너는 UTC이므로, 사용자에게 보이는 날짜/시각은 KST로 표기한다.
-_KST = ZoneInfo("Asia/Seoul")
 _ITEM_SEPARATOR = "\n\n"
+_TELEGRAM_API = "https://api.telegram.org"
+_TELEGRAM_TIMEOUT_SECONDS = 20
+_CONFIGURATION_ERROR_HINTS = ("chat not found", "bot was blocked", "not enough rights")
 
 
 class TelegramDeliveryError(RuntimeError):
-    """텔레그램 메시지가 완전히 전송되지 않았을 때 발생한다."""
+    """텔레그램 메시지가 전송되지 않았을 때 발생한다.
+
+    - ``permanent``: 메시지 자체의 문제라 같은 내용을 다시 보내도 실패한다.
+    - ``configuration``: 토큰·채팅 설정 문제라 메시지를 보존하고 설정을 고쳐야 한다.
+    - ``retry_after``: 텔레그램이 요구한 최소 대기 시간(초).
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        permanent: bool = False,
+        configuration: bool = False,
+        retry_after: int | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.permanent = permanent
+        self.configuration = configuration
+        self.retry_after = retry_after
 
 
 class TelegramNotConfiguredError(TelegramDeliveryError):
     """텔레그램 자격 증명이 없을 때 발생한다."""
 
-
-@dataclass(frozen=True)
-class DeliveryResult:
-    sent_parts: int
-    total_parts: int
-
-    @property
-    def complete(self) -> bool:
-        return self.sent_parts == self.total_parts
-
-
-def _now_kst() -> datetime:
-    return datetime.now(_KST)
+    def __init__(self, message: str) -> None:
+        super().__init__(message, configuration=True)
 
 
 def _compact(value: str, limit: int) -> str:
@@ -61,27 +68,21 @@ def _deadline_label(deadline: str | None) -> str | None:
         deadline_date = date.fromisoformat(deadline)
     except ValueError:
         return deadline
-    days = (deadline_date - _now_kst().date()).days
+    today = now_kst().date()
+    days = (deadline_date - today).days
     if days == 0:
         relative = "D-DAY"
     elif days > 0:
         relative = f"D-{days}"
     else:
         relative = f"D+{abs(days)}"
-    if deadline_date.year == _now_kst().year:
+    if deadline_date.year == today.year:
         displayed = f"{deadline_date.month}월 {deadline_date.day}일"
     else:
         displayed = (
             f"{deadline_date.year}년 {deadline_date.month}월 {deadline_date.day}일"
         )
     return f"{displayed} ({relative})"
-
-
-def _build_items(matched: list[ClassifiedNotice]) -> str:
-    return _ITEM_SEPARATOR.join(
-        _build_item(match, index)
-        for index, match in enumerate(matched, 1)
-    )
 
 
 def _build_item(match: ClassifiedNotice, index: int) -> str:
@@ -114,82 +115,67 @@ def _build_item(match: ClassifiedNotice, index: int) -> str:
     return "\n".join(lines)
 
 
-def build_urgent_message(matched: list[ClassifiedNotice], total_new: int) -> str:
-    today = _now_kst().strftime("%Y-%m-%d")
-    header = f"{today} 새 공지 {total_new}건 중 관련 {len(matched)}건"
-    return header + "\n\n" + _build_items(matched)
+def _paginate(header: str, matched: list[ClassifiedNotice]) -> list[str]:
+    """공지 경계에서 메시지를 나누고 각 조각에 헤더를 유지한다."""
+    parts: list[str] = []
+    current_items: list[str] = []
+
+    def flush() -> None:
+        if current_items:
+            parts.append(header + "\n\n" + _ITEM_SEPARATOR.join(current_items))
+            current_items.clear()
+
+    for index, match in enumerate(matched, 1):
+        item = _build_item(match, index)
+        candidate = header + "\n\n" + _ITEM_SEPARATOR.join([*current_items, item])
+        if len(candidate) <= MAX_TELEGRAM_MESSAGE_LENGTH:
+            current_items.append(item)
+            continue
+        flush()
+        if len(header) + 2 + len(item) <= MAX_TELEGRAM_MESSAGE_LENGTH:
+            current_items.append(item)
+            continue
+        # 정상 공지는 한 항목이 제한을 넘지 않지만 비정상적으로 긴 URL도 안전하게 처리한다.
+        body_limit = MAX_TELEGRAM_MESSAGE_LENGTH - len(header) - 2
+        parts.extend(header + "\n\n" + body for body in _split_text(item, body_limit))
+    flush()
+    return parts
 
 
 def build_urgent_messages(
     matched: list[ClassifiedNotice],
     total_new: int,
 ) -> list[str]:
-    """긴 즉시 알림을 공지 경계에서 나누고 각 조각에 헤더를 유지한다."""
-    today = _now_kst().strftime("%Y-%m-%d")
-    header = f"{today} 새 공지 {total_new}건 중 관련 {len(matched)}건"
-    parts: list[str] = []
-    current_items: list[str] = []
-
-    for index, match in enumerate(matched, 1):
-        item = _build_item(match, index)
-        candidate_items = [*current_items, item]
-        candidate = header + "\n\n" + _ITEM_SEPARATOR.join(candidate_items)
-        if len(candidate) <= MAX_TELEGRAM_MESSAGE_LENGTH:
-            current_items = candidate_items
-            continue
-
-        if current_items:
-            parts.append(header + "\n\n" + _ITEM_SEPARATOR.join(current_items))
-            current_items = []
-
-        single = header + "\n\n" + item
-        if len(single) > MAX_TELEGRAM_MESSAGE_LENGTH:
-            # 정상 공지는 한 항목이 제한을 넘지 않지만 비정상적으로 긴 URL도 안전하게 처리한다.
-            body_limit = MAX_TELEGRAM_MESSAGE_LENGTH - len(header) - 2
-            for body in _split_text(item, body_limit):
-                parts.append(header + "\n\n" + body)
-        else:
-            current_items = [item]
-
-    if current_items:
-        parts.append(header + "\n\n" + _ITEM_SEPARATOR.join(current_items))
-    return parts
+    today = now_kst().strftime("%Y-%m-%d")
+    return _paginate(f"{today} 새 공지 {total_new}건 중 관련 {len(matched)}건", matched)
 
 
-def build_digest_message(matched: list[ClassifiedNotice]) -> str:
-    today = _now_kst().strftime("%Y-%m-%d")
-    header = f"{today} 관심 공지 {len(matched)}건"
-    return header + "\n\n" + _build_items(matched)
-
-
-def build_relevant_message(matched: list[ClassifiedNotice], total_new: int) -> str:
-    """기존 호출부 호환용: 관련 공지를 일반 요약 형태로 생성한다."""
-    today = _now_kst().strftime("%Y-%m-%d")
-    header = f"{today} 새 공지 {total_new}건 중 관련 {len(matched)}건"
-    return header + "\n\n" + _build_items(matched)
+def build_digest_messages(matched: list[ClassifiedNotice]) -> list[str]:
+    today = now_kst().strftime("%Y-%m-%d")
+    return _paginate(f"{today} 관심 공지 {len(matched)}건", matched)
 
 
 def build_no_new_message() -> str:
     """새 공지가 없을 때 메시지"""
-    today = _now_kst().strftime("%Y-%m-%d")
+    today = now_kst().strftime("%Y-%m-%d")
     return f"{today} 새로운 공지가 없습니다."
 
 
 def build_no_relevant_message(total_new: int) -> str:
     """새 공지는 있지만 관련 공지가 없을 때 메시지"""
-    today = _now_kst().strftime("%Y-%m-%d")
+    today = now_kst().strftime("%Y-%m-%d")
     return f"{today} 새 공지 {total_new}건 확인, 관련 공지 없음"
 
 
 def build_error_message(error_detail: str) -> str:
     """워크플로우 오류 알림 메시지"""
-    today = _now_kst().strftime("%Y-%m-%d %H:%M")
+    today = now_kst().strftime("%Y-%m-%d %H:%M")
     return f"[오류] {today} 모니터링 실패\n{_html(error_detail, 1000)}"
 
 
 def build_first_run_message(seeded_count: int) -> str:
     """최초 실행 시드 처리 안내 메시지"""
-    today = _now_kst().strftime("%Y-%m-%d")
+    today = now_kst().strftime("%Y-%m-%d")
     return (
         f"{today} 모니터링을 시작합니다.\n"
         f"기존 공지 {seeded_count}건은 '확인함'으로 처리했으며, "
@@ -244,76 +230,107 @@ def _telegram_credentials() -> tuple[str, str]:
     return token, chat_id
 
 
-async def send_telegram_part(text: str) -> None:
-    """이미 분할된 텔레그램 메시지 한 조각을 전송한다."""
-    if len(text) > MAX_TELEGRAM_MESSAGE_LENGTH:
-        raise ValueError("텔레그램 메시지 한 조각이 길이 제한을 초과했습니다.")
-    token, chat_id = _telegram_credentials()
-    bot = Bot(token=token)
-    await bot.send_message(
-        chat_id=chat_id,
-        text=text,
-        parse_mode="HTML",
-        disable_web_page_preview=True,
+def html_to_plain_text(text: str) -> str:
+    """HTML 파싱이 거부된 메시지를 서식 없이라도 전달하기 위한 변환."""
+    return unescape(re.sub(r"<[^>]+>", "", text))
+
+
+def _error_from_response(status: int, payload: dict) -> TelegramDeliveryError:
+    description = str(payload.get("description") or f"HTTP {status}")
+    code = int(payload.get("error_code") or status)
+    parameters = payload.get("parameters") or {}
+    if code == 429:
+        retry_after = parameters.get("retry_after")
+        return TelegramDeliveryError(
+            f"텔레그램 전송 속도 제한: {description}",
+            retry_after=int(retry_after) if isinstance(retry_after, int) else None,
+        )
+    lowered = description.lower()
+    configuration = code in {401, 403, 404} or any(
+        hint in lowered for hint in _CONFIGURATION_ERROR_HINTS
+    )
+    return TelegramDeliveryError(
+        f"텔레그램 API 오류 {code}: {description}",
+        permanent=code == 400 and not configuration,
+        configuration=configuration,
     )
 
 
-async def send_telegram(text: str) -> DeliveryResult:
-    """모든 조각의 전송 성공을 보장하며, 일부 실패도 호출자에게 알린다."""
-    parts = split_message(text)
-    sent = 0
-    for i, msg in enumerate(parts, 1):
-        try:
-            await send_telegram_part(msg)
-            sent += 1
-        except Exception as e:
-            logger.error("텔레그램 메시지 전송 실패 (%d/%d): %s", i, len(parts), e)
-            raise TelegramDeliveryError(
-                f"텔레그램 메시지 전송 실패 ({sent}/{len(parts)}개 완료): {e}"
-            ) from e
-    logger.info("텔레그램 메시지 전송 완료 (%d/%d개 전송)", sent, len(parts))
-    return DeliveryResult(sent_parts=sent, total_parts=len(parts))
-
-
-async def notify_relevant(
-    matched: list[ClassifiedNotice],
-    total_new: int,
+async def _post_message(
+    session: aiohttp.ClientSession,
+    token: str,
+    chat_id: str,
+    text: str,
+    *,
+    html: bool,
 ) -> None:
-    """기존 호출부 호환용 관련 공지 전송."""
-    await notify_digest(matched)
-
-
-async def notify_urgent(matched: list[ClassifiedNotice], total_new: int) -> None:
-    await send_telegram(build_urgent_message(matched, total_new))
-
-
-async def notify_digest(matched: list[ClassifiedNotice]) -> None:
-    await send_telegram(build_digest_message(matched))
-
-
-async def notify_no_new() -> None:
-    """새 공지 없음 알림"""
-    text = build_no_new_message()
-    await send_telegram(text)
-
-
-async def notify_no_relevant(total_new: int) -> None:
-    """새 공지는 있지만 관련 공지 없음 알림"""
-    text = build_no_relevant_message(total_new)
-    await send_telegram(text)
-
-
-async def notify_error(error_detail: str) -> DeliveryResult | None:
-    """워크플로우 오류 발생 시 텔레그램으로 알림"""
-    text = build_error_message(error_detail)
+    payload: dict = {
+        "chat_id": chat_id,
+        "text": text,
+        "link_preview_options": {"is_disabled": True},
+    }
+    if html:
+        payload["parse_mode"] = "HTML"
     try:
-        return await send_telegram(text)
+        async with session.post(
+            f"{_TELEGRAM_API}/bot{token}/sendMessage",
+            json=payload,
+        ) as response:
+            try:
+                body = await response.json(content_type=None)
+            except ValueError:
+                body = {}
+            if response.status == 200 and isinstance(body, dict) and body.get("ok"):
+                return
+            raise _error_from_response(response.status, body if isinstance(body, dict) else {})
+    except TelegramDeliveryError:
+        raise
+    except (aiohttp.ClientError, TimeoutError) as exc:
+        # 토큰이 포함된 URL이 로그에 남지 않도록 예외 종류만 전달한다.
+        raise TelegramDeliveryError(f"텔레그램 연결 실패: {type(exc).__name__}") from None
+
+
+async def send_telegram_part(text: str) -> None:
+    """이미 분할된 텔레그램 메시지 한 조각을 전송한다.
+
+    텔레그램이 HTML 서식을 거부하면 같은 내용을 일반 텍스트로 한 번 더 보낸다.
+    """
+    if len(text) > MAX_TELEGRAM_MESSAGE_LENGTH:
+        raise TelegramDeliveryError(
+            "텔레그램 메시지 한 조각이 길이 제한을 초과했습니다.",
+            permanent=True,
+        )
+    token, chat_id = _telegram_credentials()
+    timeout = aiohttp.ClientTimeout(total=_TELEGRAM_TIMEOUT_SECONDS)
+    async with aiohttp.ClientSession(timeout=timeout, trust_env=True) as session:
+        try:
+            await _post_message(session, token, chat_id, text, html=True)
+        except TelegramDeliveryError as exc:
+            if not (exc.permanent and "parse entities" in str(exc)):
+                raise
+            logger.warning("텔레그램이 HTML 서식을 거부해 일반 텍스트로 다시 보냅니다: %s", exc)
+            await _post_message(session, token, chat_id, html_to_plain_text(text), html=False)
+
+
+async def send_telegram(text: str) -> int:
+    """긴 메시지를 나누어 모두 보내고 전송한 조각 수를 반환한다."""
+    parts = split_message(text)
+    for index, part in enumerate(parts, 1):
+        try:
+            await send_telegram_part(part)
+        except TelegramDeliveryError as exc:
+            raise TelegramDeliveryError(
+                f"텔레그램 메시지 전송 실패 ({index - 1}/{len(parts)}개 완료): {exc}",
+                permanent=exc.permanent,
+                configuration=exc.configuration,
+                retry_after=exc.retry_after,
+            ) from exc
+    return len(parts)
+
+
+async def notify_error(error_detail: str) -> None:
+    """실행 실패를 outbox를 거치지 않고 즉시 알린다. 알림 실패는 로그만 남긴다."""
+    try:
+        await send_telegram(build_error_message(error_detail))
     except TelegramDeliveryError as exc:
         logger.error("오류 알림도 전송하지 못했습니다: %s", exc)
-        return None
-
-
-async def notify_first_run(seeded_count: int) -> None:
-    """최초 실행 시 기존 공지를 시드 처리했음을 한 건의 메시지로 알림"""
-    text = build_first_run_message(seeded_count)
-    await send_telegram(text)
