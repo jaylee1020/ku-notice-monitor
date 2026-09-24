@@ -90,6 +90,10 @@ def inspect_article(url: str) -> str:
     )[:15]
     lines.append("  텍스트가 긴 요소:")
     lines.extend(f"    {length}자 <{name} class='{cls}' id='{ident}'>" for length, name, cls, ident in candidates)
+    for selector in (".view-file", ".view-con"):
+        node = soup.select_one(selector)
+        if node is not None:
+            lines.append(f"  {selector} HTML: " + str(node)[:1500].replace("\n", " "))
     body = soup.body.get_text(" ", strip=True) if soup.body else html
     lines.append("  본문 앞부분: " + body[:600])
     for script in soup.find_all("script", src=False)[:8]:

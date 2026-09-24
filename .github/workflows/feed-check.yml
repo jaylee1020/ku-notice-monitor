@@ -46,7 +46,7 @@ jobs:
         env:
           URLS: ${{ inputs.urls }}
           SCAN: ${{ inputs.scan_konkuk }}
-          INSPECT: ${{ inputs.inspect || (github.event_name == 'push' && 'https://www.konkuk.ac.kr/bbs/konkuk/235/1206094/artclView.do https://www.konkuk.ac.kr/bbs/konkuk/234/1208081/artclView.do?layout=unknown https://kuinc.konkuk.ac.kr/bbs/job/4083/1208362/artclView.do https://cse.konkuk.ac.kr/bbs/cse/775/1208215/artclView.do') || '' }}
+          INSPECT: ${{ inputs.inspect || (github.event_name == 'push' && 'https://www.konkuk.ac.kr/bbs/konkuk/235/1206094/artclView.do https://www.konkuk.ac.kr/bbs/konkuk/235/1208222/artclView.do') || '' }}
         run: |
           if [ -n "$INSPECT" ]; then
             inspect_args=()
