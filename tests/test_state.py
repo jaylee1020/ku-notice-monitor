@@ -240,3 +240,38 @@ def test_seed_new_boards_does_nothing_without_history(make_article):
     assert seed_new_boards([article], {775}, state) == {}
     assert article.key not in state["seen_ids"]
     assert state["known_boards"] == [775]
+
+
+# --- 게시판 간 중복 ---
+
+
+def test_cross_board_duplicate_in_same_run_is_dropped(make_article):
+    from ku_notice_monitor.state import drop_cross_board_duplicates
+
+    main = make_article(id="1", board_id=238, title="[융합혁신교육센터] 교육만족도 조사 안내")
+    dept = make_article(id="2", board_id=775, title="교육만족도 조사 안내")
+    other = make_article(id="3", board_id=775, title="중간 강의평가 시행 안내")
+    state: dict = {}
+    kept = drop_cross_board_duplicates([main, dept, other], state)
+    assert kept == [main, other]
+
+
+def test_repost_of_previously_seen_notice_is_dropped(make_article):
+    from ku_notice_monitor.state import drop_cross_board_duplicates
+
+    seen = make_article(id="1", board_id=234, title="2학기 최종마감등록 안내")
+    state: dict = {}
+    assert drop_cross_board_duplicates([], state, current_articles=[seen]) == []
+    repost = make_article(id="9", board_id=775, title="2학기 최종마감등록 안내")
+    assert drop_cross_board_duplicates([repost], state, current_articles=[seen, repost]) == []
+
+
+def test_same_board_repost_and_updates_are_kept(make_article):
+    from ku_notice_monitor.state import drop_cross_board_duplicates
+
+    first = make_article(id="1", board_id=234, title="수강신청 안내")
+    state: dict = {}
+    drop_cross_board_duplicates([first], state)
+    again = make_article(id="2", board_id=234, title="수강신청 안내")
+    updated = make_article(id="3", board_id=775, title="수강신청 안내", is_update=True)
+    assert drop_cross_board_duplicates([again, updated], state) == [again, updated]

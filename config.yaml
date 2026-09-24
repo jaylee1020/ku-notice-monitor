@@ -33,9 +33,10 @@ feeds:
   장학공지:
     id: 235
     enabled: true
+  # 2026-09 점검 결과 글이 0건인 빈 게시판. 취업 공지는 대학일자리플러스(4083)로 옮겨졌다.
   취창업공지:
     id: 236
-    enabled: true
+    enabled: false
   국제교류:
     id: 237
     enabled: true
@@ -59,6 +60,13 @@ feeds:
     id: 4083
     enabled: true
     rss_url: "https://kuinc.konkuk.ac.kr/bbs/job/4083/rssList.do"
+  # 학과 공지. 대학 공지와 겹치는 글은 제목 기준으로 한 번만 분석한다.
+  # 다른 학과라면 학과 홈페이지 공지 글 주소(/bbs/{사이트}/{게시판ID}/...)에서
+  # 사이트와 게시판 ID를 찾아 바꾸고 scripts/check_feeds.py로 확인하세요.
+  컴퓨터공학부:
+    id: 775
+    enabled: true
+    rss_url: "https://cse.konkuk.ac.kr/bbs/cse/775/rssList.do"
 
 # === AI 분석 설정 ===
 ai:

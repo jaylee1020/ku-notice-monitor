@@ -12,9 +12,6 @@ on:
         description: 'www.konkuk.ac.kr 게시판 ID 범위 (예: 230-260)'
         required: false
         default: ''
-  push:
-    branches: [claude/notification-readability-fixes-cfuv7u]
-    paths: [.github/workflows/feed-check.yml, scripts/check_feeds.py]
 
 permissions:
   contents: read
@@ -39,8 +36,8 @@ jobs:
 
       - name: Check feeds
         env:
-          URLS: ${{ inputs.urls || 'https://cse.konkuk.ac.kr/bbs/cse/775/rssList.do https://www.konkuk.ac.kr/bbs/cse/775/rssList.do https://job.konkuk.ac.kr/bbs/job/4083/rssList.do https://www.konkuk.ac.kr/bbs/job/4083/rssList.do' }}
-          SCAN: ${{ inputs.scan_konkuk || '225-260' }}
+          URLS: ${{ inputs.urls }}
+          SCAN: ${{ inputs.scan_konkuk }}
         run: |
           args=()
           [ -n "$SCAN" ] && args+=(--scan-konkuk "$SCAN")

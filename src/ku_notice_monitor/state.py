@@ -357,6 +357,62 @@ def seed_new_boards(
     return seeded
 
 
+TITLE_RETENTION_DAYS = 30
+
+
+_LEADING_TAGS = re.compile(r"^(?:\s*[\[【(<][^\]】)>]{1,30}[\]】)>])+")
+
+
+def _title_key(article: Article) -> str:
+    """앞쪽 말머리([학사], [대학일자리+] 등)·공백·구두점 차이를 무시한 제목 해시."""
+    title = _LEADING_TAGS.sub("", article.title) or article.title
+    normalized = re.sub(r"[^0-9a-z가-힣]+", "", title.lower())
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:24]
+
+
+def drop_cross_board_duplicates(
+    articles: list[Article],
+    state: dict,
+    *,
+    current_articles: list[Article] | None = None,
+) -> list[Article]:
+    """여러 게시판에 같은 제목으로 다시 올라온 공지를 한 번만 분석한다.
+
+    학과 게시판은 대학 전체 공지를 그대로 옮겨 오는 경우가 많다. 이번 실행 안에서
+    같은 제목이 겹치거나, 최근 다른 게시판에서 이미 본 제목이면 제외한다.
+    수정 공지는 원래 게시판에서 계속 추적해야 하므로 제외하지 않는다.
+    """
+    cutoff = (datetime.now() - timedelta(days=TITLE_RETENTION_DAYS)).isoformat()
+    recent = {
+        key: value
+        for key, value in state.get("recent_titles", {}).items()
+        if isinstance(value, dict) and str(value.get("at", "")) > cutoff
+    }
+    now = datetime.now().isoformat()
+    candidate_keys = {article.key for article in articles}
+    # 이미 확인한 공지의 제목도 기억해 두어야 며칠 뒤 다른 게시판에 옮겨진 글을 거른다.
+    for article in current_articles or []:
+        if article.key not in candidate_keys:
+            recent.setdefault(_title_key(article), {"board": article.board_id, "at": now})
+    kept: list[Article] = []
+    seen_now: dict[str, int] = {}
+    for article in articles:
+        if article.is_update:
+            kept.append(article)
+            continue
+        key = _title_key(article)
+        previous = recent.get(key)
+        if key in seen_now or (previous and previous.get("board") != article.board_id):
+            logger.info("다른 게시판과 중복된 공지를 건너뜁니다: [%s] %s", article.board_name, article.title)
+            continue
+        seen_now[key] = article.board_id
+        kept.append(article)
+    for key, board_id in seen_now.items():
+        recent[key] = {"board": board_id, "at": now}
+    state["recent_titles"] = recent
+    return kept
+
+
 def enqueue_digest(matches: list[ClassifiedNotice], state: dict) -> None:
     """일반 공지를 다음 일일 요약까지 중복 없이 보관한다."""
     pending: dict[str, dict] = {}

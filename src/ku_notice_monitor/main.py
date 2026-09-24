@@ -57,6 +57,7 @@ from .state import (
     clear_classification_retry,
     clear_pending_digest,
     complete_delivery,
+    drop_cross_board_duplicates,
     drop_delivery,
     due_classification_retry_keys,
     due_deliveries,
@@ -798,6 +799,11 @@ async def run() -> None:
         source_fingerprints=source_fingerprints,
         enriched_fingerprints=enriched_fingerprints,
     )
+    unique_articles = drop_cross_board_duplicates(
+        new_articles, state, current_articles=all_articles
+    )
+    stats["duplicate_articles"] = len(new_articles) - len(unique_articles)
+    new_articles = unique_articles
     stats["new_articles"] = len(new_articles)
     stats["updated_articles"] = sum(article.is_update for article in new_articles)
     max_new = config["settings"].get("max_new_articles_per_run", 60)
