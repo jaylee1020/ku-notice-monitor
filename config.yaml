@@ -48,9 +48,10 @@ feeds:
   일반공지:
     id: 240
     enabled: true
+  # 교직원(계약직·행정직) 채용 게시판이라 학생 알림 대상이 아니다.
   채용공지:
     id: 243
-    enabled: true
+    enabled: false
   학사서식공지:
     id: 247
     enabled: true
