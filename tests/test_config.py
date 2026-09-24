@@ -49,7 +49,7 @@ def _make_valid_config():
         "keywords": {},
         "feeds": {"테스트": {"id": 234, "enabled": True}},
         "ai": {
-            "model": "gpt-5.6-luna",
+            "model": "gpt-6-luna",
             "reasoning_effort": "medium",
             "max_concurrency": 4,
             "request_timeout_seconds": 45,
@@ -72,7 +72,7 @@ def test_validate_config_valid():
 
 
 def test_ai_config_defaults_to_medium_reasoning():
-    assert AIConfig(model="gpt-5.6-luna").reasoning_effort == "medium"
+    assert AIConfig(model="gpt-6-luna").reasoning_effort == "medium"
 
 
 def test_validate_config_missing_section():
@@ -202,7 +202,7 @@ def test_validate_config_rejects_unknown_keys():
 
 def test_validate_config_returns_typed_config():
     config = validate_config(_make_valid_config())
-    assert config.ai.model == "gpt-5.6-luna"
+    assert config.ai.model == "gpt-6-luna"
     assert config.settings.detail_refresh_days == 14
 
 
