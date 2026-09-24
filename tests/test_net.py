@@ -6,8 +6,10 @@ from unittest.mock import AsyncMock, patch
 import pytest
 
 from ku_notice_monitor.net import (
+    DownloadError,
     UnsafeUrlError,
     allowed_hosts_from_config,
+    describe_network_error,
     download_bytes,
     is_allowed_hostname,
     validate_url_target,
@@ -125,3 +127,35 @@ def test_download_accepts_bounded_content():
             )
         )
     assert result == b"123456"
+
+
+def _download_raising(session):
+    with patch("ku_notice_monitor.net.validate_url_target", new_callable=AsyncMock):
+        return asyncio.run(
+            download_bytes(
+                session,
+                "https://www.konkuk.ac.kr/rss",
+                ssl_context=None,
+                timeout=10,
+                allowed_hosts={"konkuk.ac.kr"},
+                max_size=10,
+                raise_on_error=True,
+            )
+        )
+
+
+def test_download_raise_on_error_keeps_http_status():
+    with pytest.raises(DownloadError) as info:
+        _download_raising(_FakeSession([_FakeResponse(status=503)]))
+    assert info.value.status == 503
+    assert str(info.value) == "HTTP 503 응답"
+
+
+def test_download_raise_on_error_propagates_timeout():
+    class _TimeoutSession:
+        def get(self, *_args, **_kwargs):
+            raise TimeoutError
+
+    with pytest.raises(TimeoutError) as info:
+        _download_raising(_TimeoutSession())
+    assert describe_network_error(info.value) == "응답 시간 초과"

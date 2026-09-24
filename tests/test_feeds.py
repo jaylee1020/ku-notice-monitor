@@ -567,7 +567,9 @@ def test_fetch_all_feeds_reports_partial_failure(make_article):
     assert len(batch.articles) == 1
     assert batch.successful_count == 1
     assert batch.failed_count == 1
-    assert batch.statuses[1].error.startswith("TimeoutError")
+    assert batch.statuses[1].error == "응답 시간 초과"
+    assert batch.statuses[1].server_unavailable is True
+    assert batch.is_source_outage is False
 
 
 # --- 상세 본문 보강 ---

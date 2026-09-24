@@ -92,6 +92,10 @@ class RuntimeConfig(_Section):
     detail_refresh_interval_hours: StrictInt = Field(default=6, ge=1, le=24)
     detail_refresh_days: StrictInt = Field(default=14, ge=1, le=90)
     detail_refresh_max_articles: StrictInt = Field(default=30, ge=1, le=100)
+    # 모든 피드가 서버 무응답으로 실패하면 잠시 기다렸다 한 번 더 수집한다.
+    source_outage_retry_seconds: StrictInt = Field(default=90, ge=0, le=600)
+    # 학교 서버 장애가 이 횟수만큼 연속될 때만 텔레그램으로 알린다.
+    source_outage_alert_after_runs: StrictInt = Field(default=2, ge=1, le=48)
 
     @field_validator("base_url")
     @classmethod

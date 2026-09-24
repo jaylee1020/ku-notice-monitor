@@ -7,7 +7,7 @@ from .models import Article
 from .profile_models import ProfileSnapshot
 from .util import now_kst
 
-PROMPT_VERSION = "2026-08-03-grounded-v4"
+PROMPT_VERSION = "2026-09-24-grounded-v5"
 
 SYSTEM_PROMPT = """당신은 한국 대학 공지에서 검증 가능한 사실을 추출하는 분석기입니다.
 출력 스키마의 각 축을 서로 독립적으로 판정하세요. 하나의 관련도 점수나 막연한 긴급도를 만들지 마세요.
@@ -37,7 +37,12 @@ SYSTEM_PROMPT = """당신은 한국 대학 공지에서 검증 가능한 사실�
    원래 표현이 불명확하다는 사실을 uncertainties에 기록합니다.
 10. evidence와 eligibility condition의 evidence에는 짧은 공지 원문 구절만 넣습니다.
 11. 중요한 대상·마감·행동이 첨부파일에만 있을 가능성이 높으면 attachment_need=required입니다.
-12. 불명확하거나 서로 충돌하는 내용은 uncertainties에 기록합니다."""
+12. 불명확하거나 서로 충돌하는 내용은 uncertainties에 기록합니다.
+13. summary는 휴대폰 알림으로 읽히는 한 문장(100자 이내)입니다. 제목을 되풀이하지
+    말고 학생이 알아야 할 핵심(무엇을 하는지, 누구 대상인지, 언제인지)만 씁니다.
+14. 교직원·계약직원 채용처럼 학력(학위 취득)·재학 여부 요건이 있으면 이를
+    eligibility_paths 조건으로 추출합니다. 예: "대졸 이상"은 degree_level,
+    "재학 중이 아닌 자"는 enrollment_status not_one_of ["재학"]."""
 
 _CRITICAL_PATTERN = re.compile(
     r"마감|신청|제출|납부|대상|자격|지원|필수|기한|까지|선발|장학|등록|휴학|복학|졸업",

@@ -39,6 +39,8 @@ from .notifier import (
     build_first_run_message,
     build_no_new_message,
     build_no_relevant_message,
+    build_source_outage_message,
+    build_source_recovered_message,
     build_urgent_messages,
     notify_error,
     send_telegram_part,
@@ -79,6 +81,22 @@ class NewArticleFloodError(RuntimeError):
 
 class FeedCollectionError(RuntimeError):
     """수집 성공률이 안전 기준보다 낮을 때 발생한다."""
+
+
+class SourceOutageError(FeedCollectionError):
+    """학교 서버가 모든 게시판에서 응답하지 않을 때 발생한다.
+
+    모니터 결함이 아니라 외부 장애이므로 실행을 실패로 처리하지 않고, 장애가
+    이어질 때만 사용자에게 한 번 알린다.
+    """
+
+    def __init__(self, message: str, detail: str) -> None:
+        super().__init__(message)
+        self.detail = detail
+
+
+# 워크플로가 같은 오류를 두 번 알리지 않도록, 파이썬이 오류 알림을 보냈음을 표시한다.
+ERROR_NOTIFIED_MARKER = ".error-notified"
 
 
 class DeliveryConfigurationError(RuntimeError):
@@ -125,14 +143,22 @@ def _validate_feed_health(feed_batch: FeedBatch, config: dict) -> float:
         feed_batch.successful_count / enabled_count if enabled_count else 0.0
     )
     minimum_ratio = config["settings"].get("min_feed_success_ratio", 0.7)
+    if enabled_count and feed_batch.is_source_outage:
+        detail = feed_batch.failure_summary()
+        raise SourceOutageError(
+            f"학교 서버가 응답하지 않아 게시판 {enabled_count}개를 모두 읽지 못했습니다 ({detail})",
+            detail,
+        )
     if enabled_count and (
         success_ratio < minimum_ratio
         or (feed_batch.successful_count > 0 and not feed_batch.articles)
     ):
+        failures = feed_batch.failure_summary()
         raise FeedCollectionError(
-            f"피드 수집 상태가 안전 기준 미달입니다: "
-            f"{feed_batch.successful_count}/{enabled_count} 성공, "
-            f"공지 {len(feed_batch.articles)}건"
+            f"게시판 {enabled_count}개 중 {feed_batch.successful_count}개만 읽어 "
+            f"안전 기준({minimum_ratio:.0%})에 못 미칩니다. "
+            f"수집 공지 {len(feed_batch.articles)}건"
+            + (f", 실패 원인: {failures}" if failures else "")
         )
     return success_ratio
 
@@ -303,7 +329,6 @@ def _queue_message(
 def _queue_urgent_notifications(
     state: dict,
     urgent: list[ClassifiedNotice],
-    total_new: int,
     source_fingerprints: dict[str, str],
 ) -> int:
     """즉시·검토 공지를 공지별 메시지로 나누어 중복 없이 큐에 넣는다."""
@@ -336,7 +361,7 @@ def _queue_urgent_notifications(
         urgent_key = _batch_key("urgent", [notice_token])
         queued_parts += _queue_parts(
             state,
-            build_urgent_messages([item], total_new),
+            build_urgent_messages([item]),
             kind="urgent",
             dedup_key=urgent_key,
             metadata={
@@ -540,7 +565,6 @@ async def _classify_and_queue(
     stats["outbox_queued_parts"] += _queue_urgent_notifications(
         state,
         urgent,
-        total_new,
         source_fingerprints,
     )
     if digest:
@@ -562,6 +586,17 @@ async def _classify_and_queue(
 async def _collect_feeds(config: dict, stats: dict) -> FeedBatch:
     started = time.monotonic()
     feed_batch = await fetch_all_feeds_detailed(config)
+    retry_delay = config["settings"].get("source_outage_retry_seconds", 90)
+    if feed_batch.is_source_outage and retry_delay > 0:
+        # 학교 서버는 1~2분짜리 순간 장애가 잦다. 곧바로 실패하지 않고 한 번 더 본다.
+        logger.warning(
+            "모든 피드가 서버 무응답으로 실패했습니다 (%s). %d초 뒤 다시 수집합니다.",
+            feed_batch.failure_summary(),
+            retry_delay,
+        )
+        await asyncio.sleep(retry_delay)
+        feed_batch = await fetch_all_feeds_detailed(config)
+        stats["source_outage_retried"] = True
     stats["timing"]["fetch_feeds"] = round(time.monotonic() - started, 2)
     stats["feeds_collected"] = feed_batch.successful_count
     stats["feeds_failed"] = feed_batch.failed_count
@@ -574,6 +609,70 @@ async def _collect_feeds(config: dict, stats: dict) -> FeedBatch:
     stats["feed_success_ratio"] = _validate_feed_health(feed_batch, config)
     logger.info("총 %d건 수집", len(feed_batch.articles))
     return feed_batch
+
+
+def _record_source_outage(state: dict, config: dict, exc: SourceOutageError) -> bool:
+    """연속 장애 횟수를 기록하고, 이번에 안내를 보내야 하면 outbox에 넣는다."""
+    outage = state.get("source_outage")
+    if not isinstance(outage, dict):
+        outage = {"since": now_kst().isoformat(), "consecutive_runs": 0, "alerted": False}
+    outage["consecutive_runs"] = int(outage.get("consecutive_runs", 0)) + 1
+    outage["last_error"] = exc.detail
+    state["source_outage"] = outage
+    threshold = config["settings"].get("source_outage_alert_after_runs", 2)
+    if outage.get("alerted") or outage["consecutive_runs"] < threshold:
+        return False
+    _queue_message(
+        state,
+        build_source_outage_message(
+            consecutive_runs=outage["consecutive_runs"],
+            since=str(outage.get("since", "")),
+            detail=exc.detail,
+        ),
+        kind="status",
+        dedup_key=f"source-outage:{outage.get('since')}",
+    )
+    outage["alerted"] = True
+    return True
+
+
+def _clear_source_outage(state: dict) -> int:
+    """장애가 끝났음을 기록하고, 장애 안내를 보냈다면 복구 안내를 큐에 넣는다."""
+    outage = state.pop("source_outage", None)
+    if not isinstance(outage, dict) or not outage.get("alerted"):
+        return 0
+    return _queue_message(
+        state,
+        build_source_recovered_message(int(outage.get("consecutive_runs", 0))),
+        kind="status",
+        dedup_key=f"source-recovered:{outage.get('since')}",
+    )
+
+
+async def _handle_source_outage(
+    state: dict,
+    state_path: str,
+    config: dict,
+    stats: dict,
+    exc: SourceOutageError,
+) -> None:
+    """학교 서버 장애는 실패로 끝내지 않고 상태만 남긴 뒤 다음 실행을 기다린다."""
+    alerted = _record_source_outage(state, config, exc)
+    outage = state["source_outage"]
+    stats["method"] = "source_outage"
+    stats["source_outage_runs"] = outage["consecutive_runs"]
+    logger.warning(
+        "학교 서버 장애로 이번 확인을 건너뜁니다 (연속 %d회, 안내 %s): %s",
+        outage["consecutive_runs"],
+        "전송" if alerted else ("이미 보냄" if outage.get("alerted") else "보류"),
+        exc,
+    )
+    state["last_run_stats"] = stats
+    save_state(state, state_path)
+    _add_delivery_stats(stats, await _flush_pending_deliveries(state, state_path))
+    state["last_run_stats"] = stats
+    save_state(state, state_path)
+    _log_run_summary(stats)
 
 
 async def _finish(
@@ -620,7 +719,16 @@ async def run() -> None:
     if not config["settings"].get("ssl_verify", True):
         await check_ssl_health(config)
 
-    feed_batch = await _collect_feeds(config, stats)
+    try:
+        feed_batch = await _collect_feeds(config, stats)
+    except SourceOutageError as exc:
+        if first_run:
+            # 첫 실행에 상태 파일을 만들면 다음 실행이 기존 공지를 모두 신규로 오인한다.
+            raise
+        await _handle_source_outage(state, state_path, config, stats, exc)
+        _raise_for_delivery_configuration(stats)
+        return
+    stats["outbox_queued_parts"] += _clear_source_outage(state)
     all_articles = feed_batch.articles
     source_fingerprints = {article.key: article.fingerprint for article in all_articles}
 
@@ -721,13 +829,42 @@ def _raise_for_delivery_configuration(stats: dict) -> None:
         )
 
 
+def _error_notice(exc: Exception) -> tuple[str, str | None]:
+    """오류 종류별로 사용자가 이해할 수 있는 제목과 안내를 고른다."""
+    if isinstance(exc, FeedCollectionError):
+        return (
+            "일부 게시판을 읽지 못해 이번 확인을 건너뛰었습니다",
+            "누락을 막기 위해 공지를 확인 처리하지 않았습니다. 다음 실행에서 다시 확인합니다.",
+        )
+    if isinstance(exc, NewArticleFloodError):
+        return (
+            "새 공지가 비정상적으로 많아 알림을 멈췄습니다",
+            "대량 알림을 막기 위한 안전장치입니다. 상태 파일과 게시판 구조를 확인해 주세요.",
+        )
+    if isinstance(exc, DeliveryConfigurationError):
+        return (
+            "텔레그램 설정 문제로 알림을 보내지 못했습니다",
+            "보내지 못한 알림은 보관되어 있으며, 설정을 고치면 다음 실행에서 전송됩니다.",
+        )
+    return ("공지 확인 중 오류가 발생했습니다", None)
+
+
+def _mark_error_notified() -> None:
+    try:
+        (PROJECT_ROOT / ERROR_NOTIFIED_MARKER).write_text(now_kst().isoformat(), encoding="utf-8")
+    except OSError as exc:
+        logger.warning("오류 알림 표시 파일을 쓰지 못했습니다: %s", exc)
+
+
 def main() -> None:
     setup_logging()
     try:
         asyncio.run(run())
     except Exception as exc:
         logger.exception("모니터링 실행 중 치명적 오류 발생: %s", exc)
-        asyncio.run(notify_error(str(exc)))
+        title, guidance = _error_notice(exc)
+        if asyncio.run(notify_error(str(exc), title=title, guidance=guidance)):
+            _mark_error_notified()
         sys.exit(1)
 
 

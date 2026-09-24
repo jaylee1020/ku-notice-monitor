@@ -30,7 +30,9 @@ from .constants import (
 from .models import Article, Attachment
 from .net import (
     DEFAULT_HEADERS,
+    DownloadError,
     allowed_hosts_from_config,
+    describe_network_error,
     download_bytes,
     is_allowed_hostname,
     make_ssl_context,
@@ -48,6 +50,8 @@ class FeedStatus:
     article_count: int
     elapsed_seconds: float
     error: str | None = None
+    # 연결 불가·시간 초과·5xx처럼 학교 서버가 응답하지 못한 실패. 장애 판단에 쓴다.
+    server_unavailable: bool = False
 
 
 @dataclass(frozen=True)
@@ -62,6 +66,22 @@ class FeedBatch:
     @property
     def failed_count(self) -> int:
         return len(self.statuses) - self.successful_count
+
+    @property
+    def is_source_outage(self) -> bool:
+        """모든 피드가 서버 무응답으로 실패했다면 학교 서버 쪽 장애로 본다."""
+        return bool(self.statuses) and all(
+            not status.success and status.server_unavailable for status in self.statuses
+        )
+
+    def failure_summary(self) -> str:
+        """실패 원인별 피드 수를 '응답 시간 초과 9개'처럼 요약한다."""
+        counts: dict[str, int] = {}
+        for status in self.statuses:
+            if not status.success:
+                reason = status.error or "알 수 없는 오류"
+                counts[reason] = counts.get(reason, 0) + 1
+        return ", ".join(f"{reason} {count}개" for reason, count in counts.items())
 
 
 # ---------------------------------------------------------------------------
@@ -184,6 +204,21 @@ def _parse_entry(entry, board_name: str, board_id: int, base_url: str) -> Articl
 # ---------------------------------------------------------------------------
 
 
+def _is_server_unavailable(exc: BaseException) -> bool:
+    """학교 서버가 응답하지 못한 실패(연결 불가·시간 초과·연결 끊김·5xx)인지 확인한다."""
+    if isinstance(exc, DownloadError):
+        return exc.status is not None and exc.status >= 500
+    return isinstance(
+        exc,
+        (
+            asyncio.TimeoutError,
+            TimeoutError,
+            aiohttp.ClientConnectionError,
+            aiohttp.ClientPayloadError,
+        ),
+    )
+
+
 def _is_retryable_feed_error(exc: BaseException) -> bool:
     """4xx 응답(429 제외)은 재시도해도 결과가 같으므로 즉시 실패시킨다."""
     status = getattr(exc, "status", None)
@@ -220,9 +255,10 @@ async def _fetch_feed_async(
         timeout=FEED_FETCH_TIMEOUT,
         allowed_hosts=allowed_hosts_from_config(config),
         max_size=MAX_FEED_SIZE,
+        raise_on_error=True,
     )
     if xml_data is None:
-        raise aiohttp.ClientError(f"RSS 다운로드 실패: {url}")
+        raise DownloadError("RSS 응답이 비어 있음")
 
     if b"<rss" not in xml_data.lower():
         logger.warning("RSS 형식이 아닌 응답 - %s (board_id=%d, url=%s)", board_name, board_id, url)
@@ -270,14 +306,16 @@ async def fetch_all_feeds_detailed(config: dict) -> FeedBatch:
                 elapsed_seconds=round(time.monotonic() - started, 3),
             )
         except Exception as exc:
-            logger.error("%s 피드 수집 실패: %s", name, exc)
+            reason = describe_network_error(exc)
+            logger.error("%s 피드 수집 실패: %s", name, reason)
             return [], FeedStatus(
                 name=name,
                 board_id=feed["id"],
                 success=False,
                 article_count=0,
                 elapsed_seconds=round(time.monotonic() - started, 3),
-                error=f"{type(exc).__name__}: {str(exc)[:200]}",
+                error=reason,
+                server_unavailable=_is_server_unavailable(exc),
             )
 
     async with aiohttp.ClientSession(headers=DEFAULT_HEADERS) as session:

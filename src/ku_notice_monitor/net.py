@@ -26,6 +26,34 @@ class UnsafeUrlError(ValueError):
     """허용되지 않거나 사설 네트워크를 가리키는 URL."""
 
 
+class DownloadError(aiohttp.ClientError):
+    """다운로드 실패 원인을 보존하는 예외. ``status``는 HTTP 응답 코드(있을 때)."""
+
+    def __init__(self, message: str, *, status: int | None = None) -> None:
+        super().__init__(message)
+        self.status = status
+
+
+def describe_network_error(exc: BaseException) -> str:
+    """로그와 알림에 쓸 수 있도록 네트워크 예외를 짧은 한국어 원인으로 바꾼다."""
+    if isinstance(exc, DownloadError):
+        return str(exc)
+    if isinstance(exc, (asyncio.TimeoutError, TimeoutError)):
+        return "응답 시간 초과"
+    if isinstance(exc, aiohttp.ClientConnectorCertificateError):
+        return "SSL 인증서 검증 실패"
+    if isinstance(exc, aiohttp.ClientConnectorDNSError):
+        return "DNS 조회 실패"
+    if isinstance(exc, aiohttp.ClientConnectorError):
+        return "서버 연결 실패"
+    if isinstance(exc, aiohttp.ServerDisconnectedError):
+        return "서버가 연결을 끊음"
+    if isinstance(exc, UnsafeUrlError):
+        return str(exc)
+    detail = str(exc).strip()
+    return f"{type(exc).__name__}: {detail}"[:200] if detail else type(exc).__name__
+
+
 def allowed_hosts_from_config(config: dict) -> set[str]:
     """설정에서 다운로드를 허용할 호스트/도메인 접미사를 만든다."""
     configured = config.get("settings", {}).get("allowed_download_hosts", [])
@@ -122,13 +150,21 @@ async def download_bytes(
     semaphore: asyncio.Semaphore | None = None,
     max_size: int,
     expected_content_prefix: str | None = None,
+    raise_on_error: bool = False,
 ) -> bytes | None:
     """단일 URL을 바이너리로 다운로드한다.
 
-    이미지/첨부파일 다운로드의 공통 경로. 실패(비200, 크기 초과, 예외)는
-    모두 None으로 흡수해 호출부가 개별 실패에 흔들리지 않게 한다.
+    이미지/첨부파일 다운로드의 공통 경로. 기본적으로 실패(비200, 크기 초과,
+    예외)는 모두 None으로 흡수해 호출부가 개별 실패에 흔들리지 않게 한다.
+    ``raise_on_error``가 참이면 원인을 담은 예외를 그대로 올려 RSS처럼 실패
+    원인을 알려야 하는 호출부가 재시도·진단에 쓸 수 있게 한다.
     semaphore가 주어지면 동시 요청 수를 제한한다.
     """
+
+    def fail(message: str, status: int | None = None) -> None:
+        logger.debug("%s: %s", message, url)
+        if raise_on_error:
+            raise DownloadError(message, status=status)
 
     async def _request() -> bytes | None:
         current_url = url
@@ -143,20 +179,16 @@ async def download_bytes(
                 if 300 <= resp.status < 400:
                     location = resp.headers.get("Location")
                     if not location or redirect_count >= MAX_DOWNLOAD_REDIRECTS:
-                        logger.debug("리디렉션 제한 초과 또는 Location 없음: %s", current_url)
+                        fail("리디렉션 제한 초과 또는 Location 없음", resp.status)
                         return None
                     current_url = urljoin(current_url, location)
                     continue
                 if resp.status != 200:
-                    logger.debug("다운로드 실패 (status=%d): %s", resp.status, current_url)
+                    fail(f"HTTP {resp.status} 응답", resp.status)
                     return None
                 content_type = resp.headers.get("Content-Type", "").split(";", 1)[0].lower()
                 if expected_content_prefix and not content_type.startswith(expected_content_prefix):
-                    logger.debug(
-                        "예상하지 않은 Content-Type (%s): %s",
-                        content_type or "없음",
-                        current_url,
-                    )
+                    fail(f"예상하지 않은 Content-Type ({content_type or '없음'})")
                     return None
                 content_length = resp.headers.get("Content-Length")
                 try:
@@ -164,13 +196,13 @@ async def download_bytes(
                 except ValueError:
                     declared_size = None
                 if declared_size is not None and declared_size > max_size:
-                    logger.debug("크기 초과 (%s bytes): %s", content_length, current_url)
+                    fail(f"크기 초과 ({content_length} bytes)")
                     return None
                 data = bytearray()
                 async for chunk in resp.content.iter_chunked(64 * 1024):
                     data.extend(chunk)
                     if len(data) > max_size:
-                        logger.debug("스트리밍 크기 초과 (%d bytes): %s", len(data), current_url)
+                        fail(f"스트리밍 크기 초과 ({len(data)} bytes)")
                         return None
                 return bytes(data)
         return None
@@ -181,5 +213,7 @@ async def download_bytes(
                 return await _request()
         return await _request()
     except Exception as e:
+        if raise_on_error:
+            raise
         logger.debug("다운로드 예외: %s - %s", url, e)
         return None
