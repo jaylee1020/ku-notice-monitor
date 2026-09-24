@@ -69,12 +69,11 @@ def test_urgent_notices_are_queued_as_separate_deduplicated_messages(
     }
     state = {"pending_deliveries": [], "delivery_history": {}}
 
-    queued = _queue_urgent_notifications(state, urgent, 6, fingerprints)
-    queued_again = _queue_urgent_notifications(state, urgent, 6, fingerprints)
+    queued = _queue_urgent_notifications(state, urgent, fingerprints)
+    queued_again = _queue_urgent_notifications(state, urgent, fingerprints)
     queued_reordered = _queue_urgent_notifications(
         state,
         list(reversed(urgent)),
-        0,
         fingerprints,
     )
 
@@ -83,9 +82,10 @@ def test_urgent_notices_are_queued_as_separate_deduplicated_messages(
     assert queued_reordered == 0
     assert len(state["pending_deliveries"]) == 2
     messages = [item["text"] for item in state["pending_deliveries"]]
-    assert all("새 공지 6건 중 관련 1건" in message for message in messages)
-    assert all("1. [" in message for message in messages)
-    assert all("2. [" not in message for message in messages)
+    # 공지마다 따로 보내므로 번호 없이 한 건씩 담긴다.
+    assert all("1. " not in message and "2. " not in message for message in messages)
+    assert sum("[중요]" in message for message in messages) == 1
+    assert sum("[확인 필요]" in message for message in messages) == 1
     assert sum("수강신청 확인" in message for message in messages) == 1
     assert sum("등록금 납부 확인" in message for message in messages) == 1
 
@@ -120,18 +120,16 @@ def test_urgent_dedup_filters_completed_subset_from_later_batch(
     assert _queue_urgent_notifications(
         state,
         [notice_a, notice_b],
-        2,
         fingerprints,
     ) == 2
     with patch("ku_notice_monitor.main.send_telegram_part", new_callable=AsyncMock):
         asyncio.run(_flush_pending_deliveries(state, path))
 
     assert len(state["urgent_notice_history"]) == 2
-    assert _queue_urgent_notifications(state, [notice_a], 0, fingerprints) == 0
+    assert _queue_urgent_notifications(state, [notice_a], fingerprints) == 0
     assert _queue_urgent_notifications(
         state,
         [notice_a, notice_c],
-        1,
         fingerprints,
     ) == 1
     message = state["pending_deliveries"][0]["text"]
@@ -388,4 +386,36 @@ def test_long_digest_is_queued_as_self_contained_parts(make_article, make_classi
 
     parts = [item["text"] for item in state["pending_deliveries"]]
     assert len(parts) > 1
-    assert all(part[:4].isdigit() and "관심 공지 24건" in part for part in parts)
+    assert all("관심 공지 24건" in part for part in parts)
+    assert all(f"/{len(parts)})" in part.split("\n", 1)[0] for part in parts)
+
+
+def test_feed_health_reports_source_outage_with_readable_cause():
+    from ku_notice_monitor.main import SourceOutageError
+
+    batch = FeedBatch(
+        [],
+        [
+            FeedStatus("학사", 234, False, 0, 45.0, "응답 시간 초과", server_unavailable=True),
+            FeedStatus("장학", 235, False, 0, 45.0, "응답 시간 초과", server_unavailable=True),
+        ],
+    )
+    with pytest.raises(SourceOutageError) as info:
+        _validate_feed_health(batch, {"settings": {"min_feed_success_ratio": 0.7}})
+    assert info.value.detail == "응답 시간 초과 2개"
+    assert "학교 서버가 응답하지 않아" in str(info.value)
+
+
+def test_feed_health_partial_failure_explains_causes(make_article):
+    batch = FeedBatch(
+        [make_article()],
+        [
+            FeedStatus("학사", 234, True, 1, 0.1),
+            FeedStatus("장학", 235, False, 0, 0.1, "HTTP 404 응답"),
+            FeedStatus("취업", 236, False, 0, 0.1, "HTTP 404 응답"),
+        ],
+    )
+    with pytest.raises(FeedCollectionError) as info:
+        _validate_feed_health(batch, {"settings": {"min_feed_success_ratio": 0.7}})
+    assert "게시판 3개 중 1개만" in str(info.value)
+    assert "HTTP 404 응답 2개" in str(info.value)

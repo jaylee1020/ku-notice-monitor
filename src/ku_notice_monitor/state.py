@@ -317,6 +317,102 @@ def mark_as_seen(
             stored_enriched[a.key] = enriched_fingerprints[a.key]
 
 
+def _known_board_ids(state: dict) -> set[int]:
+    """이미 수집해 본 게시판 ID. 기록이 없으면 확인한 공지 키에서 복원한다."""
+    stored = state.get("known_boards")
+    if isinstance(stored, list):
+        return {int(board) for board in stored if isinstance(board, int)}
+    boards: set[int] = set()
+    for key in state.get("seen_ids", {}):
+        board, sep, _ = str(key).partition(":")
+        if sep and board.isdigit():
+            boards.add(int(board))
+    return boards
+
+
+def seed_new_boards(
+    articles: list[Article],
+    successful_board_ids: set[int],
+    state: dict,
+    fingerprints: dict[str, str] | None = None,
+) -> dict[int, int]:
+    """새로 추가된 게시판의 기존 공지를 알림 없이 확인 처리한다.
+
+    설정에 게시판을 추가하면 그 게시판의 RSS에 있는 과거 공지가 모두 신규로
+    잡혀 알림이 쏟아지거나 신규 공지 안전 한도에 걸린다. 최초 실행과 같은 이유로,
+    처음 성공적으로 읽은 게시판은 현재 글을 시드하고 이후 글부터 알린다.
+    수집에 실패한 게시판은 다음에 처음 읽을 때 시드하도록 기록하지 않는다.
+    반환값은 시드한 게시판 ID별 공지 수다.
+    """
+    known = _known_board_ids(state)
+    has_history = isinstance(state.get("known_boards"), list) or bool(state.get("seen_ids"))
+    new_boards = successful_board_ids - known if has_history else set()
+    seeded: dict[int, int] = {}
+    if new_boards:
+        new_articles = [article for article in articles if article.board_id in new_boards]
+        mark_as_seen(new_articles, state, fingerprints=fingerprints)
+        for board_id in new_boards:
+            seeded[board_id] = sum(article.board_id == board_id for article in new_articles)
+    state["known_boards"] = sorted(known | successful_board_ids)
+    return seeded
+
+
+TITLE_RETENTION_DAYS = 30
+
+
+_LEADING_TAGS = re.compile(r"^(?:\s*[\[【(<][^\]】)>]{1,30}[\]】)>])+")
+
+
+def _title_key(article: Article) -> str:
+    """앞쪽 말머리([학사], [대학일자리+] 등)·공백·구두점 차이를 무시한 제목 해시."""
+    title = _LEADING_TAGS.sub("", article.title) or article.title
+    normalized = re.sub(r"[^0-9a-z가-힣]+", "", title.lower())
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:24]
+
+
+def drop_cross_board_duplicates(
+    articles: list[Article],
+    state: dict,
+    *,
+    current_articles: list[Article] | None = None,
+) -> list[Article]:
+    """여러 게시판에 같은 제목으로 다시 올라온 공지를 한 번만 분석한다.
+
+    학과 게시판은 대학 전체 공지를 그대로 옮겨 오는 경우가 많다. 이번 실행 안에서
+    같은 제목이 겹치거나, 최근 다른 게시판에서 이미 본 제목이면 제외한다.
+    수정 공지는 원래 게시판에서 계속 추적해야 하므로 제외하지 않는다.
+    """
+    cutoff = (datetime.now() - timedelta(days=TITLE_RETENTION_DAYS)).isoformat()
+    recent = {
+        key: value
+        for key, value in state.get("recent_titles", {}).items()
+        if isinstance(value, dict) and str(value.get("at", "")) > cutoff
+    }
+    now = datetime.now().isoformat()
+    candidate_keys = {article.key for article in articles}
+    # 이미 확인한 공지의 제목도 기억해 두어야 며칠 뒤 다른 게시판에 옮겨진 글을 거른다.
+    for article in current_articles or []:
+        if article.key not in candidate_keys:
+            recent.setdefault(_title_key(article), {"board": article.board_id, "at": now})
+    kept: list[Article] = []
+    seen_now: dict[str, int] = {}
+    for article in articles:
+        if article.is_update:
+            kept.append(article)
+            continue
+        key = _title_key(article)
+        previous = recent.get(key)
+        if key in seen_now or (previous and previous.get("board") != article.board_id):
+            logger.info("다른 게시판과 중복된 공지를 건너뜁니다: [%s] %s", article.board_name, article.title)
+            continue
+        seen_now[key] = article.board_id
+        kept.append(article)
+    for key, board_id in seen_now.items():
+        recent[key] = {"board": board_id, "at": now}
+    state["recent_titles"] = recent
+    return kept
+
+
 def enqueue_digest(matches: list[ClassifiedNotice], state: dict) -> None:
     """일반 공지를 다음 일일 요약까지 중복 없이 보관한다."""
     pending: dict[str, dict] = {}

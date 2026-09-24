@@ -83,11 +83,19 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
+          # 모니터가 이미 원인과 로그 링크를 담아 알렸다면 같은 실패를 다시 알리지 않는다.
+          # 이 단계는 설치 실패처럼 모니터가 실행되기 전에 난 오류만 알린다.
+          if [ -f .error-notified ]; then
+            echo "모니터가 이미 오류를 알렸습니다."
+            exit 0
+          fi
           if [ -n "$TELEGRAM_BOT_TOKEN" ] && [ -n "$TELEGRAM_CHAT_ID" ]; then
             curl --silent --show-error --fail \
               --request POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
               --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
-              --data-urlencode "text=건국대 공지 모니터링 실패
+              --data-urlencode "link_preview_options={\"is_disabled\":true}" \
+              --data-urlencode "text=[모니터링 오류] 공지 모니터를 실행하지 못했습니다
+          공지 분석 전 단계(설치·상태 불러오기 등)에서 실패했습니다.
           로그: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
           fi
 

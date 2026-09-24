@@ -304,3 +304,135 @@ def _snapshot():
     from ku_notice_monitor.profile_models import ProfileSnapshot
 
     return ProfileSnapshot(summary="테스트 프로필")
+
+
+# --- 학교 서버 장애 ---
+
+
+def _outage_batch() -> FeedBatch:
+    return FeedBatch(
+        [],
+        [FeedStatus("학사", 234, False, 0, 45.0, "응답 시간 초과", server_unavailable=True)],
+    )
+
+
+def _run_with_batches(tmp_path, batches, config=None):
+    with (
+        patch("ku_notice_monitor.main.PROJECT_ROOT", tmp_path),
+        patch("ku_notice_monitor.main.load_config", return_value=config or _config()),
+        patch(
+            "ku_notice_monitor.main.fetch_all_feeds_detailed",
+            new_callable=AsyncMock,
+            side_effect=batches,
+        ) as fetch,
+        patch("ku_notice_monitor.main.asyncio.sleep", new_callable=AsyncMock) as sleep,
+        patch(
+            "ku_notice_monitor.main.enrich_articles_with_body",
+            new_callable=AsyncMock,
+            return_value=set(),
+        ),
+        patch("ku_notice_monitor.main._digest_is_due", return_value=False),
+        patch(
+            "ku_notice_monitor.main.send_telegram_part",
+            new_callable=AsyncMock,
+        ) as send,
+    ):
+        asyncio.run(run())
+    return fetch, sleep, send
+
+
+def test_brief_source_outage_recovers_on_in_run_retry(tmp_path, make_article):
+    """순간 장애는 잠시 기다린 뒤 다시 수집해 정상 처리한다."""
+    state_path = tmp_path / "state.json"
+    _write_state(state_path)
+    article = make_article(link="https://www.konkuk.ac.kr/notice/1")
+    healthy = FeedBatch([article], [FeedStatus("학사", 234, True, 1, 0.1)])
+
+    with patch(
+        "ku_notice_monitor.main.match_articles",
+        new_callable=AsyncMock,
+        return_value=MatchResult([], "openai", set(), 0, {}),
+    ):
+        fetch, sleep, send = _run_with_batches(tmp_path, [_outage_batch(), healthy])
+
+    assert fetch.await_count == 2
+    sleep.assert_awaited_once_with(90)
+    send.assert_not_awaited()
+    stored = json.loads(state_path.read_text(encoding="utf-8"))
+    assert article.key in stored["seen_ids"]
+    assert "source_outage" not in stored
+
+
+def test_source_outage_is_quiet_then_alerts_once_and_announces_recovery(
+    tmp_path,
+    make_article,
+):
+    """장애는 실행 실패가 아니며, 연속될 때만 한 번 알리고 복구도 알린다."""
+    state_path = tmp_path / "state.json"
+    _write_state(state_path)
+
+    # 1회차: 조용히 기록만 한다.
+    _, _, send = _run_with_batches(tmp_path, [_outage_batch(), _outage_batch()])
+    send.assert_not_awaited()
+    stored = json.loads(state_path.read_text(encoding="utf-8"))
+    assert stored["source_outage"]["consecutive_runs"] == 1
+    assert stored["source_outage"]["alerted"] is False
+    assert stored["seen_ids"] == {}
+
+    # 2회차: 기준(2회)에 도달해 안내를 한 번 보낸다.
+    _, _, send = _run_with_batches(tmp_path, [_outage_batch(), _outage_batch()])
+    send.assert_awaited_once()
+    alert = send.await_args.args[0]
+    assert "학교 홈페이지에 접속할 수 없습니다" in alert
+    assert "2회 연속" in alert
+    assert "응답 시간 초과" in alert
+
+    # 3회차: 이미 알렸으므로 다시 보내지 않는다.
+    _, _, send = _run_with_batches(tmp_path, [_outage_batch(), _outage_batch()])
+    send.assert_not_awaited()
+    stored = json.loads(state_path.read_text(encoding="utf-8"))
+    assert stored["source_outage"]["consecutive_runs"] == 3
+
+    # 복구: 복구 안내를 보내고 장애 기록을 지운다.
+    article = make_article(link="https://www.konkuk.ac.kr/notice/1")
+    healthy = FeedBatch([article], [FeedStatus("학사", 234, True, 1, 0.1)])
+    with patch(
+        "ku_notice_monitor.main.match_articles",
+        new_callable=AsyncMock,
+        return_value=MatchResult([], "openai", set(), 0, {}),
+    ):
+        _, _, send = _run_with_batches(tmp_path, [healthy])
+    send.assert_awaited_once()
+    assert "복구되었습니다" in send.await_args.args[0]
+    stored = json.loads(state_path.read_text(encoding="utf-8"))
+    assert "source_outage" not in stored
+    assert article.key in stored["seen_ids"]
+
+
+def test_source_outage_on_first_run_fails_without_creating_state(tmp_path):
+    """첫 실행에 상태를 만들면 다음 실행이 기존 공지를 신규로 오인하므로 실패로 끝낸다."""
+    from ku_notice_monitor.main import SourceOutageError
+
+    with pytest.raises(SourceOutageError):
+        _run_with_batches(tmp_path, [_outage_batch(), _outage_batch()])
+    assert not (tmp_path / "state.json").exists()
+
+
+def test_main_marks_error_notified_so_workflow_does_not_repeat(tmp_path, monkeypatch):
+    from ku_notice_monitor import main as main_module
+
+    monkeypatch.setattr(main_module, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr(main_module, "setup_logging", lambda: None)
+
+    async def failing_run():
+        raise main_module.FeedCollectionError("게시판 9개 중 3개만 읽음")
+
+    notify = AsyncMock(return_value=True)
+    monkeypatch.setattr(main_module, "run", failing_run)
+    monkeypatch.setattr(main_module, "notify_error", notify)
+
+    with pytest.raises(SystemExit):
+        main_module.main()
+
+    assert (tmp_path / main_module.ERROR_NOTIFIED_MARKER).exists()
+    assert "건너뛰었습니다" in notify.await_args.kwargs["title"]

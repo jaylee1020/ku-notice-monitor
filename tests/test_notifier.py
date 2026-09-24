@@ -24,8 +24,8 @@ from ku_notice_monitor.notifier import (
 )
 
 
-def build_urgent_message(matched, total_new):
-    return "\n".join(build_urgent_messages(matched, total_new))
+def build_urgent_message(matched):
+    return "\n".join(build_urgent_messages(matched))
 
 
 def build_digest_message(matched):
@@ -83,9 +83,11 @@ def test_build_urgent_message_has_deadline_and_actions(make_article, make_classi
             actions=["수강바구니 확인"],
         )
     ]
-    msg = build_urgent_message(matched, 3)
-    assert "새 공지 3건 중 관련 1건" in msg
-    assert "2099년 12월 31일" in msg
+    msg = build_urgent_message(matched)
+    assert "[중요]" in msg
+    assert "<b>수강신청</b>" in msg
+    assert "마감 2099년 12월 31일(목)" in msg
+    assert "새 공지" not in msg
     assert "수강바구니 확인" in msg
     assert "분류:" not in msg
     assert "이유:" not in msg
@@ -108,11 +110,11 @@ def test_long_urgent_batch_splits_on_notice_boundaries_with_header(
         for index in range(1, 13)
     ]
 
-    parts = build_urgent_messages(matched, 12)
+    parts = build_urgent_messages(matched)
 
     assert len(parts) > 1
-    assert all(part[:4].isdigit() for part in parts)
-    assert all("새 공지 12건 중 관련 12건" in part for part in parts)
+    assert all("[확인 필요]" in part for part in parts)
+    assert all(f"/{len(parts)})" in part.split("\n", 1)[0] for part in parts)
     assert all(len(part) <= MAX_TELEGRAM_MESSAGE_LENGTH for part in parts)
     combined = "\n".join(parts)
     assert all(f"긴 공지 {index}" in combined for index in range(1, 13))
@@ -127,7 +129,7 @@ def test_build_digest_message_marks_updated_article(make_article, make_classifie
     ]
     msg = build_digest_message(matched)
     assert "관심 공지 1건" in msg
-    assert "[수정]" in msg
+    assert "(수정됨)" in msg
 
 
 def test_review_message_explains_uncertainty(make_article, make_classified):
@@ -139,8 +141,8 @@ def test_review_message_explains_uncertainty(make_article, make_classified):
             uncertainties=["학번별 적용 기준 불명확"],
         )
     ]
-    msg = build_urgent_message(matched, 1)
-    assert "확인 필요:" in msg
+    msg = build_urgent_message(matched)
+    assert "확인할 점:" in msg
     assert "학번별 적용 기준 불명확" in msg
     assert "unknown" not in msg
 
@@ -157,9 +159,9 @@ def test_message_escapes_dynamic_html_and_uses_link(
             summary="A < B",
         )
     ]
-    msg = build_urgent_message(matched, 1)
+    msg = build_urgent_message(matched)
     assert "&lt;필독&gt; 등록금 &amp; 장학" in msg
-    assert "→ A &lt; B" in msg
+    assert "\nA &lt; B\n" in msg
     assert 'href="https://example.com/?a=1&amp;b=2"' in msg
     assert "https://example.com/?a=1&b=2\n" not in msg
 
@@ -391,3 +393,133 @@ def test_post_message_hides_token_on_connection_error():
         asyncio.run(notifier._post_message(_BrokenSession(), "SECRET", "42", "hi", html=True))
     assert "SECRET" not in str(info.value)
     assert info.value.__cause__ is None
+
+
+# --- 가독성 ---
+
+
+def _freeze_today(monkeypatch, year=2026, month=9, day=24):
+    from datetime import datetime
+
+    from ku_notice_monitor.util import KST
+
+    monkeypatch.setattr(
+        notifier, "now_kst", lambda: datetime(year, month, day, 21, 0, tzinfo=KST)
+    )
+
+
+@pytest.mark.parametrize(
+    "title,board,expected",
+    [
+        ("[대학일자리+] 한미그룹 채용설명회(10/1)", "대학일자리플러스", "한미그룹 채용설명회(10/1)"),
+        ("[장학공지] [교내] 건국가족장학생 선발", "장학공지", "[교내] 건국가족장학생 선발"),
+        ("[교내] 건국가족장학생 선발", "장학공지", "[교내] 건국가족장학생 선발"),
+        ("[대학일자리+]", "대학일자리플러스", "[대학일자리+]"),
+    ],
+)
+def test_clean_title_removes_tag_duplicating_board(title, board, expected):
+    assert notifier.clean_title(title, board) == expected
+
+
+def test_item_shows_event_date_when_no_deadline(monkeypatch, make_article, make_classified):
+    _freeze_today(monkeypatch)
+    matched = [
+        make_classified(
+            article=make_article(
+                title="[대학일자리+] 키엔스코리아 채용설명회(9/30)",
+                board_name="대학일자리플러스",
+            ),
+            summary="컨설턴트 세일즈 직무 채용설명회가 공학관에서 열린다.",
+            dates=[{"kind": "event_start", "date": "2026-09-30", "label": "설명회"}],
+            actions=["채용설명회 참석", "사전 신청"],
+        )
+    ]
+    msg = build_digest_message(matched)
+    assert "<b>키엔스코리아 채용설명회(9/30)</b>" in msg
+    assert "[대학일자리+]" not in msg
+    assert "대학일자리플러스 · 일시 9월 30일(수) · D-6" in msg
+    assert "할 일: 채용설명회 참석 · 사전 신청" in msg
+
+
+def test_item_shows_application_period(monkeypatch, make_article, make_classified):
+    _freeze_today(monkeypatch)
+    matched = [
+        make_classified(
+            article=make_article(title="건국가족장학생 선발", board_name="장학공지"),
+            deadline="2026-10-20",
+            dates=[
+                {"kind": "application_open", "date": "2026-10-01", "label": "신청 시작"},
+                {"kind": "application_deadline", "date": "2026-10-20", "label": "신청 마감"},
+            ],
+        )
+    ]
+    msg = build_digest_message(matched)
+    assert "신청 10월 1일(목) ~ 10월 20일(화) · D-26" in msg
+
+
+def test_item_marks_past_deadline(monkeypatch, make_article, make_classified):
+    _freeze_today(monkeypatch)
+    matched = [make_classified(article=make_article(title="지난 공지"), deadline="2026-09-20")]
+    assert "마감 9월 20일(일) · 지남" in build_digest_message(matched)
+
+
+def test_digest_orders_by_nearest_date(monkeypatch, make_article, make_classified):
+    _freeze_today(monkeypatch)
+    matched = [
+        make_classified(article=make_article(id="1", title="날짜 없음")),
+        make_classified(article=make_article(id="2", title="다음 달"), deadline="2026-10-20"),
+        make_classified(article=make_article(id="3", title="이번 주"), deadline="2026-09-26"),
+    ]
+    msg = build_digest_message(matched)
+    assert msg.index("1. <b>이번 주") < msg.index("2. <b>다음 달") < msg.index("3. <b>날짜 없음")
+    assert "9월 24일(목) 관심 공지 3건" in msg
+
+
+def test_summary_is_cut_at_sentence_boundary(make_article, make_classified):
+    first = "첫 문장은 핵심 내용입니다."
+    matched = [
+        make_classified(
+            article=make_article(title="공지"),
+            summary=first + " " + "둘째 문장은 길게 이어집니다 " * 12 + "끝.",
+        )
+    ]
+    msg = build_digest_message(matched)
+    assert first in msg
+    assert "둘째 문장" not in msg
+
+
+def test_summary_repeating_title_is_omitted(make_article, make_classified):
+    matched = [make_classified(article=make_article(title="수강 신청 안내"), summary="수강신청 안내")]
+    msg = build_digest_message(matched)
+    assert msg.count("수강 신청 안내") == 1
+
+
+def test_error_message_is_readable_and_links_run(monkeypatch):
+    monkeypatch.setenv("GITHUB_REPOSITORY", "owner/repo")
+    monkeypatch.setenv("GITHUB_RUN_ID", "42")
+    msg = build_error_message(
+        "게시판 9개 중 3개만 읽음",
+        title="일부 게시판을 읽지 못해 이번 확인을 건너뛰었습니다",
+        guidance="다음 실행에서 다시 확인합니다.",
+    )
+    assert msg.startswith("<b>[모니터링 오류] 일부 게시판을 읽지 못해")
+    assert "원인: 게시판 9개 중 3개만 읽음" in msg
+    assert '<a href="https://github.com/owner/repo/actions/runs/42">실행 로그 보기</a>' in msg
+
+
+def test_source_outage_and_recovery_messages(monkeypatch):
+    _freeze_today(monkeypatch)
+    msg = notifier.build_source_outage_message(
+        consecutive_runs=2,
+        since="2026-09-24T10:55:00+09:00",
+        detail="응답 시간 초과 9개",
+    )
+    assert "9월 24일(목) 10:55부터 2회 연속" in msg
+    assert "응답 시간 초과 9개" in msg
+    assert "복구되었습니다" in notifier.build_source_recovered_message(3)
+
+
+def test_new_boards_message_lists_seeded_boards():
+    msg = notifier.build_new_boards_message({"컴퓨터공학부": 10})
+    assert "컴퓨터공학부(기존 공지 10건)" in msg
+    assert "앞으로 올라오는 공지부터" in msg
