@@ -19,6 +19,9 @@ MAX_PENDING_DIGEST = 200
 MAX_PENDING_DELIVERIES = 500
 # 지수 백오프(최대 6시간)로 약 3~4일간 재시도한 뒤에도 실패하면 포기한다.
 MAX_DELIVERY_ATTEMPTS = 16
+# 상세 본문 추출 방식이 바뀌면 올린다. 이전 방식으로 만든 상세 지문과 비교하면
+# 내용이 같아도 모든 공지가 수정된 것으로 오인되므로 기준을 다시 잡는다.
+DETAIL_PARSER_VERSION = 2
 
 
 class StateCorruptionError(RuntimeError):
@@ -44,6 +47,7 @@ def _initial_state() -> dict:
         "last_digest_sent_date": None,
         "last_detail_refresh_at": None,
         "profile_document_hash": None,
+        "detail_parser_version": DETAIL_PARSER_VERSION,
         "last_run": None,
     }
 
@@ -355,6 +359,15 @@ def seed_new_boards(
             seeded[board_id] = sum(article.board_id == board_id for article in new_articles)
     state["known_boards"] = sorted(known | successful_board_ids)
     return seeded
+
+
+def reset_enriched_fingerprints_if_parser_changed(state: dict) -> bool:
+    """상세 본문 추출 방식이 바뀌었으면 상세 지문을 비우고 True를 반환한다."""
+    if state.get("detail_parser_version") == DETAIL_PARSER_VERSION:
+        return False
+    state["enriched_fingerprints"] = {}
+    state["detail_parser_version"] = DETAIL_PARSER_VERSION
+    return True
 
 
 TITLE_RETENTION_DAYS = 30

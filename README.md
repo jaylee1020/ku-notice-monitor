@@ -58,6 +58,7 @@
 ```bash
 uv run --no-sync python scripts/check_feeds.py https://cse.konkuk.ac.kr/bbs/cse/775/rssList.do
 uv run --no-sync python scripts/check_feeds.py --scan-konkuk 230-260
+uv run --no-sync python scripts/check_feeds.py --inspect https://www.konkuk.ac.kr/bbs/konkuk/234/1208081/artclView.do
 ```
 
 설정된 피드와 후보 URL마다 응답 상태, 글 수, 최신 글을 보여 줍니다. 학과 공지는

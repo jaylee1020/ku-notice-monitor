@@ -17,10 +17,6 @@ on:
         required: false
         default: ''
 
-  push:
-    branches: [claude/notification-readability-fixes-cfuv7u]
-    paths: [scripts/check_feeds.py]
-
 permissions:
   contents: read
 
@@ -46,7 +42,7 @@ jobs:
         env:
           URLS: ${{ inputs.urls }}
           SCAN: ${{ inputs.scan_konkuk }}
-          INSPECT: ${{ inputs.inspect || (github.event_name == 'push' && 'https://www.konkuk.ac.kr/bbs/konkuk/235/1206094/artclView.do https://www.konkuk.ac.kr/bbs/konkuk/235/1208222/artclView.do') || '' }}
+          INSPECT: ${{ inputs.inspect }}
         run: |
           if [ -n "$INSPECT" ]; then
             inspect_args=()

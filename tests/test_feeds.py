@@ -621,3 +621,54 @@ def test_enrich_treats_page_without_body_or_attachments_as_failure(make_article)
         enriched = asyncio.run(enrich_articles_with_body([article], _enrich_config()))
 
     assert enriched == set()
+
+
+# 2026-09 개편 이후 실제 상세 페이지 구조(피드 점검 워크플로로 확인).
+_REDESIGNED_ARTICLE_HTML = """
+<html><body>
+<div class="_fnctWrap">
+  <div class="board-view-info"><div class="view-info">
+    <h2>[교내][등록금] 2026학년도 2학기 건국가족장학생 선발 안내</h2>
+    <div class="view-detail"><div class="view-util">작성자 장학복지팀 조회수 327</div></div>
+  </div></div>
+  <div class="view-con">
+    <p class="1"><span>[</span><span>유의사항</span><span>]</span></p>
+    <p class="1"><span>★ 신청기간 외에는 추가 접수 절대 받지 않습니다.</span></p>
+    <p>1. 신청기간 : 2026. 10. 1.(목) ~ 10. 20.(화)</p>
+  </div>
+  <div class="view-file">
+    <dl class="row"><dt class="title">첨부파일</dt><dd class="insert"><ul>
+      <li>
+        <a href="/bbs/konkuk/235/1227131/download.do">
+          \t\t\t붙임2)건국가족신청서.xlsx
+        \t\t</a>
+        <button type="button" onclick="window.open('/bbs/konkuk/235/1227131/synapView.do');">미리보기</button>
+      </li>
+    </ul></dd></dl>
+  </div>
+</div>
+</body></html>
+""".encode()
+
+
+def test_enrich_reads_redesigned_detail_page(make_article):
+    article = make_article(
+        description="RSS",
+        link="https://www.konkuk.ac.kr/bbs/konkuk/235/1208222/artclView.do",
+    )
+
+    async def fake_download(*_args, **_kwargs):
+        return _REDESIGNED_ARTICLE_HTML
+
+    with patch("ku_notice_monitor.feeds.download_bytes", side_effect=fake_download):
+        enriched = asyncio.run(enrich_articles_with_body([article], _enrich_config()))
+
+    assert enriched == {article.key}
+    assert "신청기간 외에는 추가 접수" in article.description
+    assert "10. 20.(화)" in article.description
+    # 제목·작성자 같은 머리 정보는 본문에 섞이지 않는다.
+    assert "조회수" not in article.description
+    assert [att.filename for att in article.attachments] == ["붙임2)건국가족신청서.xlsx"]
+    assert article.attachments[0].url == (
+        "https://www.konkuk.ac.kr/bbs/konkuk/235/1227131/download.do"
+    )
