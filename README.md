@@ -5,7 +5,7 @@
 ## 동작 방식
 
 - RSS와 공지 본문을 비동기로 수집합니다.
-- GPT‑5.6 Luna는 공지별로 사실을 독립 추출하고, Pydantic Structured Outputs가 결과 형식을 보장합니다.
+- GPT‑6 Luna는 공지별로 사실을 독립 추출하고, Pydantic Structured Outputs가 결과 형식을 보장합니다.
 - 대상 적격성, 관심도, 필수 행동, 놓쳤을 때의 손실을 하나의 관련도 점수로 합치지 않습니다.
 - 결정론적 정책 엔진이 `immediate` / `digest` / `review` / `suppress`를 선택합니다.
 - 대상이 불명확한 고위험 공지는 숨기지 않고 `review`로 보냅니다.
@@ -93,7 +93,7 @@
 
 ```yaml
 ai:
-  model: "gpt-5.6-luna"
+  model: "gpt-6-luna"
   reasoning_effort: "medium"
   max_concurrency: 4
   request_timeout_seconds: 45
