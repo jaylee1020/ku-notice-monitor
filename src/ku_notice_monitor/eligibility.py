@@ -17,6 +17,7 @@ from .profile_models import (
     ProfileFactKey,
     ProfileSnapshot,
 )
+from .util import normalize_for_match as _normalize
 
 
 class ConditionMatch(StrEnum):
@@ -46,10 +47,6 @@ _REGION_SUFFIXES = (
     "도",
     "시",
 )
-
-
-def _normalize(value: str) -> str:
-    return re.sub(r"[^0-9a-z가-힣]+", "", value.lower())
 
 
 def _normalize_location(value: str) -> str:

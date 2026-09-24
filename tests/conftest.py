@@ -1,24 +1,8 @@
-"""테스트 공통 설정 - 환경 호환성을 위한 모듈 모킹 및 공유 픽스처"""
-
-import sys
-from unittest.mock import MagicMock
+"""테스트 공유 픽스처."""
 
 import pytest
 
-# 외부 SDK가 설치되지 않았거나 로드 불가한 환경에서도
-# 테스트가 실행될 수 있도록 mock 처리
-for mod_name in [
-    "openai",
-    "telegram",
-    "feedparser",
-    "aiohttp",
-    "certifi",
-    "dotenv",
-]:
-    if mod_name not in sys.modules:
-        sys.modules[mod_name] = MagicMock()
-
-from ku_notice_monitor.models import Article, Attachment, ClassifiedNotice  # noqa: E402
+from ku_notice_monitor.models import Article, Attachment, ClassifiedNotice
 
 
 @pytest.fixture

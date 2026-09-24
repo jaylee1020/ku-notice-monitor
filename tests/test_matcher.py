@@ -12,17 +12,19 @@ from ku_notice_monitor import openai_classifier
 from ku_notice_monitor.analysis_models import NoticeAssessment, NoticeDate
 from ku_notice_monitor.classification import Delivery, classify_assessment, decide_delivery
 from ku_notice_monitor.document_extract import DocumentExtractionError
+from ku_notice_monitor.llm import is_retryable_api_error
 from ku_notice_monitor.matcher import keyword_fallback, match_articles, validate_assessment_grounding
 from ku_notice_monitor.models import Attachment
 from ku_notice_monitor.openai_classifier import (
+    AnalysisOutcome,
     MediaPayload,
     _build_input_content,
     _classify_one,
     _extension_of,
     _guess_mime_type,
-    _is_retryable_openai_error,
     _media_items,
     _prepare_pdf_payload,
+    _within_media_budget,
 )
 from ku_notice_monitor.prompts import build_profile_text, build_prompt, select_relevant_excerpt
 
@@ -183,7 +185,6 @@ def test_classify_assessment_builds_domain_result(make_article):
     )
     assert result.delivery == "digest"
     assert result.category == "scholarship"
-    assert result.score == 3
 
 
 def test_rule_fallback_caps_uncertain_optional_opportunity_at_digest(make_article):
@@ -326,15 +327,15 @@ def test_match_articles_openai_success(make_article):
         category="career",
         interest_fit="medium",
         consequence="missed_opportunity",
-    ).model_dump(mode="json")
+    )
     with patch(
         "ku_notice_monitor.matcher.analyze_with_openai",
         new_callable=AsyncMock,
-        return_value={article.key: raw},
+        return_value={article.key: AnalysisOutcome(raw)},
     ):
-        matched, method = asyncio.run(match_articles([article], _config()))
-    assert method == "openai"
-    assert matched[0].delivery == "digest"
+        result = asyncio.run(match_articles([article], _config()))
+    assert result.method == "openai"
+    assert result.notices[0].delivery == "digest"
 
 
 def test_match_articles_suppresses_unsupported_ulsan_opportunity(make_article):
@@ -378,7 +379,7 @@ def test_match_articles_suppresses_unsupported_ulsan_opportunity(make_article):
             },
         ],
         evidence=["울산광역시인 대학생"],
-    ).model_dump(mode="json")
+    )
     config = _config()
     config["profile_snapshot"] = {
         "summary": "서울 거주 학생",
@@ -401,7 +402,7 @@ def test_match_articles_suppresses_unsupported_ulsan_opportunity(make_article):
     with patch(
         "ku_notice_monitor.matcher.analyze_with_openai",
         new_callable=AsyncMock,
-        return_value={article.key: raw},
+        return_value={article.key: AnalysisOutcome(raw)},
     ):
         result = asyncio.run(match_articles([article], config))
     assert result.notices == []
@@ -416,23 +417,23 @@ def test_match_articles_partially_falls_back(make_article):
         category="career",
         interest_fit="medium",
         consequence="missed_opportunity",
-    ).model_dump(mode="json")
+    )
     with patch(
         "ku_notice_monitor.matcher.analyze_with_openai",
         new_callable=AsyncMock,
-        return_value={openai_article.key: raw},
+        return_value={openai_article.key: AnalysisOutcome(raw)},
     ):
-        matched, method = asyncio.run(
+        result = asyncio.run(
             match_articles([openai_article, failed_article], _config())
         )
-    assert method == "openai+rules"
-    assert any(item.source == "rules" for item in matched)
+    assert result.method == "openai+rules"
+    assert any(item.source == "rules" for item in result.notices)
 
 
 def test_match_articles_empty():
-    matched, method = asyncio.run(match_articles([], _config()))
-    assert matched == []
-    assert method == "none"
+    result = asyncio.run(match_articles([], _config()))
+    assert result.notices == []
+    assert result.method == "none"
 
 
 @pytest.mark.parametrize(
@@ -523,10 +524,11 @@ class _StatusError(Exception):
 
 
 def test_retryable_openai_error():
-    assert _is_retryable_openai_error(_StatusError(429)) is True
-    assert _is_retryable_openai_error(_StatusError(503)) is True
-    assert _is_retryable_openai_error(_StatusError(401)) is False
-    assert _is_retryable_openai_error(ValueError("bad schema")) is False
+    assert is_retryable_api_error(_StatusError(429)) is True
+    assert is_retryable_api_error(_StatusError(503)) is True
+    assert is_retryable_api_error(_StatusError(401)) is False
+    assert is_retryable_api_error(ValueError("bad schema")) is False
+    assert is_retryable_api_error(TimeoutError()) is True
 
 
 def test_ungrounded_ineligible_is_changed_to_unknown(make_article):
@@ -575,17 +577,18 @@ def test_call_openai_api_returns_parsed_schema():
     result = asyncio.run(
         openai_classifier._call_openai_api(
             client,
-            model_name="gpt-5.6-luna",
-            reasoning_effort="low",
-            content=[{"type": "input_text", "text": "test"}],
-            metrics=metrics,
+            _config(reasoning_effort="low"),
+            [{"type": "input_text", "text": "test"}],
+            metrics,
         )
     )
     assert result.interest_fit.value == "medium"
     kwargs = client.responses.parse.await_args.kwargs
     assert kwargs["model"] == "gpt-5.6-luna"
+    assert kwargs["reasoning"] == {"effort": "low"}
     assert kwargs["text_format"] is NoticeAssessment
     assert kwargs["store"] is False
+    assert kwargs["prompt_cache_key"].startswith("ku-notice:")
     assert metrics == {
         "request_attempts": 1,
         "successful_calls": 1,
@@ -596,12 +599,32 @@ def test_call_openai_api_returns_parsed_schema():
     }
 
 
+def test_call_openai_api_rejects_missing_structured_output():
+    response = SimpleNamespace(output_parsed=None, status="incomplete")
+    client = SimpleNamespace(
+        responses=SimpleNamespace(parse=AsyncMock(return_value=response))
+    )
+    with pytest.raises(ValueError, match="incomplete"):
+        asyncio.run(
+            openai_classifier._call_openai_api(
+                client,
+                _config(),
+                [{"type": "input_text", "text": "test"}],
+            )
+        )
+    # 스키마 오류는 재시도해도 같으므로 한 번만 호출한다.
+    assert client.responses.parse.await_count == 1
+
+
 def test_classify_one_only_loads_attachments_when_required(make_article):
     article = make_article(
         attachments=[Attachment("guide.pdf", "https://example.com/guide.pdf")]
     )
-    first = _assessment(attachment_need="required")
-    second = _assessment(attachment_need="not_needed", evidence=["첨부 확인"])
+    first = AnalysisOutcome(_assessment(attachment_need="required"))
+    second = AnalysisOutcome(
+        _assessment(attachment_need="not_needed", evidence=["첨부 확인"]),
+        attachment_text="첨부 확인",
+    )
     with patch(
         "ku_notice_monitor.openai_classifier._analyze_article",
         new_callable=AsyncMock,
@@ -615,7 +638,7 @@ def test_classify_one_only_loads_attachments_when_required(make_article):
                 asyncio.Semaphore(1),
             )
         )
-    assert result is not None
+    assert result == (article.key, second)
     assert analyze.await_count == 2
     assert analyze.await_args_list[0].kwargs["include_media"] is False
     assert analyze.await_args_list[1].kwargs["include_media"] is True
@@ -637,11 +660,120 @@ def test_analyze_with_openai_returns_results_by_article_key(
     articles = [make_article(id="1"), make_article(id="2")]
 
     async def fake_classify(client, article, config, semaphore, metrics=None):
-        return article.key, _assessment().model_dump(mode="json")
+        return article.key, AnalysisOutcome(_assessment())
 
     monkeypatch.setattr(openai_classifier, "_classify_one", fake_classify)
-    monkeypatch.setattr(openai_classifier, "AsyncOpenAI", lambda **kwargs: object())
+    monkeypatch.setattr(openai_classifier, "make_client", lambda config: AsyncMock())
     results = asyncio.run(
         openai_classifier.analyze_with_openai(articles, _config())
     )
     assert set(results) == {article.key for article in articles}
+
+
+def test_grounding_accepts_evidence_from_extracted_attachment_text(make_article):
+    assessment = _assessment(
+        evidence=["서울 소재 대학 재학생"],
+        dates=[{"kind": "application_deadline", "date": "2026-09-30", "label": "신청 마감"}],
+        eligibility_paths=[
+            {
+                "label": "재학생",
+                "conditions": [
+                    {
+                        "fact_key": "enrollment_status",
+                        "operator": "equals",
+                        "expected_values": ["재학"],
+                        "evidence": "서울 소재 대학 재학생",
+                    }
+                ],
+            }
+        ],
+    )
+    article = make_article(title="장학생 선발", description="자세한 내용은 첨부 참고")
+
+    without_attachment = validate_assessment_grounding(article, assessment)
+    with_attachment = validate_assessment_grounding(
+        article,
+        assessment,
+        attachment_text="지원 자격: 서울 소재 대학 재학생\n신청 기한: 2026. 9. 30.까지",
+    )
+
+    assert without_attachment.evidence == []
+    assert without_attachment.eligibility_paths == []
+    assert without_attachment.dates == []
+    assert with_attachment.evidence == ["서울 소재 대학 재학생"]
+    assert len(with_attachment.eligibility_paths) == 1
+    assert [item.date for item in with_attachment.dates] == ["2026-09-30"]
+
+
+def test_punctuation_only_evidence_is_not_grounded(make_article):
+    grounded = validate_assessment_grounding(
+        make_article(title="공지", description="내용"),
+        _assessment(evidence=["…", "--"]),
+    )
+    assert grounded.evidence == []
+
+
+def test_match_without_ai_uses_rules_and_marks_all_for_retry(make_article):
+    articles = [make_article(id="1", title="수강신청 안내"), make_article(id="2", title="인턴 모집")]
+    with patch(
+        "ku_notice_monitor.matcher.analyze_with_openai",
+        new_callable=AsyncMock,
+    ) as analyze:
+        result = asyncio.run(match_articles(articles, _config(), use_ai=False))
+    analyze.assert_not_awaited()
+    assert result.method == "rules"
+    assert result.failed_keys == {article.key for article in articles}
+
+
+def test_within_media_budget_skips_oversized_payloads(monkeypatch):
+    monkeypatch.setattr(openai_classifier, "MAX_TOTAL_MEDIA_SIZE", 10)
+    media = [
+        MediaPayload("a.md", "text/markdown", b"12345678", "file"),
+        MediaPayload("b.md", "text/markdown", b"12345", "file"),
+        MediaPayload("c.md", "text/markdown", b"12", "file"),
+    ]
+    assert [item.filename for item in _within_media_budget(media)] == ["a.md", "c.md"]
+
+
+def test_only_locally_extracted_media_counts_as_grounding_text():
+    assert MediaPayload("a.pdf.md", "text/markdown", "자격".encode(), "file").extracted_text == "자격"
+    assert MediaPayload("a.pdf", "application/pdf", b"%PDF", "file").extracted_text == ""
+
+
+def test_attachment_pass_failure_keeps_first_pass_and_marks_partial(make_article):
+    article = make_article(
+        attachments=[Attachment("guide.pdf", "https://example.com/guide.pdf")]
+    )
+    first = AnalysisOutcome(_assessment(attachment_need="required"))
+    metrics = {}
+    with patch(
+        "ku_notice_monitor.openai_classifier._analyze_article",
+        new_callable=AsyncMock,
+        side_effect=[first, TimeoutError("download stalled")],
+    ):
+        key, outcome = asyncio.run(
+            _classify_one(object(), article, _config(), asyncio.Semaphore(1), metrics)
+        )
+    assert key == article.key
+    assert outcome.partial is True
+    assert outcome.assessment.category == first.assessment.category
+    assert any("첨부" in item for item in outcome.assessment.uncertainties)
+    assert metrics["partial_articles"] == 1
+
+
+def test_partial_outcome_is_used_but_scheduled_for_retry(make_article):
+    article = make_article(title="인턴 모집")
+    outcome = AnalysisOutcome(
+        _assessment(category="career", interest_fit="medium", consequence="missed_opportunity"),
+        partial=True,
+    )
+    with patch(
+        "ku_notice_monitor.matcher.analyze_with_openai",
+        new_callable=AsyncMock,
+        return_value={article.key: outcome},
+    ):
+        result = asyncio.run(match_articles([article], _config()))
+    assert result.method == "openai"
+    assert result.notices[0].source == "openai"
+    assert result.failed_keys == {article.key}
+    assert result.metrics["rule_fallback_count"] == 0

@@ -1,9 +1,8 @@
 """모델이 추출한 사실을 알림 결정으로 바꾸는 결정론적 정책 엔진."""
 
-from datetime import date, datetime
+from datetime import date
 from enum import StrEnum
 from typing import Literal
-from zoneinfo import ZoneInfo
 
 from .analysis_models import (
     AudienceFit,
@@ -15,6 +14,7 @@ from .analysis_models import (
     Obligation,
 )
 from .models import Article, ClassifiedNotice
+from .util import now_kst
 
 
 class Delivery(StrEnum):
@@ -34,7 +34,6 @@ _DEADLINE_KINDS = {
     DateKind.DOCUMENT_DEADLINE,
     DateKind.PAYMENT_DEADLINE,
 }
-_KST = ZoneInfo("Asia/Seoul")
 
 
 def _nearest_deadline(assessment: NoticeAssessment) -> str | None:
@@ -63,7 +62,7 @@ def decide_delivery(
     중요한 공지를 숨기는 비용이 불필요한 알림 한 건보다 크므로, 고위험·불명확
     조합은 suppress 대신 review로 보낸다.
     """
-    current_date = today or datetime.now(_KST).date()
+    current_date = today or now_kst().date()
     high_impact = assessment.consequence in _HIGH_IMPACT
     deadline = _nearest_deadline(assessment)
     days_left = _days_until(deadline, current_date)

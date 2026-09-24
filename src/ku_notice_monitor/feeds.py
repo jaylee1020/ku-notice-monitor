@@ -12,6 +12,7 @@ from urllib.parse import urljoin, urlsplit, urlunsplit
 
 import aiohttp
 import feedparser
+from bs4 import BeautifulSoup
 from tenacity import retry, retry_if_exception, retry_if_exception_type, stop_after_attempt, wait_exponential
 
 from .constants import (
@@ -292,11 +293,6 @@ async def fetch_all_feeds_detailed(config: dict) -> FeedBatch:
     return FeedBatch(all_articles, statuses)
 
 
-async def fetch_all_feeds(config: dict) -> list[Article]:
-    """기존 호출부 호환용으로 공지 목록만 반환한다."""
-    return (await fetch_all_feeds_detailed(config)).articles
-
-
 # ---------------------------------------------------------------------------
 # 게시물 본문/이미지/첨부파일 크롤링
 # ---------------------------------------------------------------------------
@@ -453,10 +449,12 @@ async def _fetch_article_body_async(
     base_url: str,
     semaphore: asyncio.Semaphore,
     allowed_hosts: set[str],
-) -> tuple[str, list[str], list[Attachment]]:
-    """게시물 페이지에서 본문 텍스트, 이미지 URL, 첨부파일 정보를 크롤링한다."""
-    from bs4 import BeautifulSoup
+) -> tuple[str, list[str], list[Attachment]] | None:
+    """게시물 페이지에서 본문 텍스트, 이미지 URL, 첨부파일 정보를 크롤링한다.
 
+    페이지를 받지 못했거나 본문·첨부를 모두 찾지 못하면 ``None``을 반환한다. 이 경우를
+    빈 본문으로 취급하면 이전 상세 지문과 달라져 수정 공지로 오탐하게 된다.
+    """
     try:
         async with semaphore:
             html_data = await download_bytes(
@@ -468,14 +466,17 @@ async def _fetch_article_body_async(
                 max_size=MAX_ARTICLE_HTML_SIZE,
             )
         if html_data is None:
-            return "", [], []
+            return None
         html = html_data.decode("utf-8", errors="replace")
 
         soup = BeautifulSoup(html, "lxml")
         attachments = _extract_attachments(soup, base_url, allowed_hosts)
-
         content_div = soup.find("div", class_=BOARD_CONTENT_CLASS)
         if not content_div:
+            if not attachments:
+                # 오류 페이지처럼 본문도 첨부도 없는 응답은 실패로 본다.
+                logger.warning("본문 영역을 찾지 못했습니다 - %s", url)
+                return None
             return "", [], attachments
 
         text = _html_to_markdown(content_div)
@@ -488,7 +489,7 @@ async def _fetch_article_body_async(
         return text[:MAX_ARTICLE_BODY_LENGTH], image_urls, attachments
     except Exception as e:
         logger.warning("본문 크롤링 실패 - %s: %s", url, e)
-        return "", [], []
+        return None
 
 
 def _merge_description(rss_body: str, crawled_body: str) -> str:
@@ -501,10 +502,10 @@ def _merge_description(rss_body: str, crawled_body: str) -> str:
     return rss_body  # 크롤 실패 또는 동일 → RSS 유지
 
 
-async def enrich_articles_with_body(articles: list[Article], config: dict) -> None:
-    """새 공지들의 본문/이미지/첨부파일을 병렬 크롤링하여 Article에 채워 넣는다."""
+async def enrich_articles_with_body(articles: list[Article], config: dict) -> set[str]:
+    """공지 본문·이미지·첨부를 병렬 크롤링해 채우고, 성공한 공지 key를 반환한다."""
     if not articles:
-        return
+        return set()
 
     ssl_context = ssl_context_from_config(config)
     base_url = config["settings"]["base_url"]
@@ -529,23 +530,26 @@ async def enrich_articles_with_body(articles: list[Article], config: dict) -> No
             return_exceptions=True,
         )
 
-    for article, result in zip(link_articles, results):
+    enriched: set[str] = set()
+    for article, result in zip(link_articles, results, strict=True):
         if isinstance(result, BaseException):
             logger.warning("본문 크롤링 예외 - %s: %s", article.link, result)
             continue
+        if result is None:
+            continue
         body, image_urls, attachments = result
-
+        enriched.add(article.key)
         article.description = _merge_description(article.description or "", body)
-        if image_urls:
-            article.images = image_urls
+        article.images = image_urls
+        article.attachments = attachments
         if attachments:
-            article.attachments = attachments
             logger.debug(
                 "첨부파일 %d건 발견 - %s: %s",
                 len(attachments),
                 article.title,
                 ", ".join(att.filename for att in attachments),
             )
+    return enriched
 
 
 async def check_ssl_health(config: dict) -> bool:

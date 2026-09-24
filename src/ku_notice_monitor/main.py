@@ -1,4 +1,15 @@
-"""건국대학교 공지 모니터링 파이프라인."""
+"""건국대학교 공지 모니터링 파이프라인.
+
+한 번의 실행은 다음 단계로 이루어진다.
+
+1. 이전 실행에서 남은 알림 outbox를 먼저 전송한다.
+2. RSS를 수집하고 신규·수정·재시도·재확인 대상 공지를 고른다.
+3. 대상 공지의 상세 본문을 보강하고 AI/규칙으로 분류한다.
+4. 즉시 알림과 일일 요약을 outbox에 넣고 상태를 저장한 뒤 전송한다.
+
+모든 전송 결과는 즉시 상태 파일에 기록되므로, 실행이 중간에 실패해도 이미 보낸
+알림이 다시 전송되지 않는다.
+"""
 
 import asyncio
 import hashlib
@@ -6,10 +17,10 @@ import json
 import logging
 import sys
 import time
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
-from zoneinfo import ZoneInfo
 
 from .config import PROJECT_ROOT, load_config
 from .feeds import (
@@ -22,7 +33,9 @@ from .feeds import (
 from .matcher import match_articles
 from .models import Article, ClassifiedNotice
 from .notifier import (
-    build_digest_message,
+    TelegramDeliveryError,
+    TelegramNotConfiguredError,
+    build_digest_messages,
     build_first_run_message,
     build_no_new_message,
     build_no_relevant_message,
@@ -31,11 +44,17 @@ from .notifier import (
     send_telegram_part,
     split_message,
 )
-from .profile import profile_document_fingerprint, resolve_profile_snapshot
+from .profile import (
+    ProfileResolutionError,
+    profile_document_fingerprint,
+    resolve_profile_snapshot,
+)
 from .state import (
+    MAX_DELIVERY_ATTEMPTS,
     clear_classification_retry,
     clear_pending_digest,
     complete_delivery,
+    drop_delivery,
     due_classification_retry_keys,
     due_deliveries,
     enqueue_delivery,
@@ -49,9 +68,9 @@ from .state import (
     save_state,
     schedule_classification_retry,
 )
+from .util import KST, now_kst
 
 logger = logging.getLogger(__name__)
-_KST = ZoneInfo("Asia/Seoul")
 
 
 class NewArticleFloodError(RuntimeError):
@@ -60,6 +79,44 @@ class NewArticleFloodError(RuntimeError):
 
 class FeedCollectionError(RuntimeError):
     """수집 성공률이 안전 기준보다 낮을 때 발생한다."""
+
+
+class DeliveryConfigurationError(RuntimeError):
+    """텔레그램 토큰·채팅 설정 문제로 알림을 보낼 수 없을 때 발생한다.
+
+    메시지는 outbox에 보존되지만 사용자가 알 수 있도록 실행을 실패로 표시한다.
+    """
+
+
+def _new_stats() -> dict[str, Any]:
+    return {
+        "timestamp": now_kst().isoformat(),
+        "feeds_collected": 0,
+        "feeds_failed": 0,
+        "feed_failures": [],
+        "articles_found": 0,
+        "new_articles": 0,
+        "updated_articles": 0,
+        "matched_articles": 0,
+        "immediate_articles": 0,
+        "review_articles": 0,
+        "digest_queued": 0,
+        "digest_sent": 0,
+        "outbox_queued_parts": 0,
+        "outbox_sent_parts": 0,
+        "outbox_failed_parts": 0,
+        "outbox_dropped_parts": 0,
+        "classification_retry_count": 0,
+        "suppressed_articles": 0,
+        "analysis_metrics": {},
+        "detail_refreshed": 0,
+        "enrichment_failed": 0,
+        "profile_changed": False,
+        "profile_rechecked": 0,
+        "profile_metrics": {},
+        "method": "none",
+        "timing": {},
+    }
 
 
 def _validate_feed_health(feed_batch: FeedBatch, config: dict) -> float:
@@ -87,6 +144,8 @@ def setup_logging() -> None:
         datefmt="%Y-%m-%d %H:%M:%S",
         handlers=[logging.StreamHandler(sys.stdout)],
     )
+    # OpenAI SDK가 쓰는 httpx의 요청별 INFO 로그는 실행 요약을 가리는 소음이다.
+    logging.getLogger("httpx").setLevel(logging.WARNING)
 
 
 def _log_run_summary(stats: dict) -> None:
@@ -103,27 +162,18 @@ def _log_run_summary(stats: dict) -> None:
     logger.info("run_summary_json=%s", json.dumps({"event": "run_summary", **stats}, ensure_ascii=False))
 
 
-def _finalize_state(
-    state: dict,
-    state_path: str,
-    all_articles: list[Article],
-    stats: dict,
-    source_fingerprints: dict[str, str],
-    enriched_fingerprints: dict[str, str] | None = None,
-) -> None:
-    mark_as_seen(
-        all_articles,
-        state,
-        fingerprints=source_fingerprints,
-        enriched_fingerprints=enriched_fingerprints,
-    )
-    state["last_run_stats"] = stats
-    save_state(state, state_path)
-
-
 def _batch_key(prefix: str, values: list[str]) -> str:
     raw = "\0".join([prefix, *sorted(values)]).encode("utf-8")
     return hashlib.sha256(raw).hexdigest()
+
+
+def _unique_by_key(*groups: list[Article]) -> list[Article]:
+    return list({article.key: article for group in groups for article in group}.values())
+
+
+# ---------------------------------------------------------------------------
+# 대상 공지 선택
+# ---------------------------------------------------------------------------
 
 
 def _detail_refresh_is_due(
@@ -131,7 +181,7 @@ def _detail_refresh_is_due(
     config: dict,
     now: datetime | None = None,
 ) -> bool:
-    current = now or datetime.now(_KST)
+    current = now or now_kst()
     interval = config["settings"].get("detail_refresh_interval_hours", 6)
     last_raw = state.get("last_detail_refresh_at")
     if not last_raw:
@@ -141,7 +191,7 @@ def _detail_refresh_is_due(
     except (TypeError, ValueError):
         return True
     if last.tzinfo is None:
-        last = last.replace(tzinfo=_KST)
+        last = last.replace(tzinfo=KST)
     return current - last >= timedelta(hours=interval)
 
 
@@ -152,10 +202,11 @@ def _select_detail_refresh_articles(
     now: datetime | None = None,
 ) -> list[Article]:
     """최근 공지와 고정 공지를 제한적으로 다시 읽어 본문 수정도 감지한다."""
-    current = now or datetime.now(_KST)
+    current = now or now_kst()
     days = config["settings"].get("detail_refresh_days", 14)
     limit = config["settings"].get("detail_refresh_max_articles", 30)
-    cutoff = current.replace(tzinfo=None) - timedelta(days=days)
+    # RSS 게시일은 시간대 없는 KST 문자열이다.
+    cutoff = current.astimezone(KST).replace(tzinfo=None) - timedelta(days=days)
     seen = state.get("seen_ids", {})
     candidates: list[tuple[datetime, Article]] = []
     for article in articles:
@@ -171,6 +222,67 @@ def _select_detail_refresh_articles(
     return [article for _, article in candidates[:limit]]
 
 
+@dataclass(frozen=True)
+class _Targets:
+    """이번 실행에서 상세 본문을 읽을 공지 묶음."""
+
+    candidates: list[Article]
+    retries: list[Article]
+    refreshes: list[Article]
+    profile_rechecks: list[Article]
+
+    @property
+    def enrichment(self) -> list[Article]:
+        return _unique_by_key(
+            self.candidates, self.retries, self.refreshes, self.profile_rechecks
+        )
+
+
+def _select_targets(
+    all_articles: list[Article],
+    state: dict,
+    config: dict,
+    source_fingerprints: dict[str, str],
+    *,
+    refresh_due: bool,
+    profile_changed: bool,
+) -> _Targets:
+    retry_keys = due_classification_retry_keys(state)
+    recent = (
+        _select_detail_refresh_articles(all_articles, state, config)
+        if refresh_due or profile_changed
+        else []
+    )
+    return _Targets(
+        candidates=filter_new_articles(
+            all_articles,
+            state,
+            source_fingerprints=source_fingerprints,
+        ),
+        retries=[article for article in all_articles if article.key in retry_keys],
+        refreshes=recent if refresh_due else [],
+        profile_rechecks=recent if profile_changed else [],
+    )
+
+
+# ---------------------------------------------------------------------------
+# outbox
+# ---------------------------------------------------------------------------
+
+
+def _queue_parts(
+    state: dict,
+    parts: list[str],
+    *,
+    kind: str,
+    dedup_key: str,
+    metadata: dict | None = None,
+) -> int:
+    before = len(state.setdefault("pending_deliveries", []))
+    enqueue_delivery(parts, state, kind=kind, dedup_key=dedup_key, metadata=metadata)
+    return len(state["pending_deliveries"]) - before
+
+
 def _queue_message(
     state: dict,
     text: str,
@@ -179,15 +291,13 @@ def _queue_message(
     dedup_key: str,
     metadata: dict | None = None,
 ) -> int:
-    before = len(state.setdefault("pending_deliveries", []))
-    enqueue_delivery(
-        split_message(text),
+    return _queue_parts(
         state,
+        split_message(text),
         kind=kind,
         dedup_key=dedup_key,
         metadata=metadata,
     )
-    return len(state["pending_deliveries"]) - before
 
 
 def _queue_urgent_notifications(
@@ -197,15 +307,13 @@ def _queue_urgent_notifications(
     source_fingerprints: dict[str, str],
 ) -> int:
     """즉시·검토 공지를 공지별 메시지로 나누어 중복 없이 큐에 넣는다."""
-    if not urgent:
-        return 0
-    delivery_priority = {"immediate": 0, "review": 1}
     pending_notice_tokens = {
         str(token)
         for delivery in state.get("pending_deliveries", [])
         for token in delivery.get("metadata", {}).get("notice_tokens", [])
     }
     delivered_notice_tokens = state.setdefault("urgent_notice_history", {})
+    delivery_priority = {"immediate": 0, "review": 1}
 
     candidates: list[tuple[ClassifiedNotice, str]] = []
     for item in urgent:
@@ -217,27 +325,18 @@ def _queue_urgent_notifications(
                 item.delivery,
             ],
         )
-        if token in pending_notice_tokens or token in delivered_notice_tokens:
-            continue
-        candidates.append((item, token))
-
-    ordered_candidates = sorted(
-        candidates,
-        key=lambda item: (
-            delivery_priority.get(item[0].delivery, 2),
-            item[0].article.key,
-        ),
+        if token not in pending_notice_tokens and token not in delivered_notice_tokens:
+            candidates.append((item, token))
+    candidates.sort(
+        key=lambda pair: (delivery_priority.get(pair[0].delivery, 2), pair[0].article.key)
     )
-    if not ordered_candidates:
-        return 0
 
     queued_parts = 0
-    for item, notice_token in ordered_candidates:
+    for item, notice_token in candidates:
         urgent_key = _batch_key("urgent", [notice_token])
-        before = len(state.setdefault("pending_deliveries", []))
-        enqueue_delivery(
-            build_urgent_messages([item], total_new),
+        queued_parts += _queue_parts(
             state,
+            build_urgent_messages([item], total_new),
             kind="urgent",
             dedup_key=urgent_key,
             metadata={
@@ -246,19 +345,37 @@ def _queue_urgent_notifications(
                 "notice_tokens": [notice_token],
             },
         )
-        queued_parts += len(state["pending_deliveries"]) - before
     return queued_parts
 
 
-async def _flush_pending_deliveries(state: dict, state_path: str) -> dict[str, int]:
+def _record_group_completion(state: dict, completed: dict, result: dict) -> None:
+    """메시지 묶음의 마지막 조각이 처리되면 중복 방지 기록을 남긴다."""
+    metadata = completed.get("metadata", {})
+    if completed["kind"] == "digest":
+        if digest_date := metadata.get("digest_date"):
+            state["last_digest_sent_date"] = digest_date
+        result["digest_notices_sent"] += int(metadata.get("notice_count", 0))
+    elif completed["kind"] == "urgent":
+        delivered_at = datetime.now().isoformat()
+        history = state.setdefault("urgent_notice_history", {})
+        for token in metadata.get("notice_tokens", []):
+            history[str(token)] = delivered_at
+
+
+async def _flush_pending_deliveries(state: dict, state_path: str) -> dict[str, Any]:
     """현재 전송 가능한 outbox를 처리하고 각 결과를 즉시 영구 저장한다."""
-    result = {"sent_parts": 0, "failed_parts": 0, "digest_notices_sent": 0}
+    result: dict[str, Any] = {
+        "sent_parts": 0,
+        "failed_parts": 0,
+        "dropped_parts": 0,
+        "digest_notices_sent": 0,
+        "configuration_error": None,
+    }
     blocked_groups: set[str] = set()
     due_ids = {str(item.get("id")) for item in due_deliveries(state)}
 
     for item in list(state.get("pending_deliveries", [])):
-        metadata = item.get("metadata", {})
-        group_id = str(metadata.get("group_id") or item["id"])
+        group_id = str(item.get("metadata", {}).get("group_id") or item["id"])
         if group_id in blocked_groups:
             continue
         if str(item.get("id")) not in due_ids:
@@ -268,38 +385,63 @@ async def _flush_pending_deliveries(state: dict, state_path: str) -> dict[str, i
         try:
             await send_telegram_part(item["text"])
         except Exception as exc:
-            blocked_groups.add(group_id)
-            record_delivery_failure(state, item["id"], str(exc))
-            save_state(state, state_path)
-            result["failed_parts"] += 1
-            logger.error(
-                "outbox 전송 실패: kind=%s id=%s attempts=%s error=%s",
-                item["kind"],
-                item["id"][:12],
-                int(item.get("attempts", 0)) + 1,
-                exc,
+            if isinstance(exc, TelegramNotConfiguredError):
+                logger.warning("%s", exc)
+                break
+            if isinstance(exc, TelegramDeliveryError) and exc.configuration:
+                # 설정 문제는 메시지 탓이 아니므로 시도 횟수를 늘리지 않고 전송을 멈춘다.
+                result["configuration_error"] = str(exc)
+                logger.error("텔레그램 설정 문제로 outbox 전송을 중단합니다: %s", exc)
+                break
+            permanent = isinstance(exc, TelegramDeliveryError) and exc.permanent
+            retry_after = exc.retry_after if isinstance(exc, TelegramDeliveryError) else None
+            attempts = record_delivery_failure(
+                state,
+                item["id"],
+                str(exc),
+                retry_after_seconds=retry_after,
             )
+            if permanent or attempts >= MAX_DELIVERY_ATTEMPTS:
+                dropped = drop_delivery(state, item["id"])
+                result["dropped_parts"] += 1
+                logger.error(
+                    "outbox 항목을 포기합니다: kind=%s id=%s attempts=%s error=%s",
+                    item["kind"],
+                    item["id"][:12],
+                    attempts,
+                    exc,
+                )
+                if dropped and not has_delivery_group(state, group_id):
+                    _record_group_completion(state, dropped, result)
+            else:
+                blocked_groups.add(group_id)
+                result["failed_parts"] += 1
+                logger.error(
+                    "outbox 전송 실패: kind=%s id=%s attempts=%s error=%s",
+                    item["kind"],
+                    item["id"][:12],
+                    attempts,
+                    exc,
+                )
+            save_state(state, state_path)
             continue
 
         completed = complete_delivery(state, item["id"])
         result["sent_parts"] += 1
         if completed and not has_delivery_group(state, group_id):
-            completed_meta = completed.get("metadata", {})
-            if completed["kind"] == "digest":
-                digest_date = completed_meta.get("digest_date")
-                if digest_date:
-                    state["last_digest_sent_date"] = digest_date
-                result["digest_notices_sent"] += int(
-                    completed_meta.get("notice_count", 0)
-                )
-            elif completed["kind"] == "urgent":
-                delivered_at = datetime.now().isoformat()
-                history = state.setdefault("urgent_notice_history", {})
-                for token in completed_meta.get("notice_tokens", []):
-                    history[str(token)] = delivered_at
+            _record_group_completion(state, completed, result)
         save_state(state, state_path)
 
     return result
+
+
+def _add_delivery_stats(stats: dict, result: dict) -> None:
+    stats["outbox_sent_parts"] += result["sent_parts"]
+    stats["outbox_failed_parts"] += result["failed_parts"]
+    stats["outbox_dropped_parts"] += result.get("dropped_parts", 0)
+    stats["digest_sent"] += result["digest_notices_sent"]
+    if result.get("configuration_error"):
+        stats["delivery_configuration_error"] = result["configuration_error"]
 
 
 def _digest_is_due(
@@ -307,7 +449,7 @@ def _digest_is_due(
     now: datetime | None = None,
     state: dict | None = None,
 ) -> bool:
-    current = now or datetime.now(_KST)
+    current = now or now_kst()
     digest_hour = config["notifications"].get("digest_hour_kst", 21)
     if current.hour < digest_hour:
         return False
@@ -320,7 +462,7 @@ async def _flush_digest_if_due(
     now: datetime | None = None,
 ) -> int:
     """전송 시각이 지난 요약을 outbox로 원자적으로 이동한다."""
-    current = now or datetime.now(_KST)
+    current = now or now_kst()
     digest_date = current.date().isoformat()
     if not _digest_is_due(config, current, state):
         return 0
@@ -331,9 +473,9 @@ async def _flush_digest_if_due(
         state["last_digest_sent_date"] = digest_date
         return 0
     group_id = f"digest:{digest_date}"
-    _queue_message(
+    _queue_parts(
         state,
-        build_digest_message(pending),
+        build_digest_messages(pending),
         kind="digest",
         dedup_key=group_id,
         metadata={
@@ -347,59 +489,79 @@ async def _flush_digest_if_due(
     return len(pending)
 
 
-async def run() -> None:
-    logger.info("=== 건국대 공지 모니터링 시작 ===")
-    stats: dict[str, Any] = {
-        "timestamp": datetime.now(_KST).isoformat(),
-        "feeds_collected": 0,
-        "feeds_failed": 0,
-        "feed_failures": [],
-        "articles_found": 0,
-        "new_articles": 0,
-        "updated_articles": 0,
-        "matched_articles": 0,
-        "immediate_articles": 0,
-        "review_articles": 0,
-        "digest_queued": 0,
-        "digest_sent": 0,
-        "outbox_queued_parts": 0,
-        "outbox_sent_parts": 0,
-        "outbox_failed_parts": 0,
-        "classification_retry_count": 0,
-        "suppressed_articles": 0,
-        "analysis_metrics": {},
-        "detail_refreshed": 0,
-        "profile_changed": False,
-        "profile_rechecked": 0,
-        "profile_metrics": {},
-        "method": "none",
-        "timing": {},
-    }
+# ---------------------------------------------------------------------------
+# 분류
+# ---------------------------------------------------------------------------
 
-    typed_config = load_config()
-    config = typed_config.model_dump()
-    state_path = str(PROJECT_ROOT / config["settings"]["state_file"])
-    first_run = not Path(state_path).exists()
-    state = load_state(state_path)
-    current_profile_hash = profile_document_fingerprint(config)
-    previous_profile_hash = state.get("profile_document_hash")
-    profile_changed = (
-        isinstance(previous_profile_hash, str)
-        and previous_profile_hash != current_profile_hash
-    )
-    stats["profile_changed"] = profile_changed
 
-    retry_result = await _flush_pending_deliveries(state, state_path)
-    stats["outbox_sent_parts"] += retry_result["sent_parts"]
-    stats["outbox_failed_parts"] += retry_result["failed_parts"]
-    stats["digest_sent"] += retry_result["digest_notices_sent"]
-
-    if not config["settings"].get("ssl_verify", True):
-        await check_ssl_health(config)
+async def _classify_and_queue(
+    state: dict,
+    config: dict,
+    articles: list[Article],
+    *,
+    total_new: int,
+    source_fingerprints: dict[str, str],
+    stats: dict,
+) -> None:
+    profile_metrics: dict[str, Any] = {}
+    use_ai = True
+    try:
+        snapshot = await resolve_profile_snapshot(config, metrics=profile_metrics)
+        config["profile_snapshot"] = snapshot.model_dump(mode="json")
+    except ProfileResolutionError as exc:
+        # 개인화 기준 없이 AI 판정을 확정하면 잘못 숨긴 공지를 되돌릴 수 없다.
+        # 이번에는 보수적 규칙으로만 판정하고 모든 공지를 재분석 대상으로 남긴다.
+        logger.error("개인화 프로필을 확보하지 못해 규칙 판정 후 재분석을 예약합니다: %s", exc)
+        profile_metrics["error"] = str(exc)[:300]
+        use_ai = False
+    stats["profile_metrics"] = profile_metrics
 
     started = time.monotonic()
+    result = await match_articles(articles, config, use_ai=use_ai)
+    stats["timing"]["analyze"] = round(time.monotonic() - started, 2)
+    stats["method"] = result.method
+    stats["matched_articles"] = len(result.notices)
+    stats["suppressed_articles"] = result.suppressed_count
+    stats["analysis_metrics"] = result.metrics
+
+    for article in articles:
+        if article.key in result.failed_keys:
+            schedule_classification_retry(state, article.key)
+        else:
+            clear_classification_retry(state, article.key)
+    stats["classification_retry_count"] = len(state.get("classification_retries", {}))
+
+    urgent = [item for item in result.notices if item.delivery in {"immediate", "review"}]
+    digest = [item for item in result.notices if item.delivery == "digest"]
+    stats["immediate_articles"] = sum(item.delivery == "immediate" for item in urgent)
+    stats["review_articles"] = sum(item.delivery == "review" for item in urgent)
+    stats["digest_queued"] = len(digest)
+
+    stats["outbox_queued_parts"] += _queue_urgent_notifications(
+        state,
+        urgent,
+        total_new,
+        source_fingerprints,
+    )
+    if digest:
+        enqueue_digest(digest, state)
+    if not result.notices and config["notifications"].get("notify_empty_runs", False):
+        stats["outbox_queued_parts"] += _queue_message(
+            state,
+            build_no_relevant_message(total_new),
+            kind="status",
+            dedup_key=_batch_key("no-relevant", list(source_fingerprints.values())),
+        )
+
+
+# ---------------------------------------------------------------------------
+# 실행
+# ---------------------------------------------------------------------------
+
+
+async def _collect_feeds(config: dict, stats: dict) -> FeedBatch:
+    started = time.monotonic()
     feed_batch = await fetch_all_feeds_detailed(config)
-    all_articles = feed_batch.articles
     stats["timing"]["fetch_feeds"] = round(time.monotonic() - started, 2)
     stats["feeds_collected"] = feed_batch.successful_count
     stats["feeds_failed"] = feed_batch.failed_count
@@ -408,9 +570,58 @@ async def run() -> None:
         for status in feed_batch.statuses
         if not status.success
     ]
-    stats["articles_found"] = len(all_articles)
+    stats["articles_found"] = len(feed_batch.articles)
     stats["feed_success_ratio"] = _validate_feed_health(feed_batch, config)
-    logger.info("총 %d건 수집", len(all_articles))
+    logger.info("총 %d건 수집", len(feed_batch.articles))
+    return feed_batch
+
+
+async def _finish(
+    state: dict,
+    state_path: str,
+    stats: dict,
+    all_articles: list[Article],
+    source_fingerprints: dict[str, str],
+    enriched_fingerprints: dict[str, str] | None = None,
+) -> None:
+    """공지를 확인 처리해 저장한 뒤 outbox를 전송한다."""
+    mark_as_seen(
+        all_articles,
+        state,
+        fingerprints=source_fingerprints,
+        enriched_fingerprints=enriched_fingerprints,
+    )
+    state["last_run_stats"] = stats
+    save_state(state, state_path)
+    _add_delivery_stats(stats, await _flush_pending_deliveries(state, state_path))
+    state["last_run_stats"] = stats
+    save_state(state, state_path)
+    _log_run_summary(stats)
+
+
+async def run() -> None:
+    logger.info("=== 건국대 공지 모니터링 시작 ===")
+    stats = _new_stats()
+    config = load_config().model_dump()
+    state_path = str(PROJECT_ROOT / config["settings"]["state_file"])
+    first_run = not Path(state_path).exists()
+    state = load_state(state_path)
+
+    current_profile_hash = profile_document_fingerprint(config)
+    previous_profile_hash = state.get("profile_document_hash")
+    profile_changed = (
+        isinstance(previous_profile_hash, str)
+        and previous_profile_hash != current_profile_hash
+    )
+    stats["profile_changed"] = profile_changed
+
+    _add_delivery_stats(stats, await _flush_pending_deliveries(state, state_path))
+
+    if not config["settings"].get("ssl_verify", True):
+        await check_ssl_health(config)
+
+    feed_batch = await _collect_feeds(config, stats)
+    all_articles = feed_batch.articles
     source_fingerprints = {article.key: article.fingerprint for article in all_articles}
 
     if first_run and config["settings"].get("seed_on_first_run", True) and all_articles:
@@ -423,53 +634,36 @@ async def run() -> None:
             metadata={"group_id": "first-run"},
         )
         state["profile_document_hash"] = current_profile_hash
-        _finalize_state(state, state_path, all_articles, stats, source_fingerprints)
-        delivery_result = await _flush_pending_deliveries(state, state_path)
-        stats["outbox_sent_parts"] += delivery_result["sent_parts"]
-        stats["outbox_failed_parts"] += delivery_result["failed_parts"]
-        state["last_run_stats"] = stats
-        save_state(state, state_path)
-        _log_run_summary(stats)
+        await _finish(state, state_path, stats, all_articles, source_fingerprints)
+        _raise_for_delivery_configuration(stats)
         return
 
-    preliminary_new = filter_new_articles(
+    refresh_due = _detail_refresh_is_due(state, config)
+    targets = _select_targets(
         all_articles,
         state,
-        source_fingerprints=source_fingerprints,
+        config,
+        source_fingerprints,
+        refresh_due=refresh_due,
+        profile_changed=profile_changed,
     )
-    retry_keys = due_classification_retry_keys(state)
-    retry_articles = [article for article in all_articles if article.key in retry_keys]
-    refresh_due = _detail_refresh_is_due(state, config)
-    refresh_articles = (
-        _select_detail_refresh_articles(all_articles, state, config)
-        if refresh_due
-        else []
-    )
-    profile_recheck_articles = (
-        _select_detail_refresh_articles(all_articles, state, config)
-        if profile_changed
-        else []
-    )
-    stats["profile_rechecked"] = len(profile_recheck_articles)
-    enrichment_by_key = {
-        article.key: article
-        for article in [
-            *preliminary_new,
-            *retry_articles,
-            *refresh_articles,
-            *profile_recheck_articles,
-        ]
-    }
-    enrichment_targets = list(enrichment_by_key.values())
+    stats["profile_rechecked"] = len(targets.profile_rechecks)
+
+    enrichment_targets = targets.enrichment
+    enriched_keys: set[str] = set()
     if enrichment_targets:
         started = time.monotonic()
-        await enrich_articles_with_body(enrichment_targets, config)
+        enriched_keys = await enrich_articles_with_body(enrichment_targets, config)
         stats["timing"]["enrich_articles"] = round(time.monotonic() - started, 2)
+        stats["enrichment_failed"] = len(enrichment_targets) - len(enriched_keys)
     if refresh_due:
-        state["last_detail_refresh_at"] = datetime.now(_KST).isoformat()
-        stats["detail_refreshed"] = len(refresh_articles)
+        state["last_detail_refresh_at"] = now_kst().isoformat()
+        stats["detail_refreshed"] = len(targets.refreshes)
+    # 크롤링에 실패한 공지의 지문은 RSS 요약 기준이라 이전 상세 지문과 비교하면 안 된다.
     enriched_fingerprints = {
-        article.key: article.fingerprint for article in enrichment_targets
+        article.key: article.fingerprint
+        for article in enrichment_targets
+        if article.key in enriched_keys
     }
     new_articles = filter_new_articles(
         all_articles,
@@ -486,93 +680,45 @@ async def run() -> None:
             "초과했습니다. state와 피드 구조를 확인하세요."
         )
 
-    classification_by_key = {
-        article.key: article
-        for article in [
-            *new_articles,
-            *retry_articles,
-            *profile_recheck_articles,
-        ]
-    }
-    classification_articles = list(classification_by_key.values())
-
+    classification_articles = _unique_by_key(
+        new_articles, targets.retries, targets.profile_rechecks
+    )
     if classification_articles:
-        profile_metrics: dict[str, Any] = {}
-        profile_snapshot = await resolve_profile_snapshot(
+        await _classify_and_queue(
+            state,
             config,
-            metrics=profile_metrics,
+            classification_articles,
+            total_new=len(new_articles),
+            source_fingerprints=source_fingerprints,
+            stats=stats,
         )
-        config["profile_snapshot"] = profile_snapshot.model_dump(mode="json")
-        stats["profile_metrics"] = profile_metrics
-        started = time.monotonic()
-        match_result = await match_articles(classification_articles, config)
-        matched, method = match_result
-        stats["timing"]["analyze"] = round(time.monotonic() - started, 2)
-        stats["method"] = method
-        stats["matched_articles"] = len(matched)
-        stats["suppressed_articles"] = match_result.suppressed_count
-        stats["analysis_metrics"] = match_result.metrics
-        for article in classification_articles:
-            if article.key in match_result.failed_keys:
-                schedule_classification_retry(state, article.key)
-            else:
-                clear_classification_retry(state, article.key)
-        stats["classification_retry_count"] = len(
-            state.get("classification_retries", {})
-        )
-
-        urgent = [
-            item for item in matched if item.delivery in {"immediate", "review"}
-        ]
-        digest = [item for item in matched if item.delivery == "digest"]
-        stats["immediate_articles"] = sum(
-            item.delivery == "immediate" for item in urgent
-        )
-        stats["review_articles"] = sum(item.delivery == "review" for item in urgent)
-        stats["digest_queued"] = len(digest)
-
-        if urgent:
-            stats["outbox_queued_parts"] += _queue_urgent_notifications(
-                state,
-                urgent,
-                len(new_articles),
-                source_fingerprints,
-            )
-        if digest:
-            enqueue_digest(digest, state)
-        if not matched and config["notifications"].get("notify_empty_runs", False):
-            stats["outbox_queued_parts"] += _queue_message(
-                state,
-                build_no_relevant_message(len(new_articles)),
-                kind="status",
-                dedup_key=_batch_key("no-relevant", list(source_fingerprints.values())),
-            )
     elif config["notifications"].get("notify_empty_runs", False):
         stats["outbox_queued_parts"] += _queue_message(
             state,
             build_no_new_message(),
             kind="status",
-            dedup_key=f"no-new:{datetime.now(_KST).date().isoformat()}",
+            dedup_key=f"no-new:{now_kst().date().isoformat()}",
         )
 
     stats["digest_queued"] += await _flush_digest_if_due(state, config)
     state["profile_document_hash"] = current_profile_hash
-    _finalize_state(
+    await _finish(
         state,
         state_path,
-        all_articles,
         stats,
+        all_articles,
         source_fingerprints,
         enriched_fingerprints,
     )
-    delivery_result = await _flush_pending_deliveries(state, state_path)
-    stats["outbox_sent_parts"] += delivery_result["sent_parts"]
-    stats["outbox_failed_parts"] += delivery_result["failed_parts"]
-    stats["digest_sent"] += delivery_result["digest_notices_sent"]
-    state["last_run_stats"] = stats
-    save_state(state, state_path)
-    _log_run_summary(stats)
+    _raise_for_delivery_configuration(stats)
     logger.info("=== 완료 ===")
+
+
+def _raise_for_delivery_configuration(stats: dict) -> None:
+    if error := stats.get("delivery_configuration_error"):
+        raise DeliveryConfigurationError(
+            f"알림을 보낼 수 없습니다. 메시지는 보존되었습니다: {error}"
+        )
 
 
 def main() -> None:

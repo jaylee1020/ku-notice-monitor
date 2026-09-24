@@ -5,7 +5,7 @@ from unittest.mock import patch
 
 import pytest
 
-from ku_notice_monitor.config import AIConfig, _load_json_env, _load_text_env, validate_config
+from ku_notice_monitor.config import AIConfig, _load_json_env, _load_text_env, load_config, validate_config
 
 # --- _load_json_env ---
 
@@ -169,7 +169,7 @@ def test_validate_config_ssl_verify_wrong_type():
 def test_validate_config_feed_id_must_be_int():
     config = _make_valid_config()
     config["feeds"]["bad"] = {"id": "234", "enabled": True}
-    with pytest.raises(ValueError, match="정수"):
+    with pytest.raises(ValueError, match=r"feeds\.bad\.id"):
         validate_config(config)
 
 
@@ -193,8 +193,40 @@ def test_validate_config_invalid_reasoning_effort():
         validate_config(config)
 
 
+def test_validate_config_rejects_unknown_keys():
+    config = _make_valid_config()
+    config["ai"]["reasoning_efort"] = "high"  # 오타
+    with pytest.raises(ValueError, match="reasoning_efort"):
+        validate_config(config)
+
+
+def test_validate_config_returns_typed_config():
+    config = validate_config(_make_valid_config())
+    assert config.ai.model == "gpt-5.6-luna"
+    assert config.settings.detail_refresh_days == 14
+
+
 def test_validate_config_invalid_digest_hour():
     config = _make_valid_config()
     config["notifications"]["digest_hour_kst"] = 24
     with pytest.raises(ValueError, match="digest_hour_kst"):
         validate_config(config)
+
+
+def test_repository_config_yaml_is_valid(monkeypatch):
+    for name in ("PROFILE_TEXT", "PROFILE_JSON", "KEYWORDS_JSON"):
+        monkeypatch.delenv(name, raising=False)
+    with patch("ku_notice_monitor.config.load_dotenv"):
+        config = load_config()
+    assert config.ai.model
+    assert config.feeds["학사공지"].id == 234
+    assert "konkuk.ac.kr" in config.settings.allowed_download_hosts
+
+
+def test_load_config_applies_environment_profile(monkeypatch):
+    monkeypatch.setenv("PROFILE_TEXT", "  나는 서울에 산다.  ")
+    monkeypatch.setenv("KEYWORDS_JSON", '{"high": ["장학"]}')
+    with patch("ku_notice_monitor.config.load_dotenv"):
+        config = load_config()
+    assert config.profile_text == "나는 서울에 산다."
+    assert config.keywords.high == ["장학"]

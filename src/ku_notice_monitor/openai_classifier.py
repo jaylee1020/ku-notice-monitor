@@ -1,16 +1,13 @@
-"""GPT-5.6 Luna 공지별 사실 추출기와 선택적 첨부 분석."""
+"""OpenAI 공지별 사실 추출기와 선택적 첨부 분석."""
 
 import asyncio
 import base64
 import logging
 import mimetypes
-import os
 from dataclasses import dataclass
-from typing import Any
 
 import aiohttp
 from openai import AsyncOpenAI
-from tenacity import retry, retry_if_exception, stop_after_attempt, wait_exponential
 
 from .analysis_models import (
     ASSESSMENT_SCHEMA_VERSION,
@@ -18,7 +15,6 @@ from .analysis_models import (
     NoticeAssessment,
 )
 from .constants import (
-    AI_MAX_CONCURRENCY,
     ATTACHMENT_DOWNLOAD_TIMEOUT,
     IMAGE_DOWNLOAD_TIMEOUT,
     MAX_ATTACHMENT_SIZE,
@@ -36,6 +32,7 @@ from .document_extract import (
     extract_hwp_markdown,
     extract_pdf_markdown,
 )
+from .llm import empty_usage, make_client, openai_configured, parse_structured
 from .models import Article
 from .net import (
     DEFAULT_HEADERS,
@@ -55,11 +52,31 @@ class MediaPayload:
     data: bytes
     kind: str
 
+    @property
+    def extracted_text(self) -> str:
+        """로컬에서 텍스트로 변환한 첨부만 근거 검증 원문으로 쓸 수 있다."""
+        if self.mime_type != "text/markdown":
+            return ""
+        return self.data.decode("utf-8", errors="replace")
+
 
 @dataclass(frozen=True)
 class MediaDownloadResult:
     payloads: list[MediaPayload]
     failed_names: list[str]
+
+
+@dataclass(frozen=True)
+class AnalysisOutcome:
+    """모델 판정과, 판정 근거를 검증할 때 본문 외에 참고할 첨부 추출 텍스트.
+
+    ``partial``은 필요한 첨부 분석이 실패해 1차 판정만 있다는 뜻이다. 이번 실행에는
+    1차 판정을 쓰되 호출자가 재분석을 예약해야 한다.
+    """
+
+    assessment: NoticeAssessment
+    attachment_text: str = ""
+    partial: bool = False
 
 
 def _extension_of(name: str) -> str:
@@ -190,7 +207,7 @@ async def _download_media(
 
     payloads: list[MediaPayload] = []
     failed_names: list[str] = []
-    for item, result in zip(items, results):
+    for item, result in zip(items, results, strict=True):
         if isinstance(result, BaseException):
             logger.debug("미디어 다운로드 실패: %s", result)
             failed_names.append(item[1])
@@ -201,18 +218,25 @@ async def _download_media(
     return MediaDownloadResult(payloads, failed_names)
 
 
-def _build_input_content(
-    prompt: str,
-    media: list[MediaPayload],
-    config: dict,
-) -> list[dict]:
-    content: list[dict] = [{"type": "input_text", "text": prompt}]
+def _within_media_budget(media: list[MediaPayload]) -> list[MediaPayload]:
+    selected: list[MediaPayload] = []
     total_bytes = 0
     for item in media:
         if total_bytes + len(item.data) > MAX_TOTAL_MEDIA_SIZE:
             logger.warning("요청 미디어 총량 제한으로 %s 첨부를 건너뜁니다.", item.filename)
             continue
         total_bytes += len(item.data)
+        selected.append(item)
+    return selected
+
+
+def _build_input_content(
+    prompt: str,
+    media: list[MediaPayload],
+    config: dict,
+) -> list[dict]:
+    content: list[dict] = [{"type": "input_text", "text": prompt}]
+    for item in media:
         encoded = base64.b64encode(item.data).decode("ascii")
         data_url = f"data:{item.mime_type};base64,{encoded}"
         if item.kind == "image":
@@ -235,70 +259,21 @@ def _build_input_content(
     return content
 
 
-def _is_retryable_openai_error(exc: BaseException) -> bool:
-    if isinstance(exc, (asyncio.TimeoutError, TimeoutError, ConnectionError)):
-        return True
-    if isinstance(exc, (ValueError, TypeError, KeyError)):
-        return False
-    status = getattr(exc, "status_code", None)
-    return isinstance(status, int) and (status == 429 or 500 <= status < 600)
-
-
-@retry(
-    retry=retry_if_exception(_is_retryable_openai_error),
-    stop=stop_after_attempt(3),
-    wait=wait_exponential(multiplier=1, min=2, max=16),
-    reraise=True,
-)
 async def _call_openai_api(
     client: AsyncOpenAI,
-    *,
-    model_name: str,
-    reasoning_effort: str,
+    config: dict,
     content: list[dict],
     metrics: dict | None = None,
 ) -> NoticeAssessment:
-    if metrics is not None:
-        metrics["request_attempts"] = metrics.get("request_attempts", 0) + 1
-    request_input: Any = [
-        {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user", "content": content},
-    ]
-    reasoning: Any = {"effort": reasoning_effort}
-    response = await client.responses.parse(
-        model=model_name,
-        input=request_input,
-        reasoning=reasoning,
-        text_format=NoticeAssessment,
-        store=False,
+    return await parse_structured(
+        client,
+        config=config,
+        system_prompt=SYSTEM_PROMPT,
+        user_content=content,
+        output_type=NoticeAssessment,
+        cache_key=f"ku-notice:{PROMPT_VERSION}",
+        metrics=metrics,
     )
-    if response.output_parsed is None:
-        raise ValueError("OpenAI 응답에 구조화된 분석 결과가 없습니다.")
-    usage = getattr(response, "usage", None)
-    if usage is not None:
-        input_tokens = getattr(usage, "input_tokens", 0) or 0
-        output_tokens = getattr(usage, "output_tokens", 0) or 0
-        total_tokens = getattr(usage, "total_tokens", 0) or 0
-        input_details = getattr(usage, "input_tokens_details", None)
-        cached_tokens = getattr(input_details, "cached_tokens", 0) or 0
-        logger.info(
-            "OpenAI 사용량: input=%s, output=%s, total=%s",
-            input_tokens,
-            output_tokens,
-            total_tokens,
-        )
-        if metrics is not None:
-            metrics["successful_calls"] = metrics.get("successful_calls", 0) + 1
-            metrics["input_tokens"] = metrics.get("input_tokens", 0) + input_tokens
-            metrics["output_tokens"] = metrics.get("output_tokens", 0) + output_tokens
-            metrics["total_tokens"] = metrics.get("total_tokens", 0) + total_tokens
-            metrics["cached_input_tokens"] = (
-                metrics.get("cached_input_tokens", 0) + cached_tokens
-            )
-    request_id = getattr(response, "_request_id", None)
-    if request_id:
-        logger.info("OpenAI request_id=%s", request_id)
-    return response.output_parsed
 
 
 async def _analyze_article(
@@ -308,24 +283,24 @@ async def _analyze_article(
     *,
     include_media: bool,
     metrics: dict | None = None,
-) -> NoticeAssessment:
+) -> AnalysisOutcome:
     download = (
         await _download_media(article, config)
         if include_media
         else MediaDownloadResult([], [])
     )
+    media = _within_media_budget(download.payloads)
     prompt = build_prompt(
         article,
         build_profile_text(config),
-        attachments_included=bool(download.payloads),
+        attachments_included=bool(media),
         unreadable_attachments=download.failed_names,
     )
     assessment = await _call_openai_api(
         client,
-        model_name=config["ai"]["model"],
-        reasoning_effort=config["ai"].get("reasoning_effort", "medium"),
-        content=_build_input_content(prompt, download.payloads, config),
-        metrics=metrics,
+        config,
+        _build_input_content(prompt, media, config),
+        metrics,
     )
     if download.failed_names:
         uncertainty = (
@@ -337,7 +312,10 @@ async def _analyze_article(
                 "uncertainties": [*assessment.uncertainties, uncertainty][:5],
             }
         )
-    return assessment
+    attachment_text = "\n".join(
+        text for item in media if (text := item.extracted_text)
+    )
+    return AnalysisOutcome(assessment, attachment_text)
 
 
 async def _classify_one(
@@ -346,29 +324,16 @@ async def _classify_one(
     config: dict,
     semaphore: asyncio.Semaphore,
     metrics: dict | None = None,
-) -> tuple[str, dict] | None:
+) -> tuple[str, AnalysisOutcome] | None:
     async with semaphore:
         try:
-            assessment = await _analyze_article(
+            outcome = await _analyze_article(
                 client,
                 article,
                 config,
                 include_media=False,
                 metrics=metrics,
             )
-            if (
-                assessment.attachment_need == AttachmentNeed.REQUIRED
-                and _media_items(article)
-            ):
-                logger.info("%s: 핵심 판정에 첨부 확인이 필요해 2차 분석합니다.", article.key)
-                assessment = await _analyze_article(
-                    client,
-                    article,
-                    config,
-                    include_media=True,
-                    metrics=metrics,
-                )
-            return article.key, assessment.model_dump(mode="json")
         except Exception as exc:
             if metrics is not None:
                 metrics["failed_articles"] = metrics.get("failed_articles", 0) + 1
@@ -380,15 +345,45 @@ async def _classify_one(
             )
             return None
 
+        if not (
+            outcome.assessment.attachment_need == AttachmentNeed.REQUIRED
+            and _media_items(article)
+        ):
+            return article.key, outcome
+
+        logger.info("%s: 핵심 판정에 첨부 확인이 필요해 2차 분석합니다.", article.key)
+        try:
+            return article.key, await _analyze_article(
+                client,
+                article,
+                config,
+                include_media=True,
+                metrics=metrics,
+            )
+        except Exception as exc:
+            if metrics is not None:
+                metrics["partial_articles"] = metrics.get("partial_articles", 0) + 1
+            logger.warning(
+                "%s 첨부 2차 분석 실패. 1차 판정을 쓰고 재분석을 예약합니다: %s",
+                article.key,
+                exc,
+            )
+            assessment = outcome.assessment
+            uncertainties = [*assessment.uncertainties, "첨부파일 분석에 실패해 본문만으로 판정함"]
+            return article.key, AnalysisOutcome(
+                assessment.model_copy(update={"uncertainties": uncertainties[-5:]}),
+                partial=True,
+            )
+
 
 async def analyze_with_openai(
     articles: list[Article],
     config: dict,
     *,
     metrics: dict | None = None,
-) -> dict[str, dict]:
-    """공지별 독립 분석 결과를 key로 반환한다."""
-    if not os.environ.get("OPENAI_API_KEY"):
+) -> dict[str, AnalysisOutcome]:
+    """공지별 독립 분석 결과를 key로 반환한다. 실패한 공지는 결과에서 빠진다."""
+    if not openai_configured():
         logger.warning("OPENAI_API_KEY가 없어 규칙 기반 분류로 대체합니다.")
         return {}
 
@@ -399,33 +394,20 @@ async def analyze_with_openai(
                 "prompt_version": PROMPT_VERSION,
                 "schema_version": ASSESSMENT_SCHEMA_VERSION,
                 "articles_requested": len(articles),
-                "request_attempts": 0,
-                "successful_calls": 0,
                 "failed_articles": 0,
-                "input_tokens": 0,
-                "output_tokens": 0,
-                "total_tokens": 0,
-                "cached_input_tokens": 0,
+                "partial_articles": 0,
+                **empty_usage(),
             }
         )
-    client = AsyncOpenAI(
-        api_key=os.environ["OPENAI_API_KEY"],
-        timeout=config["ai"].get("request_timeout_seconds", 45),
-        max_retries=0,
-    )
-    semaphore = asyncio.Semaphore(
-        config["ai"].get("max_concurrency", AI_MAX_CONCURRENCY)
-    )
-    results = await asyncio.gather(
-        *(
-            _classify_one(
-                client,
-                article,
-                config,
-                semaphore,
-                metrics=metrics,
+    client = make_client(config)
+    semaphore = asyncio.Semaphore(config["ai"].get("max_concurrency", 4))
+    try:
+        results = await asyncio.gather(
+            *(
+                _classify_one(client, article, config, semaphore, metrics=metrics)
+                for article in articles
             )
-            for article in articles
         )
-    )
+    finally:
+        await client.close()
     return dict(item for item in results if item is not None)

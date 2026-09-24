@@ -15,6 +15,8 @@ jobs:
     timeout-minutes: 15  # 네트워크 행(hang) 시 기본 6시간 동안 러너가 잡혀 있는 것을 방지
     permissions:
       contents: read
+    outputs:
+      state_uploaded: ${{ steps.upload_state.outcome == 'success' }}
 
     steps:
       - name: Checkout
@@ -33,9 +35,19 @@ jobs:
 
       - name: Load runtime state
         run: |
-          git fetch --no-tags origin refs/heads/monitor-state:refs/remotes/origin/monitor-state || true
-          if git show-ref --verify --quiet refs/remotes/origin/monitor-state; then
+          # 네트워크 오류를 "상태 없음"으로 오인하면 최초 실행처럼 공지를 시드해 버리므로,
+          # 브랜치가 실제로 없을 때(exit 2)만 새 상태로 시작한다.
+          rm -f state.json
+          status=0
+          git ls-remote --exit-code --heads origin monitor-state > /dev/null || status=$?
+          if [ "$status" -eq 0 ]; then
+            git fetch --no-tags origin refs/heads/monitor-state:refs/remotes/origin/monitor-state
             git show origin/monitor-state:state.json > state.json
+          elif [ "$status" -eq 2 ]; then
+            echo "monitor-state 브랜치가 없어 최초 실행으로 시작합니다."
+          else
+            echo "::error::monitor-state 브랜치를 확인하지 못했습니다 (exit $status)."
+            exit 1
           fi
 
       - name: Install locked dependencies
@@ -52,24 +64,17 @@ jobs:
           KEYWORDS_JSON: ${{ secrets.KEYWORDS_JSON }}
         run: uv run --no-sync ku-notice-monitor
 
+      # 상태는 전송 한 건마다 원자적으로 저장되므로 실행이 중간에 실패해도 일관적이다.
+      # 실패한 실행의 상태도 보존해야 이미 보낸 알림을 다음 실행에서 다시 보내지 않는다.
       - name: Upload runtime state
-        if: success()
+        id: upload_state
+        if: always() && hashFiles('state.json') != ''
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: runtime-state
           path: state.json
           retention-days: 1
           if-no-files-found: error
-
-      - name: Upload logs on failure
-        if: failure()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: monitor-logs
-          path: |
-            *.log
-            state.json
-          retention-days: 7
 
       - name: Notify on failure
         if: failure()
@@ -88,7 +93,7 @@ jobs:
 
   persist-state:
     needs: monitor
-    if: needs.monitor.result == 'success'
+    if: always() && needs.monitor.outputs.state_uploaded == 'true'
     runs-on: ubuntu-latest
     permissions:
       contents: write

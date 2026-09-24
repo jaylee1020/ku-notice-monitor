@@ -4,15 +4,13 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ku-notice-monitor"
-version = "2.0.0"
+version = "3.0.0"
 description = "건국대학교 공지사항 모니터링 에이전트"
 requires-python = ">=3.12"
 dependencies = [
     "feedparser>=6.0",
     "openai>=2.0",
-    "httpx[socks]>=0.28",
     "pydantic>=2.0",
-    "python-telegram-bot>=21.0",
     "python-dotenv>=1.0",
     "pyyaml>=6.0",
     "beautifulsoup4>=4.12",
@@ -43,7 +41,7 @@ line-length = 120
 target-version = "py312"
 
 [tool.ruff.lint]
-select = ["E", "F", "W", "I"]
+select = ["E", "F", "W", "I", "B", "UP"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
@@ -56,7 +54,7 @@ source = ["ku_notice_monitor"]
 [tool.coverage.report]
 show_missing = true
 skip_covered = true
-fail_under = 75
+fail_under = 80
 
 [tool.mypy]
 python_version = "3.12"

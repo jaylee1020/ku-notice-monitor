@@ -103,25 +103,6 @@ class ClassifiedNotice:
     uncertainties: list[str] = field(default_factory=list)
     source: Literal["openai", "rules", "legacy"] = "openai"
 
-    @property
-    def urgency(self) -> str:
-        """구형 호출부에서 사용하는 긴급도 표현."""
-        if self.delivery in {"immediate", "review"}:
-            return "urgent"
-        if self.delivery == "digest":
-            return "digest"
-        return "ignore"
-
-    @property
-    def score(self) -> int:
-        """구형 표시·상태와의 호환용 파생값. 정책 결정에는 사용하지 않는다."""
-        return {
-            "immediate": 5,
-            "review": 4,
-            "digest": 3,
-            "suppress": 1,
-        }.get(self.delivery, 1)
-
     def to_dict(self) -> dict:
         return {
             "article": self.article.to_dict(),

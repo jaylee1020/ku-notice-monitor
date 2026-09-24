@@ -11,9 +11,18 @@
 - 대상이 불명확한 고위험 공지는 숨기지 않고 `review`로 보냅니다.
 - 첨부파일은 핵심 판정에 필요하다고 나온 공지만 2차 분석해 비용과 지연을 줄입니다.
 - OpenAI 호출이 실패하면 해당 공지만 보수적으로 판정하고 백오프로 재분류합니다.
+  첨부 2차 분석만 실패하면 1차 AI 판정을 유지하고 재분석을 예약합니다.
+- `PROFILE_TEXT` 구조화에 실패해도 실행을 중단하지 않고, 규칙으로 판정한 뒤
+  모든 공지를 재분석 대상으로 남깁니다.
 - RSS가 그대로여도 최근 공지의 상세 본문을 다시 확인해 `[수정]`으로 감지합니다.
+  상세 페이지를 읽지 못한 경우는 수정으로 취급하지 않습니다.
 - 알림은 영구 outbox에 먼저 기록하고, 실제 전송에 성공한 조각만 완료 처리합니다.
-- 런타임 상태는 `main`이 아닌 전용 `monitor-state` 브랜치에 저장합니다.
+  텔레그램이 요구한 대기 시간(`retry_after`)을 지키고, 메시지 자체가 거부되거나
+  약 3~4일간 실패하면 포기해 대기열이 막히지 않게 합니다.
+- 토큰·채팅 설정 오류는 메시지를 보존한 채 실행을 실패로 표시해 GitHub 알림으로
+  문제를 알 수 있게 합니다.
+- 런타임 상태는 `main`이 아닌 전용 `monitor-state` 브랜치에 저장합니다. 실행이
+  중간에 실패해도 그때까지의 전송 기록을 보존해 중복 알림을 막습니다.
 
 ## 주요 기능
 
@@ -109,12 +118,15 @@ notifications:
 
 ## 로컬 실행
 
-Python 3.12 이상이 필요합니다.
+Python 3.12 이상과 `uv` 0.11.29가 필요합니다.
 
 ```bash
 uv sync --locked --extra dev
 uv run ku-notice-monitor
 ```
+
+로컬에서 만든 `state.json`은 커밋되지 않습니다. 실제 운영 상태는
+`monitor-state` 브랜치에 있습니다.
 
 로컬 시크릿은 커밋되지 않는 `.env.local`에 둡니다.
 
@@ -130,6 +142,9 @@ TELEGRAM_CHAT_ID=...
 src/ku_notice_monitor/
   analysis_models.py   OpenAI Structured Outputs 스키마
   classification.py    전달 결정을 내리는 정책 엔진
+  config.py            config.yaml·환경변수 로딩과 엄격한 스키마 검증
+  eligibility.py       자격 경로와 프로필의 3값 논리 비교
+  llm.py               OpenAI 클라이언트·재시도·사용량 집계 공통 계층
   openai_classifier.py Responses API·선택적 첨부 분석
   document_extract.py  HWP/HWPX·PDF 격리 변환
   pdf_extract_worker.py  텍스트 PDF 판별·Markdown 추출 워커
@@ -137,8 +152,10 @@ src/ku_notice_monitor/
   matcher.py           AI/규칙 폴백·근거 검증·정책 조율
   feeds.py             RSS·본문·이미지·첨부 수집
   net.py               SSRF 방어와 제한 다운로드
-  notifier.py          텔레그램 메시지와 전송 결과
+  notifier.py          텔레그램 메시지 구성과 Bot API 전송
+  profile.py           자연어 프로필 구조화와 근거 검증
   state.py             상태·outbox·재시도·수정 감지
+  util.py              KST 시각·원문 대조 공통 도우미
   main.py              실행 파이프라인
 evals/                 정책·근거 검증 회귀 사례
 tests/                 단위·장애·종단간 테스트
