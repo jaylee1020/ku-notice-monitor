@@ -1,8 +1,10 @@
 """수정 공지 감지와 일일 요약 큐 테스트."""
 
+import json
 from datetime import datetime
 
 from ku_notice_monitor.state import (
+    STATE_SCHEMA_VERSION,
     clear_pending_digest,
     complete_delivery,
     due_classification_retry_keys,
@@ -195,10 +197,50 @@ def test_state_v3_migrates_profile_hash_without_personal_data(tmp_path):
         encoding="utf-8",
     )
     state = load_state(str(path))
-    assert state["schema_version"] == 5
+    assert state["schema_version"] == STATE_SCHEMA_VERSION
     assert state["profile_document_hash"] is None
     assert state["urgent_notice_history"] == {}
     assert "profile_snapshot" not in state
+
+
+def test_state_v6_rebaselines_detail_fingerprints_without_flagging_updates(
+    tmp_path,
+    make_article,
+):
+    """본문 병합 방식이 바뀌어도 기존 공지가 한꺼번에 '수정됨'으로 잡히지 않는다."""
+    article = make_article(id="1", description="RSS 요약")
+    path = tmp_path / "state.json"
+    path.write_text(
+        json.dumps(
+            {
+                "schema_version": 5,
+                "seen_ids": {article.key: datetime.now().isoformat()},
+                "article_fingerprints": {article.key: article.fingerprint},
+                "enriched_fingerprints": {article.key: "fingerprint-from-old-merge"},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    state = load_state(str(path))
+    result = filter_new_articles(
+        [article],
+        state,
+        source_fingerprints={article.key: article.fingerprint},
+        enriched_fingerprints={article.key: "fingerprint-from-new-merge"},
+    )
+
+    assert state["schema_version"] == 6
+    assert state["enriched_fingerprints"] == {}
+    assert result == []
+    # 이번 실행에서 새 기준을 저장하면 다음 수정부터 정상 감지한다.
+    mark_as_seen(
+        [article],
+        state,
+        fingerprints={article.key: article.fingerprint},
+        enriched_fingerprints={article.key: "fingerprint-from-new-merge"},
+    )
+    assert state["enriched_fingerprints"][article.key] == "fingerprint-from-new-merge"
 
 
 # --- 새 게시판 시드 ---

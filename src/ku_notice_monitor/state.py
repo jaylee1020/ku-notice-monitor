@@ -14,7 +14,7 @@ from .models import Article, ClassifiedNotice
 
 logger = logging.getLogger(__name__)
 
-STATE_SCHEMA_VERSION = 5
+STATE_SCHEMA_VERSION = 6
 MAX_PENDING_DIGEST = 200
 MAX_PENDING_DELIVERIES = 500
 # 지수 백오프(최대 6시간)로 약 3~4일간 재시도한 뒤에도 실패하면 포기한다.
@@ -110,6 +110,10 @@ def load_state(state_path: str) -> dict:
     # v4 → v5: 묶음이 달라져도 공지별 즉시 알림 중복을 막는 완료 기록 추가
     if schema_version < 5:
         state.setdefault("urgent_notice_history", {})
+    # v5 → v6: RSS 요약과 상세 본문 병합 방식이 바뀌어 상세 지문을 다시 기준으로 잡는다.
+    # 이전 지문과 비교하면 바뀐 게 없는 최근 공지가 모두 수정 공지로 잡힌다.
+    if schema_version < 6:
+        state["enriched_fingerprints"] = {}
 
     state["schema_version"] = schema_version
     state.setdefault("seen_ids", {})
