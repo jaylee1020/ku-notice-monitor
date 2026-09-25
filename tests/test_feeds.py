@@ -7,13 +7,17 @@ from pathlib import Path
 from unittest.mock import patch
 
 import pytest
+from tenacity import stop_after_attempt
 
 from ku_notice_monitor.feeds import (
     _extract_attachments,
     _extract_image_urls,
     _extract_rss_content,
+    _fetch_feed_async,
     _html_to_markdown,
     _is_retryable_feed_error,
+    _is_server_unavailable,
+    _merge_description,
     _safe_pub_date_string,
     _strip_html,
     _to_int,
@@ -23,8 +27,11 @@ from ku_notice_monitor.feeds import (
     fetch_all_feeds_detailed,
     is_empty_feed_item,
     normalize_link,
+    page_structure_hint,
+    parse_article_page,
     parse_pub_date,
 )
+from ku_notice_monitor.net import DownloadError
 from ku_notice_monitor.state import (
     StateCorruptionError,
     filter_new_articles,
@@ -428,6 +435,42 @@ def test_extract_image_urls_og_image_fallback():
     assert urls == ["https://example.com/og.jpg"]
 
 
+def test_og_image_is_not_added_when_body_has_images():
+    from bs4 import BeautifulSoup
+
+    html = (
+        '<html><head>'
+        '<meta property="og:image" content="https://example.com/site-logo.jpg">'
+        "</head><body>"
+        '<div class="hwp_editor_board_content"><img src="https://example.com/poster.jpg"></div>'
+        "</body></html>"
+    )
+    soup = BeautifulSoup(html, "html.parser")
+    div = soup.find("div")
+    urls = _extract_image_urls(div, "https://www.konkuk.ac.kr", soup=soup)
+    assert urls == ["https://example.com/poster.jpg"]
+
+
+# --- _merge_description ---
+
+
+def test_merge_description_does_not_repeat_rss_text_already_in_body():
+    rss = "신청 기간: 9. 22. ~ 10. 1. 제출 서류: 신청서 1부"
+    crawled = "신청 기간: 9. 22. ~ 10. 1.\n\n- 제출 서류: 신청서 1부"
+    assert _merge_description(rss, crawled) == crawled
+
+
+def test_merge_description_keeps_rss_when_it_already_has_body():
+    rss = "안내 본문 전체와 문의처 02-450-0000"
+    assert _merge_description(rss, "안내 본문 전체") == rss
+
+
+def test_merge_description_joins_different_texts_and_keeps_rss_on_crawl_failure():
+    assert _merge_description("RSS 요약", "상세 본문") == "RSS 요약\n상세 본문"
+    assert _merge_description("RSS 요약", "") == "RSS 요약"
+    assert _merge_description("", "상세 본문") == "상세 본문"
+
+
 # --- _strip_html / _extract_rss_content ---
 
 
@@ -487,6 +530,26 @@ def test_extract_attachments_basic():
     assert attachments[0].filename == "안내문.hwp"
     assert attachments[0].url == "https://www.konkuk.ac.kr/bbs/konkuk/234/1209265/download.do"
     assert attachments[1].filename == "양식.pdf"
+
+
+def test_extract_attachments_scans_page_when_skin_has_no_attachment_section():
+    """게시판 스킨마다 첨부 목록 마크업이 달라 전용 영역이 없어도 첨부를 찾는다."""
+    from bs4 import BeautifulSoup
+
+    html = """
+    <dl class="file-list"><dd><ul>
+      <li><a href="/bbs/konkuk/235/555/download.do">2026 장학 안내문.hwp (35KB)</a>
+          <a href="/bbs/konkuk/235/555/download.do"><img alt="다운로드"></a>
+          <a href="/synap/preview.do?id=555">미리보기</a></li>
+      <li><a href="/bbs/konkuk/235/556/download.do" title="신청서.docx"></a></li>
+    </ul></dd></dl>
+    """
+    soup = BeautifulSoup(html, "html.parser")
+    attachments = _extract_attachments(soup, "https://www.konkuk.ac.kr")
+    assert [(att.filename, att.ext) for att in attachments] == [
+        ("2026 장학 안내문.hwp", ".hwp"),
+        ("신청서.docx", ".docx"),
+    ]
 
 
 def test_extract_attachments_no_section():
@@ -572,6 +635,30 @@ def test_fetch_all_feeds_reports_partial_failure(make_article):
     assert batch.is_source_outage is False
 
 
+def test_non_rss_response_is_a_failed_feed_not_an_empty_one():
+    """점검 안내 같은 HTML 응답을 '글 0건 성공'으로 집계하지 않는다."""
+    config = {
+        "feeds": {},
+        "settings": {
+            "base_url": "https://www.konkuk.ac.kr",
+            "rss_url_template": "https://www.konkuk.ac.kr/bbs/konkuk/{board_id}/rssList.do",
+            "allowed_download_hosts": ["konkuk.ac.kr"],
+        },
+    }
+
+    async def fake_download(*_args, **_kwargs):
+        return b"<html><body>system maintenance</body></html>"
+
+    fetch_once = _fetch_feed_async.retry_with(stop=stop_after_attempt(1))
+    with patch("ku_notice_monitor.feeds.download_bytes", side_effect=fake_download):
+        with pytest.raises(DownloadError) as caught:
+            asyncio.run(fetch_once(None, "학사", 234, {"id": 234}, config, None))
+
+    assert "RSS" in str(caught.value)
+    # 게시판 주소 변경일 수도 있으므로 학교 서버 장애로 조용히 넘기지 않는다.
+    assert _is_server_unavailable(caught.value) is False
+
+
 # --- 상세 본문 보강 ---
 
 _ARTICLE_HTML = """
@@ -609,6 +696,112 @@ def test_enrich_reports_only_successfully_crawled_articles(make_article):
     # 실패한 공지는 RSS 내용 그대로 남아야 한다.
     assert failed.description == "RSS"
     assert failed.attachments == []
+
+
+_RSS_SUMMARY = (
+    "2026학년도 2학기 교내 근로장학생을 아래와 같이 모집하오니 희망하는 학생은 기간 내 "
+    "신청하시기 바랍니다. 신청 기간: 9. 22.(월) ~ 10. 1.(수) 18:00까지"
+)
+
+# 기존 선택자(hwp_editor_board_content, attachments)가 하나도 없는 게시판 스킨.
+_UNKNOWN_SKIN_HTML = f"""
+<html><head><title>교내 근로장학생 모집 | 건국대학교</title>
+<meta property="og:image" content="https://www.konkuk.ac.kr/logo.png"></head>
+<body>
+<div id="gnb"><ul><li>장학공지</li><li>수강신청</li><li>등록금</li></ul></div>
+<div class="sns-share" style="display:none"><div>{_RSS_SUMMARY}</div></div>
+<div class="board-wrap">
+  <h2 class="view-title">교내 근로장학생 모집</h2>
+  <div class="view-info">작성일 2026-09-20 조회수 120</div>
+  <div class="view-body">
+    <p>2026학년도 2학기 교내 근로장학생을 아래와 같이 모집하오니</p>
+    <p>희망하는 학생은 기간 내 신청하시기 바랍니다.</p>
+    <table><tr><th>신청 기간</th><td>9. 22.(월) ~ 10. 1.(수) 18:00까지</td></tr>
+           <tr><th>제출 서류</th><td>신청서 1부</td></tr></table>
+    <p><img src="/_attach/image/2026/09/poster.png"></p>
+  </div>
+  <dl class="file-list"><dd><ul>
+    <li><a href="/bbs/konkuk/235/777/download.do">근로장학 신청서.hwp (20KB)</a></li>
+  </ul></dd></dl>
+</div>
+<div id="footer">개인정보처리방침 장학 안내</div>
+</body></html>
+"""
+
+
+def test_parse_article_page_finds_body_from_rss_summary_on_unknown_skin():
+    page = parse_article_page(
+        _UNKNOWN_SKIN_HTML,
+        base_url="https://www.konkuk.ac.kr",
+        allowed_hosts={"konkuk.ac.kr"},
+        rss_summary=_RSS_SUMMARY[:120] + "...",
+    )
+
+    assert page is not None
+    assert page.body_source == "rss-summary"
+    assert "제출 서류 | 신청서 1부" in page.body
+    # 메뉴·숨은 공유 영역·꼬리말과 작성 정보는 본문에 섞이지 않는다.
+    assert "수강신청" not in page.body
+    assert "개인정보처리방침" not in page.body
+    assert "조회수" not in page.body
+    assert page.images == ["https://www.konkuk.ac.kr/_attach/image/2026/09/poster.png"]
+    assert [att.filename for att in page.attachments] == ["근로장학 신청서.hwp"]
+
+
+def test_parse_article_page_uses_known_skin_selector_without_rss_summary():
+    html = """
+    <html><body><div id="menu">학사 장학</div>
+    <div class="artclView"><p>포스터 이미지로 안내합니다.</p></div></body></html>
+    """
+    page = parse_article_page(
+        html,
+        base_url="https://www.konkuk.ac.kr",
+        allowed_hosts={"konkuk.ac.kr"},
+    )
+
+    assert page is not None
+    assert page.body_source == "div.artclView"
+    assert page.body == "포스터 이미지로 안내합니다."
+
+
+def test_parse_article_page_ignores_too_short_summary_anchor():
+    html = "<html><body><div id='title'><div>장학 안내</div></div></body></html>"
+    assert parse_article_page(
+        html,
+        base_url="https://www.konkuk.ac.kr",
+        allowed_hosts={"konkuk.ac.kr"},
+        rss_summary="장학 안내",
+    ) is None
+
+
+def test_page_structure_hint_summarizes_markup_for_logs():
+    from bs4 import BeautifulSoup
+
+    hint = page_structure_hint(BeautifulSoup(_UNKNOWN_SKIN_HTML, "lxml"))
+
+    assert "교내 근로장학생 모집" in hint
+    assert "download 링크 1개" in hint
+    assert "view-body" in hint and "file-list" in hint
+
+
+def test_enrich_uses_rss_summary_to_read_unknown_skin(make_article):
+    article = make_article(
+        description=_RSS_SUMMARY,
+        link="https://www.konkuk.ac.kr/bbs/konkuk/235/1/artclView.do",
+        attachment_count=1,
+    )
+
+    async def fake_download(*_args, **_kwargs):
+        return _UNKNOWN_SKIN_HTML.encode()
+
+    with patch("ku_notice_monitor.feeds.download_bytes", side_effect=fake_download):
+        enriched = asyncio.run(enrich_articles_with_body([article], _enrich_config()))
+
+    assert enriched == {article.key}
+    # RSS 요약이 본문 앞부분과 같으므로 두 번 넣지 않는다.
+    assert article.description.count("교내 근로장학생을") == 1
+    assert "신청서 1부" in article.description
+    assert [att.filename for att in article.attachments] == ["근로장학 신청서.hwp"]
 
 
 def test_enrich_treats_page_without_body_or_attachments_as_failure(make_article):

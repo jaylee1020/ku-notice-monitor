@@ -38,6 +38,7 @@ from .net import (
     make_ssl_context,
     ssl_context_from_config,
 )
+from .util import normalize_for_match
 
 logger = logging.getLogger(__name__)
 
@@ -261,8 +262,10 @@ async def _fetch_feed_async(
         raise DownloadError("RSS 응답이 비어 있음")
 
     if b"<rss" not in xml_data.lower():
+        # 점검 안내·오류 페이지를 '글 0건'으로 받아들이면 게시판을 못 읽고 있는데도
+        # 성공으로 집계된다. 실패로 올려 수집 성공률과 실패 원인에 반영한다.
         logger.warning("RSS 형식이 아닌 응답 - %s (board_id=%d, url=%s)", board_name, board_id, url)
-        return []
+        raise DownloadError("RSS 형식이 아닌 응답")
 
     feed = feedparser.parse(xml_data)
     articles = [
@@ -401,8 +404,9 @@ def _extract_image_urls(
             if add(candidate):
                 return image_urls
 
-    # 본문에 이미지가 부족하면 og:image / twitter:image 메타 태그를 폴백으로 사용
-    if soup is not None:
+    # 본문에 이미지가 전혀 없을 때만 og:image / twitter:image를 쓴다. 본문 이미지가
+    # 있는데도 붙이면 대개 사이트 공통 로고라 첨부 분석 비용만 늘어난다.
+    if soup is not None and not image_urls:
         for meta in soup.find_all("meta"):
             prop = (meta.get("property") or meta.get("name") or "").lower()
             if prop in ("og:image", "twitter:image") and add(meta.get("content", "")):
@@ -411,22 +415,38 @@ def _extract_image_urls(
     return image_urls
 
 
+# "안내문.hwp (35KB)"처럼 파일명 뒤에 붙는 크기·설명을 떼어 낸다.
+_ATTACHMENT_NAME_PATTERN = re.compile(r"^(.*?\.[A-Za-z0-9]{2,5})(?=\s*(?:[\[(].*)?$)")
+
+
+def _attachment_filename(a_tag) -> str:
+    text = re.sub(r"\s+", " ", a_tag.get_text(" ", strip=True)).strip()
+    if not text:
+        text = str(a_tag.get("title") or "").strip()
+    match = _ATTACHMENT_NAME_PATTERN.match(text)
+    return match.group(1).strip() if match else text
+
+
 def _extract_attachments(
     soup,
     base_url: str,
     allowed_hosts: set[str] | None = None,
 ) -> list[Attachment]:
-    """페이지의 div.attachments에서 첨부파일 목록을 추출한다."""
-    attach_div = soup.find("div", class_="attachments")
-    if not attach_div:
-        return []
+    """게시판 첨부 다운로드 링크(download.do)를 모은다.
+
+    첨부 전용 영역(div.attachments)이 있으면 그 안에서, 없으면 페이지 전체에서
+    찾는다. 게시판 스킨마다 첨부 목록의 마크업이 달라 전용 영역만 보면 첨부를
+    하나도 찾지 못한다.
+    """
+    container = soup.find("div", class_="attachments") or soup
 
     attachments: list[Attachment] = []
-    for a_tag in attach_div.find_all("a", href=True):
+    seen_urls: set[str] = set()
+    for a_tag in container.find_all("a", href=True):
         href = a_tag["href"]
         if "/download.do" not in href:
             continue
-        filename = a_tag.get_text(strip=True)
+        filename = _attachment_filename(a_tag)
         if not filename:
             continue
         url = urljoin(base_url.rstrip("/") + "/", href)
@@ -436,6 +456,9 @@ def _extract_attachments(
         if allowed_hosts and not is_allowed_hostname(parsed.hostname, allowed_hosts):
             logger.debug("허용되지 않은 첨부 호스트를 건너뜁니다: %s", parsed.hostname)
             continue
+        if url in seen_urls:
+            continue
+        seen_urls.add(url)
         attachments.append(Attachment(filename=filename, url=url))
     return attachments
 
@@ -480,6 +503,117 @@ def _html_to_markdown(content_div) -> str:
     return text.strip()
 
 
+@dataclass(frozen=True)
+class ArticlePage:
+    """상세 페이지에서 읽은 본문·이미지·첨부와, 본문 영역을 찾은 방법(진단용)."""
+
+    body: str
+    images: list[str]
+    attachments: list[Attachment]
+    body_source: str
+
+
+# 공지 본문을 감싸는 것으로 알려진 영역. 한글 웹 에디터로 쓴 글은 첫 번째 영역에 담긴다.
+_BODY_SELECTORS = ("div.artclView", "div.view-con", "div.board-view-content")
+# 표 칸(td)은 제외한다. 한글 문서를 옮긴 본문은 표로 되어 있어 첫 칸만 본문으로 잡힌다.
+_BODY_BLOCK_TAGS = ["div", "article", "section", "main"]
+_HIDDEN_MARKERS = ("share", "sns")
+# RSS 요약으로 본문 위치를 찾을 때 쓰는 기준 길이(공백·구두점 제외 글자 수).
+_SUMMARY_ANCHOR_MIN = 20
+_SUMMARY_ANCHOR_MAX = 150
+_STRUCTURE_HINT_KEYS = ("view", "artcl", "content", "cont", "board", "bbs", "attach", "file")
+
+
+def _is_hidden_or_share_widget(element) -> bool:
+    """숨김 영역이나 공유 위젯은 요약 문구를 되풀이할 수 있어 본문 후보에서 뺀다."""
+    attrs = element.attrs
+    if "hidden" in attrs or attrs.get("aria-hidden") == "true":
+        return True
+    if "display:none" in str(attrs.get("style", "")).replace(" ", "").lower():
+        return True
+    names = " ".join([*attrs.get("class", []), str(attrs.get("id", ""))]).lower()
+    return any(marker in names for marker in _HIDDEN_MARKERS)
+
+
+def _find_body_by_summary(soup, rss_summary: str):
+    """RSS 요약 앞부분을 담은 가장 작은 블록을 본문 영역으로 본다.
+
+    RSS 요약은 본문 앞부분을 그대로 옮긴 것이라, 게시판 스킨의 class 이름을 몰라도
+    본문 위치를 찾을 수 있다. 너무 짧은 요약은 제목·메뉴와 헷갈릴 수 있어 쓰지 않는다.
+    요약을 담은 가지만 따라 내려가므로 메뉴가 큰 페이지도 전체를 반복해 읽지 않는다.
+    """
+    anchor = normalize_for_match(rss_summary)[:_SUMMARY_ANCHOR_MAX]
+    if len(anchor) < _SUMMARY_ANCHOR_MIN:
+        return None
+    best = None
+    best_length = 0
+    stack = [soup.body or soup]
+    while stack:
+        node = stack.pop()
+        for child in node.find_all(True, recursive=False):
+            if _is_hidden_or_share_widget(child):
+                continue
+            text = normalize_for_match(child.get_text(" "))
+            if anchor not in text:
+                continue
+            if child.name in _BODY_BLOCK_TAGS and (best is None or len(text) < best_length):
+                best, best_length = child, len(text)
+            stack.append(child)
+    return best
+
+
+def _find_body(soup, rss_summary: str):
+    content = soup.find("div", class_=BOARD_CONTENT_CLASS)
+    if content is not None:
+        return content, BOARD_CONTENT_CLASS
+    content = _find_body_by_summary(soup, rss_summary)
+    if content is not None:
+        return content, "rss-summary"
+    for selector in _BODY_SELECTORS:
+        content = soup.select_one(selector)
+        if content is not None:
+            return content, selector
+    return None, "none"
+
+
+def page_structure_hint(soup) -> str:
+    """본문을 찾지 못했을 때 로그로 마크업을 짐작할 수 있도록 제목과 주요 class를 요약한다."""
+    title = soup.title.get_text(" ", strip=True)[:60] if soup.title else ""
+    classes: list[str] = []
+    for element in soup.find_all(["div", "dl", "ul", "section", "article"], class_=True):
+        for name in element.get("class", []):
+            lowered = name.lower()
+            if name not in classes and any(key in lowered for key in _STRUCTURE_HINT_KEYS):
+                classes.append(name)
+    downloads = sum("/download.do" in a_tag["href"] for a_tag in soup.find_all("a", href=True))
+    return f"title={title!r}, download 링크 {downloads}개, class={classes[:12]}"
+
+
+def parse_article_page(
+    html: str,
+    *,
+    base_url: str,
+    allowed_hosts: set[str],
+    rss_summary: str = "",
+) -> ArticlePage | None:
+    """상세 페이지 HTML에서 본문·이미지·첨부를 읽는다. 둘 다 없으면 ``None``."""
+    soup = BeautifulSoup(html, "lxml")
+    attachments = _extract_attachments(soup, base_url, allowed_hosts)
+    content, source = _find_body(soup, rss_summary)
+    if content is None:
+        if not attachments:
+            return None
+        return ArticlePage("", [], attachments, source)
+    image_urls = _extract_image_urls(
+        content,
+        base_url,
+        soup=soup,
+        allowed_hosts=allowed_hosts,
+    )
+    text = _html_to_markdown(content)
+    return ArticlePage(text[:MAX_ARTICLE_BODY_LENGTH], image_urls, attachments, source)
+
+
 async def _fetch_article_body_async(
     session: aiohttp.ClientSession,
     url: str,
@@ -487,7 +621,8 @@ async def _fetch_article_body_async(
     base_url: str,
     semaphore: asyncio.Semaphore,
     allowed_hosts: set[str],
-) -> tuple[str, list[str], list[Attachment]] | None:
+    rss_summary: str = "",
+) -> ArticlePage | None:
     """게시물 페이지에서 본문 텍스트, 이미지 URL, 첨부파일 정보를 크롤링한다.
 
     페이지를 받지 못했거나 본문·첨부를 모두 찾지 못하면 ``None``을 반환한다. 이 경우를
@@ -506,38 +641,42 @@ async def _fetch_article_body_async(
         if html_data is None:
             return None
         html = html_data.decode("utf-8", errors="replace")
-
-        soup = BeautifulSoup(html, "lxml")
-        attachments = _extract_attachments(soup, base_url, allowed_hosts)
-        content_div = soup.find("div", class_=BOARD_CONTENT_CLASS)
-        if not content_div:
-            if not attachments:
-                # 오류 페이지처럼 본문도 첨부도 없는 응답은 실패로 본다.
-                logger.warning("본문 영역을 찾지 못했습니다 - %s", url)
-                return None
-            return "", [], attachments
-
-        text = _html_to_markdown(content_div)
-        image_urls = _extract_image_urls(
-            content_div,
-            base_url,
-            soup=soup,
+        page = parse_article_page(
+            html,
+            base_url=base_url,
             allowed_hosts=allowed_hosts,
+            rss_summary=rss_summary,
         )
-        return text[:MAX_ARTICLE_BODY_LENGTH], image_urls, attachments
+        if page is None:
+            # 오류 페이지처럼 본문도 첨부도 없는 응답은 실패로 본다. 게시판 스킨이 바뀌어도
+            # 원인을 알 수 있게 페이지 구조를 함께 남긴다.
+            logger.warning(
+                "본문 영역을 찾지 못했습니다 - %s (%s)",
+                url,
+                page_structure_hint(BeautifulSoup(html, "lxml")),
+            )
+        return page
     except Exception as e:
         logger.warning("본문 크롤링 실패 - %s: %s", url, e)
         return None
 
 
 def _merge_description(rss_body: str, crawled_body: str) -> str:
-    """RSS 요약과 크롤된 본문을 병합한다 (RSS 우선, 중복 제거)."""
-    if crawled_body and rss_body and crawled_body != rss_body:
-        combined = crawled_body if rss_body in crawled_body else f"{rss_body}\n{crawled_body}"
-        return combined[:MAX_ARTICLE_BODY_LENGTH]
-    if crawled_body and not rss_body:
+    """RSS 요약과 크롤된 본문을 병합하고 한쪽에 이미 들어 있는 내용은 되풀이하지 않는다.
+
+    RSS 요약은 공백이 한 칸으로 합쳐지고 상세 본문은 줄바꿈·목록·표 기호가 있어
+    문자열을 그대로 비교하면 같은 내용도 달라 보인다. 공백·구두점을 무시하고
+    비교해야 같은 본문이 두 번 들어가 모델 입력을 낭비하지 않는다.
+    """
+    if not crawled_body:
+        return rss_body  # 크롤 실패 → RSS 유지
+    normalized_rss = normalize_for_match(rss_body)
+    normalized_crawled = normalize_for_match(crawled_body)
+    if normalized_rss in normalized_crawled:
         return crawled_body[:MAX_ARTICLE_BODY_LENGTH]
-    return rss_body  # 크롤 실패 또는 동일 → RSS 유지
+    if normalized_crawled in normalized_rss:
+        return rss_body[:MAX_ARTICLE_BODY_LENGTH]
+    return f"{rss_body}\n{crawled_body}"[:MAX_ARTICLE_BODY_LENGTH]
 
 
 async def enrich_articles_with_body(articles: list[Article], config: dict) -> set[str]:
@@ -562,6 +701,7 @@ async def enrich_articles_with_body(articles: list[Article], config: dict) -> se
                     base_url_of(a.link) or base_url,
                     semaphore,
                     allowed_hosts,
+                    a.description or "",
                 )
                 for a in link_articles
             ),
@@ -569,24 +709,33 @@ async def enrich_articles_with_body(articles: list[Article], config: dict) -> se
         )
 
     enriched: set[str] = set()
+    sources: dict[str, int] = {}
     for article, result in zip(link_articles, results, strict=True):
         if isinstance(result, BaseException):
             logger.warning("본문 크롤링 예외 - %s: %s", article.link, result)
             continue
         if result is None:
             continue
-        body, image_urls, attachments = result
         enriched.add(article.key)
-        article.description = _merge_description(article.description or "", body)
-        article.images = image_urls
-        article.attachments = attachments
-        if attachments:
+        sources[result.body_source] = sources.get(result.body_source, 0) + 1
+        article.description = _merge_description(article.description or "", result.body)
+        article.images = result.images
+        article.attachments = result.attachments
+        if article.attachment_count and not result.attachments:
+            logger.warning(
+                "RSS에는 첨부 %d개가 있지만 상세 페이지에서 찾지 못했습니다 - %s",
+                article.attachment_count,
+                article.link,
+            )
+        if result.attachments:
             logger.debug(
                 "첨부파일 %d건 발견 - %s: %s",
-                len(attachments),
+                len(result.attachments),
                 article.title,
-                ", ".join(att.filename for att in attachments),
+                ", ".join(att.filename for att in result.attachments),
             )
+    if sources:
+        logger.info("상세 본문 %d/%d건 확인 (본문 영역: %s)", len(enriched), len(link_articles), sources)
     return enriched
 
 

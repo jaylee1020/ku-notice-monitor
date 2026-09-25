@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ku-notice-monitor"
-version = "3.0.0"
+version = "3.1.0"
 description = "건국대학교 공지사항 모니터링 에이전트"
 requires-python = ">=3.12"
 dependencies = [

@@ -36,14 +36,27 @@ _DEADLINE_KINDS = {
 }
 
 
-def _nearest_deadline(assessment: NoticeAssessment) -> str | None:
-    candidates = [
-        notice_date.date
-        for notice_date in assessment.dates
-        if notice_date.kind in _DEADLINE_KINDS
-    ]
-    candidates.extend(action.deadline for action in assessment.actions if action.deadline)
-    return min(candidates) if candidates else None
+def _nearest_deadline(assessment: NoticeAssessment, today: date) -> str | None:
+    """아직 지나지 않은 가장 가까운 마감을, 모두 지났다면 가장 최근 마감을 고른다.
+
+    1차 마감이 지나고 2차 신청이 남은 공지를 이미 지난 1차 마감으로 판단하면
+    유효한 기회를 '마감 지남'으로 잘못 안내하게 된다.
+    """
+    candidates = sorted(
+        {
+            *(
+                notice_date.date
+                for notice_date in assessment.dates
+                if notice_date.kind in _DEADLINE_KINDS
+            ),
+            *(action.deadline for action in assessment.actions if action.deadline),
+        }
+    )
+    if not candidates:
+        return None
+    current = today.isoformat()
+    upcoming = [value for value in candidates if value >= current]
+    return upcoming[0] if upcoming else candidates[-1]
 
 
 def _days_until(value: str | None, today: date) -> int | None:
@@ -64,7 +77,7 @@ def decide_delivery(
     """
     current_date = today or now_kst().date()
     high_impact = assessment.consequence in _HIGH_IMPACT
-    deadline = _nearest_deadline(assessment)
+    deadline = _nearest_deadline(assessment, current_date)
     days_left = _days_until(deadline, current_date)
     active_deadline = days_left is not None and days_left >= 0
     deadline_close = (
@@ -139,9 +152,10 @@ def classify_assessment(
     action_window_days: int = 21,
     suppress_speculative_opportunities: bool = True,
 ) -> ClassifiedNotice:
+    current_date = today or now_kst().date()
     delivery, reason = decide_delivery(
         assessment,
-        today=today,
+        today=current_date,
         action_window_days=action_window_days,
         suppress_speculative_opportunities=suppress_speculative_opportunities,
     )
@@ -152,7 +166,7 @@ def classify_assessment(
     ):
         delivery = Delivery.DIGEST
         reason = "자동 분석된 선택적 기회는 일일 요약에서 확인"
-    deadline = _nearest_deadline(assessment)
+    deadline = _nearest_deadline(assessment, current_date)
     return ClassifiedNotice(
         article=article,
         delivery=delivery.value,

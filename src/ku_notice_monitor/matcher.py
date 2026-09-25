@@ -14,7 +14,7 @@ from .models import Article, ClassifiedNotice
 from .openai_classifier import AnalysisOutcome, analyze_with_openai
 from .profile import legacy_profile_snapshot
 from .profile_models import ProfileSnapshot
-from .util import is_grounded, normalize_for_match
+from .util import is_grounded, normalize_for_match, now_kst
 
 logger = logging.getLogger(__name__)
 
@@ -42,6 +42,8 @@ _OPTIONAL_OPPORTUNITY_CATEGORIES = {
     "event",
 }
 _DATE_PATTERN = re.compile(r"(20\d{2})[.\-/년]\s*(\d{1,2})[.\-/월]\s*(\d{1,2})일?")
+# "9. 30.(화)", "10월 1일", "(9/30)"처럼 연도를 생략한 한국어 공지의 날짜 표기.
+_MONTH_DAY_PATTERN = re.compile(r"(?<![\d.])(\d{1,2})\s*(?:월\s*|[./]\s*)(\d{1,2})(?!\d)")
 
 
 @dataclass(frozen=True)
@@ -115,6 +117,22 @@ def _fallback_dates(text: str) -> list[dict]:
             }
         )
     return dates[:8]
+
+
+def _month_days(text: str) -> set[tuple[int, int]]:
+    """연도 없이 적힌 월·일 조합을 모은다."""
+    found: set[tuple[int, int]] = set()
+    for match in _MONTH_DAY_PATTERN.finditer(text):
+        month, day = int(match.group(1)), int(match.group(2))
+        if 1 <= month <= 12 and 1 <= day <= 31:
+            found.add((month, day))
+    return found
+
+
+def _reference_year(article: Article) -> int:
+    """연도를 생략한 날짜를 해석할 기준 연도. 게시일이 없으면 오늘(KST)."""
+    published = _sort_date(article)
+    return published.year if published != datetime.min else now_kst().year
 
 
 def keyword_fallback(article: Article, config: dict) -> NoticeAssessment:
@@ -249,9 +267,23 @@ def validate_assessment_grounding(
 
     source_digits = re.sub(r"\D", "", source)
     source_dates = {item["date"] for item in _fallback_dates(source)}
+    # 한국어 공지는 "9. 30.(화)까지"처럼 연도를 자주 생략한다. 월·일이 원문에 있고
+    # 모델이 보완한 연도가 게시 연도나 다음 해(연말 게시 공지의 1월 일정)면 인정한다.
+    source_month_days = _month_days(source)
+    reference_year = _reference_year(article)
+    plausible_years = {reference_year, reference_year + 1}
 
     def date_is_grounded(value: str) -> bool:
-        return value in source_dates or value.replace("-", "") in source_digits
+        if value in source_dates or value.replace("-", "") in source_digits:
+            return True
+        try:
+            parsed = date.fromisoformat(value)
+        except ValueError:
+            return False
+        return (
+            parsed.year in plausible_years
+            and (parsed.month, parsed.day) in source_month_days
+        )
 
     grounded_dates = []
     removed_dates = False
