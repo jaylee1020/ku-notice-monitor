@@ -2,7 +2,10 @@ name: 건국대 공지 모니터링
 
 on:
   schedule:
-    - cron: '0 * * * *'  # 매시간 확인: 긴급 공지는 즉시, 일반 공지는 설정 시각에 요약
+    # 매시간 확인: 긴급 공지는 즉시, 일반 공지는 설정 시각에 요약.
+    # 정각(0분) 예약은 GitHub 부하로 자주 누락되어 하루 6~7회만 실행되었으므로
+    # 붐비지 않는 분에 실행한다.
+    - cron: '17 * * * *'
   workflow_dispatch:
 
 concurrency:
@@ -41,7 +44,8 @@ jobs:
           status=0
           git ls-remote --exit-code --heads origin monitor-state > /dev/null || status=$?
           if [ "$status" -eq 0 ]; then
-            git fetch --no-tags origin refs/heads/monitor-state:refs/remotes/origin/monitor-state
+            # 상태 브랜치는 매시간 커밋이 쌓이므로 최신 커밋 하나만 받는다.
+            git fetch --no-tags --depth=1 origin refs/heads/monitor-state:refs/remotes/origin/monitor-state
             git show origin/monitor-state:state.json > state.json
           elif [ "$status" -eq 2 ]; then
             echo "monitor-state 브랜치가 없어 최초 실행으로 시작합니다."
@@ -69,7 +73,7 @@ jobs:
       - name: Upload runtime state
         id: upload_state
         if: always() && hashFiles('state.json') != ''
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: runtime-state
           path: state.json
@@ -109,8 +113,6 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-        with:
-          fetch-depth: 0
 
       - name: Download runtime state
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
@@ -120,10 +122,17 @@ jobs:
 
       - name: Commit state to dedicated branch
         run: |
-          if git show-ref --verify --quiet refs/remotes/origin/monitor-state; then
+          # 전체 이력 대신 상태 브랜치의 최신 커밋만 받아 그 위에 커밋한다.
+          status=0
+          git ls-remote --exit-code --heads origin monitor-state > /dev/null || status=$?
+          if [ "$status" -eq 0 ]; then
+            git fetch --no-tags --depth=1 origin refs/heads/monitor-state:refs/remotes/origin/monitor-state
             git switch -C monitor-state origin/monitor-state
-          else
+          elif [ "$status" -eq 2 ]; then
             git switch -c monitor-state
+          else
+            echo "::error::monitor-state 브랜치를 확인하지 못했습니다 (exit $status)."
+            exit 1
           fi
           cp runtime-state/state.json state.json
           git config user.name "github-actions[bot]"
