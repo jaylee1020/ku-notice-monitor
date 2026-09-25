@@ -230,14 +230,19 @@ def _select_detail_refresh_articles(
     config: dict,
     now: datetime | None = None,
 ) -> list[Article]:
-    """최근 공지와 고정 공지를 제한적으로 다시 읽어 본문 수정도 감지한다."""
+    """최근 공지와 고정 공지를 제한적으로 다시 읽어 본문 수정도 감지한다.
+
+    최근 공지를 먼저 고르고 남는 자리에 오래된 고정 공지를 넣는다. 게시판마다
+    고정 공지가 여러 개라 이를 앞세우면 한도가 오래된 고정 공지로 다 차서, 수정될
+    가능성이 가장 큰 최근 공지를 다시 읽지 못한다.
+    """
     current = now or now_kst()
     days = config["settings"].get("detail_refresh_days", 14)
     limit = config["settings"].get("detail_refresh_max_articles", 30)
     # RSS 게시일은 시간대 없는 KST 문자열이다.
     cutoff = current.astimezone(KST).replace(tzinfo=None) - timedelta(days=days)
     seen = state.get("seen_ids", {})
-    candidates: list[tuple[datetime, Article]] = []
+    candidates: list[tuple[bool, datetime, Article]] = []
     for article in articles:
         if article.key not in seen:
             continue
@@ -245,10 +250,11 @@ def _select_detail_refresh_articles(
             published = parse_pub_date(article.pub_date)
         except (TypeError, ValueError):
             published = datetime.min
-        if article.is_pinned or published >= cutoff:
-            candidates.append((published, article))
-    candidates.sort(key=lambda item: (item[1].is_pinned, item[0]), reverse=True)
-    return [article for _, article in candidates[:limit]]
+        recent = published >= cutoff
+        if article.is_pinned or recent:
+            candidates.append((recent, published, article))
+    candidates.sort(key=lambda item: (item[0], item[1]), reverse=True)
+    return [article for _, _, article in candidates[:limit]]
 
 
 @dataclass(frozen=True)
@@ -345,14 +351,15 @@ def _queue_urgent_notifications(
 
     candidates: list[tuple[ClassifiedNotice, str]] = []
     for item in urgent:
-        token = _batch_key(
-            "urgent-notice",
-            [
-                item.article.key,
-                source_fingerprints.get(item.article.key, item.article.fingerprint),
-                item.delivery,
-            ],
-        )
+        token_parts = [
+            item.article.key,
+            source_fingerprints.get(item.article.key, item.article.fingerprint),
+            item.delivery,
+        ]
+        if item.article.is_update:
+            # RSS는 그대로이고 상세 본문만 바뀐 수정 공지도 수정본마다 한 번은 알린다.
+            token_parts.append(f"revision:{item.article.fingerprint}")
+        token = _batch_key("urgent-notice", token_parts)
         if token not in pending_notice_tokens and token not in delivered_notice_tokens:
             candidates.append((item, token))
     candidates.sort(

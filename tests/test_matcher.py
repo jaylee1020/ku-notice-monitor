@@ -172,6 +172,44 @@ def test_policy_uses_deadline_window_not_relevance_score():
     assert delivery == Delivery.IMMEDIATE
 
 
+def test_policy_uses_upcoming_round_when_first_deadline_passed(make_article):
+    """1차 마감이 지나도 남은 2차 마감을 기준으로 판단하고 표시한다."""
+    assessment = _assessment(
+        obligation="required",
+        dates=[
+            {"kind": "application_deadline", "date": "2026-07-20", "label": "1차 마감"},
+            {"kind": "application_deadline", "date": "2026-08-10", "label": "2차 마감"},
+        ],
+    )
+
+    delivery, reason = decide_delivery(assessment, today=date(2026, 8, 1))
+    result = classify_assessment(
+        make_article(title="2차 신청"),
+        assessment,
+        source="openai",
+        today=date(2026, 8, 1),
+    )
+
+    assert delivery == Delivery.IMMEDIATE
+    assert "9일" in reason
+    assert result.deadline == "2026-08-10"
+
+
+def test_policy_reports_latest_deadline_when_all_have_passed():
+    assessment = _assessment(
+        obligation="required",
+        dates=[
+            {"kind": "application_deadline", "date": "2026-07-01", "label": "1차 마감"},
+            {"kind": "document_deadline", "date": "2026-07-20", "label": "서류 마감"},
+        ],
+    )
+
+    delivery, reason = decide_delivery(assessment, today=date(2026, 8, 1))
+
+    assert delivery == Delivery.REVIEW
+    assert "지났" in reason
+
+
 def test_classify_assessment_builds_domain_result(make_article):
     result = classify_assessment(
         make_article(title="장학금"),
@@ -562,6 +600,54 @@ def test_hallucinated_dates_are_removed(make_article):
     )
     assert grounded.dates == []
     assert any("날짜" in item for item in grounded.uncertainties)
+
+
+def test_year_less_korean_dates_are_grounded_with_publication_year(make_article):
+    article = make_article(
+        pub_date="2026-09-20 10:00:00.0",
+        title="국가근로장학금 신청 안내(9/22)",
+        description="신청 기간: 9. 22.(월) ~ 10월 1일(수) 18:00까지",
+    )
+    assessment = _assessment(
+        dates=[
+            {"kind": "application_open", "date": "2026-09-22", "label": "신청 시작"},
+            {"kind": "application_deadline", "date": "2026-10-01", "label": "신청 마감"},
+            # 원문에 없는 날짜와, 게시 연도와 맞지 않는 연도는 여전히 제외한다.
+            {"kind": "event_start", "date": "2026-10-02", "label": "발표"},
+            {"kind": "other", "date": "2024-10-01", "label": "이전 연도"},
+        ],
+        actions=[{"label": "신청", "required": True, "deadline": "2026-10-01"}],
+    )
+
+    grounded = validate_assessment_grounding(article, assessment)
+
+    assert [item.date for item in grounded.dates] == ["2026-09-22", "2026-10-01"]
+    assert grounded.actions[0].deadline == "2026-10-01"
+
+
+def test_year_less_january_date_in_december_notice_uses_next_year(make_article):
+    article = make_article(
+        pub_date="2026-12-15 09:00:00.0",
+        description="복학 신청은 1월 5일까지입니다.",
+    )
+    assessment = _assessment(
+        dates=[{"kind": "application_deadline", "date": "2027-01-05", "label": "복학 신청 마감"}],
+    )
+
+    grounded = validate_assessment_grounding(article, assessment)
+
+    assert [item.date for item in grounded.dates] == ["2027-01-05"]
+
+
+def test_compact_full_date_is_still_grounded(make_article):
+    article = make_article(pub_date="2026-09-01 09:00:00.0", description="마감 2026.9.30")
+    assessment = _assessment(
+        dates=[{"kind": "application_deadline", "date": "2026-09-30", "label": "마감"}],
+    )
+
+    grounded = validate_assessment_grounding(article, assessment)
+
+    assert [item.date for item in grounded.dates] == ["2026-09-30"]
 
 
 def test_call_openai_api_returns_parsed_schema():

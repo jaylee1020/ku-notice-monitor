@@ -10,10 +10,12 @@ import pytest
 from ku_notice_monitor.feeds import FeedBatch, FeedStatus
 from ku_notice_monitor.main import (
     FeedCollectionError,
+    _detail_refresh_is_due,
     _digest_is_due,
     _flush_digest_if_due,
     _flush_pending_deliveries,
     _queue_urgent_notifications,
+    _select_detail_refresh_articles,
     _validate_feed_health,
 )
 from ku_notice_monitor.notifier import TelegramDeliveryError, TelegramNotConfiguredError
@@ -88,6 +90,32 @@ def test_urgent_notices_are_queued_as_separate_deduplicated_messages(
     assert sum("[확인 필요]" in message for message in messages) == 1
     assert sum("수강신청 확인" in message for message in messages) == 1
     assert sum("등록금 납부 확인" in message for message in messages) == 1
+
+
+def test_body_only_update_of_urgent_notice_is_realerted_once(make_article, make_classified):
+    original = make_article(id="1", title="등록금 납부 안내", description="9월 30일까지 납부")
+    fingerprints = {original.key: original.fingerprint}
+    state = {"pending_deliveries": [], "delivery_history": {}, "urgent_notice_history": {}}
+    assert _queue_urgent_notifications(
+        state, [make_classified(article=original, delivery="immediate")], fingerprints
+    ) == 1
+    # 보낸 것으로 처리한다.
+    for token in state["pending_deliveries"][0]["metadata"]["notice_tokens"]:
+        state["urgent_notice_history"][token] = "2026-09-01T00:00:00"
+    state["pending_deliveries"] = []
+
+    # RSS 요약은 같고 상세 본문(납부 기한)만 바뀐 수정 공지.
+    edited = make_article(
+        id="1",
+        title="등록금 납부 안내",
+        description="10월 7일까지 납부로 연장",
+        is_update=True,
+    )
+    notice = make_classified(article=edited, delivery="immediate")
+
+    assert _queue_urgent_notifications(state, [notice], fingerprints) == 1
+    assert "(수정됨)" in state["pending_deliveries"][0]["text"]
+    assert _queue_urgent_notifications(state, [notice], fingerprints) == 0
 
 
 def test_urgent_dedup_filters_completed_subset_from_later_batch(
@@ -419,3 +447,47 @@ def test_feed_health_partial_failure_explains_causes(make_article):
         _validate_feed_health(batch, {"settings": {"min_feed_success_ratio": 0.7}})
     assert "게시판 3개 중 1개만" in str(info.value)
     assert "HTTP 404 응답 2개" in str(info.value)
+
+
+def _refresh_config(limit=3):
+    return {
+        "settings": {
+            "detail_refresh_days": 14,
+            "detail_refresh_max_articles": limit,
+            "detail_refresh_interval_hours": 6,
+        }
+    }
+
+
+def test_detail_refresh_prefers_recent_notices_over_old_pinned_ones(make_article):
+    now = datetime(2026, 9, 25, 9, 0, tzinfo=ZoneInfo("Asia/Seoul"))
+    old_pinned = [
+        make_article(id=f"p{index}", pub_date="2026-03-02 09:00:00.0", is_pinned=True)
+        for index in range(3)
+    ]
+    recent = [
+        make_article(id="r1", pub_date="2026-09-24 10:00:00.0"),
+        make_article(id="r2", pub_date="2026-09-20 10:00:00.0"),
+    ]
+    unseen = make_article(id="new", pub_date="2026-09-25 08:00:00.0")
+    stale = make_article(id="stale", pub_date="2026-08-01 09:00:00.0")
+    articles = [*old_pinned, *recent, unseen, stale]
+    state = {"seen_ids": {article.key: "2026-09-01" for article in articles if article is not unseen}}
+
+    selected = _select_detail_refresh_articles(articles, state, _refresh_config(limit=3), now=now)
+
+    # 최근 공지 두 건을 먼저 담고, 남은 한 자리만 오래된 고정 공지에 쓴다.
+    assert [article.id for article in selected] == ["r1", "r2", "p0"]
+
+
+def test_detail_refresh_is_due_after_interval():
+    now = datetime(2026, 9, 25, 12, 0, tzinfo=ZoneInfo("Asia/Seoul"))
+    config = _refresh_config()
+    assert _detail_refresh_is_due({}, config, now) is True
+    assert _detail_refresh_is_due({"last_detail_refresh_at": "not-a-date"}, config, now) is True
+    assert _detail_refresh_is_due(
+        {"last_detail_refresh_at": (now - timedelta(hours=5)).isoformat()}, config, now
+    ) is False
+    assert _detail_refresh_is_due(
+        {"last_detail_refresh_at": (now - timedelta(hours=6)).isoformat()}, config, now
+    ) is True
