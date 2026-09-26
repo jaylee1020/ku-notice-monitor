@@ -14,7 +14,7 @@ from .models import Article, ClassifiedNotice
 
 logger = logging.getLogger(__name__)
 
-STATE_SCHEMA_VERSION = 6
+STATE_SCHEMA_VERSION = 7
 MAX_PENDING_DIGEST = 200
 MAX_PENDING_DELIVERIES = 500
 # 지수 백오프(최대 6시간)로 약 3~4일간 재시도한 뒤에도 실패하면 포기한다.
@@ -40,6 +40,9 @@ def _initial_state() -> dict:
         "delivery_history": {},
         "urgent_notice_history": {},
         "classification_retries": {},
+        "tracked_notices": {},
+        "weekly_report": None,
+        "telegram_update_offset": None,
         "last_digest_enqueued_date": None,
         "last_digest_sent_date": None,
         "last_detail_refresh_at": None,
@@ -114,6 +117,11 @@ def load_state(state_path: str) -> dict:
     # 이전 지문과 비교하면 바뀐 게 없는 최근 공지가 모두 수정 공지로 잡힌다.
     if schema_version < 6:
         state["enriched_fingerprints"] = {}
+    # v6 → v7: 마감 리마인더·버튼 피드백용 공지 기록, 주간 리포트 집계, 텔레그램 버튼 처리 위치
+    if schema_version < 7:
+        state.setdefault("tracked_notices", {})
+        state.setdefault("weekly_report", None)
+        state.setdefault("telegram_update_offset", None)
 
     state["schema_version"] = schema_version
     state.setdefault("seen_ids", {})
@@ -124,11 +132,17 @@ def load_state(state_path: str) -> dict:
     state.setdefault("delivery_history", {})
     state.setdefault("urgent_notice_history", {})
     state.setdefault("classification_retries", {})
+    state.setdefault("tracked_notices", {})
     state.setdefault("last_digest_enqueued_date", None)
     state.setdefault("last_digest_sent_date", None)
     state.setdefault("last_detail_refresh_at", None)
     state.setdefault("profile_document_hash", None)
     state.setdefault("last_run", None)
+    # 보조 기록이 손상되어도 공지 확인은 계속되어야 하므로 새로 시작한다.
+    if not isinstance(state.get("weekly_report"), dict):
+        state["weekly_report"] = None
+    if not isinstance(state.get("telegram_update_offset"), int):
+        state["telegram_update_offset"] = None
     if state["profile_document_hash"] is not None and not isinstance(
         state["profile_document_hash"],
         str,
@@ -145,6 +159,7 @@ def load_state(state_path: str) -> dict:
         "delivery_history": dict,
         "urgent_notice_history": dict,
         "classification_retries": dict,
+        "tracked_notices": dict,
     }
     for field, expected_type in expected_types.items():
         if not isinstance(state[field], expected_type):
@@ -201,6 +216,11 @@ def load_state(state_path: str) -> dict:
         for k, value in state["classification_retries"].items()
         if isinstance(value, dict)
     }
+    state["tracked_notices"] = {
+        str(k): value
+        for k, value in state["tracked_notices"].items()
+        if isinstance(value, dict) and isinstance(value.get("key"), str)
+    }
     state["schema_version"] = STATE_SCHEMA_VERSION
 
     return state
@@ -238,6 +258,11 @@ def save_state(state: dict, state_path: str) -> None:
         str(k): v
         for k, v in state.get("classification_retries", {}).items()
         if isinstance(v, dict) and str(v.get("created_at", "")) > retry_cutoff
+    }
+    state["tracked_notices"] = {
+        str(k): v
+        for k, v in state.get("tracked_notices", {}).items()
+        if isinstance(v, dict) and str(v.get("keep_until", "9999")) > datetime.now().date().isoformat()
     }
     state["last_run"] = datetime.now().isoformat()
 
@@ -455,8 +480,12 @@ def enqueue_delivery(
     kind: str,
     dedup_key: str,
     metadata: dict | None = None,
+    reply_markup: dict | None = None,
 ) -> list[str]:
-    """전송할 메시지 조각을 중복 없이 영구 outbox에 넣는다."""
+    """전송할 메시지 조각을 중복 없이 영구 outbox에 넣는다.
+
+    ``reply_markup``(버튼)은 메시지 맨 아래에 오도록 마지막 조각에만 붙인다.
+    """
     queue = state.setdefault("pending_deliveries", [])
     history = state.setdefault("delivery_history", {})
     existing_ids = {str(item.get("id")) for item in queue}
@@ -490,6 +519,8 @@ def enqueue_delivery(
                 "metadata": dict(metadata or {}),
             }
         )
+        if reply_markup and index == len(parts) - 1:
+            new_items[-1]["reply_markup"] = reply_markup
     if len(queue) + len(new_items) > MAX_PENDING_DELIVERIES:
         raise StateCapacityError(
             f"알림 outbox가 안전 한도({MAX_PENDING_DELIVERIES})를 초과했습니다."

@@ -16,6 +16,7 @@ from ku_notice_monitor.state import (
     load_state,
     mark_as_seen,
     record_delivery_failure,
+    save_state,
     schedule_classification_retry,
 )
 
@@ -230,7 +231,7 @@ def test_state_v6_rebaselines_detail_fingerprints_without_flagging_updates(
         enriched_fingerprints={article.key: "fingerprint-from-new-merge"},
     )
 
-    assert state["schema_version"] == 6
+    assert state["schema_version"] == STATE_SCHEMA_VERSION
     assert state["enriched_fingerprints"] == {}
     assert result == []
     # 이번 실행에서 새 기준을 저장하면 다음 수정부터 정상 감지한다.
@@ -317,3 +318,53 @@ def test_same_board_repost_and_updates_are_kept(make_article):
     again = make_article(id="2", board_id=234, title="수강신청 안내")
     updated = make_article(id="3", board_id=775, title="수강신청 안내", is_update=True)
     assert drop_cross_board_duplicates([again, updated], state) == [again, updated]
+
+
+def test_state_v6_migrates_followup_records(tmp_path):
+    path = tmp_path / "state.json"
+    path.write_text(
+        json.dumps(
+            {
+                "schema_version": 6,
+                "seen_ids": {},
+                "weekly_report": "broken",
+                "telegram_update_offset": "12",
+            }
+        ),
+        encoding="utf-8",
+    )
+    state = load_state(str(path))
+    assert state["schema_version"] == STATE_SCHEMA_VERSION
+    assert state["tracked_notices"] == {}
+    assert state["weekly_report"] is None
+    assert state["telegram_update_offset"] is None
+
+
+def test_state_drops_malformed_tracked_notices(tmp_path):
+    path = tmp_path / "state.json"
+    path.write_text(
+        json.dumps({"schema_version": 7, "tracked_notices": {"a": {"key": "234:1"}, "b": "x", "c": {}}}),
+        encoding="utf-8",
+    )
+    assert list(load_state(str(path))["tracked_notices"]) == ["a"]
+
+
+def test_save_state_prunes_expired_tracked_notices(tmp_path):
+    state = {
+        "seen_ids": {},
+        "tracked_notices": {
+            "old": {"key": "234:1", "keep_until": "2000-01-01"},
+            "live": {"key": "234:2", "keep_until": "2999-01-01"},
+        },
+    }
+    save_state(state, str(tmp_path / "state.json"))
+    assert list(state["tracked_notices"]) == ["live"]
+
+
+def test_reply_markup_is_attached_to_last_part_only():
+    state: dict = {}
+    markup = {"inline_keyboard": [[{"text": "✅", "callback_data": "d:1"}]]}
+    enqueue_delivery(["one", "two"], state, kind="urgent", dedup_key="k", reply_markup=markup)
+    first, last = state["pending_deliveries"]
+    assert "reply_markup" not in first
+    assert last["reply_markup"] == markup

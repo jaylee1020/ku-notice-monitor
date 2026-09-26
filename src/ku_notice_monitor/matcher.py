@@ -2,7 +2,7 @@
 
 import logging
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date, datetime
 from typing import Literal
 
@@ -53,6 +53,8 @@ class MatchResult:
     failed_keys: set[str]
     suppressed_count: int
     metrics: dict
+    # 주간 리포트에서 "알림 안 한 공지"로 보여 주기 위한 숨김 판정 결과
+    suppressed: list[ClassifiedNotice] = field(default_factory=list)
 
 
 def _sort_date(article: Article) -> datetime:
@@ -352,7 +354,7 @@ async def match_articles(
     used_openai = False
     used_rules = False
     classified: list[ClassifiedNotice] = []
-    suppressed_count = 0
+    suppressed: list[ClassifiedNotice] = []
     action_window_days = config.get("classification", {}).get("action_window_days", 21)
     suppress_speculative = config.get("classification", {}).get(
         "suppress_speculative_opportunities",
@@ -395,7 +397,7 @@ async def match_articles(
         if result.delivery != Delivery.SUPPRESS:
             classified.append(result)
         else:
-            suppressed_count += 1
+            suppressed.append(result)
 
     method = (
         "openai+rules"
@@ -415,4 +417,4 @@ async def match_articles(
     metrics["openai_result_count"] = len(openai_results)
     metrics["rule_fallback_count"] = len(articles) - len(openai_results)
     metrics["eligibility_override_count"] = eligibility_overrides
-    return MatchResult(classified, method, failed_keys, suppressed_count, metrics)
+    return MatchResult(classified, method, failed_keys, len(suppressed), metrics, suppressed)

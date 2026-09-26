@@ -523,3 +523,34 @@ def test_new_boards_message_lists_seeded_boards():
     msg = notifier.build_new_boards_message({"컴퓨터공학부": 10})
     assert "컴퓨터공학부(기존 공지 10건)" in msg
     assert "앞으로 올라오는 공지부터" in msg
+
+
+def test_post_message_includes_buttons():
+    session = _FakeSession(_FakeResponse(200, {"ok": True}))
+    markup = {"inline_keyboard": [[{"text": "✅ 완료", "callback_data": "d:1"}]]}
+    asyncio.run(
+        notifier._post_message(session, "TOKEN", "42", "hi", html=True, reply_markup=markup)
+    )
+    assert session.calls[0][1]["reply_markup"] == markup
+
+
+def test_send_telegram_part_keeps_buttons_on_plain_text_fallback(monkeypatch):
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "token")
+    monkeypatch.setenv("TELEGRAM_CHAT_ID", "chat")
+    parse_error = _error_from_response(
+        400,
+        {"ok": False, "error_code": 400, "description": "Bad Request: can't parse entities"},
+    )
+    markup = {"inline_keyboard": []}
+    with patch.object(
+        notifier, "_post_message", new_callable=AsyncMock, side_effect=[parse_error, None]
+    ) as post:
+        asyncio.run(send_telegram_part("<b>hi</b>", reply_markup=markup))
+    assert [call.kwargs["reply_markup"] for call in post.await_args_list] == [markup, markup]
+
+
+def test_call_telegram_returns_result():
+    session = _FakeSession(_FakeResponse(200, {"ok": True, "result": [{"update_id": 1}]}))
+    result = asyncio.run(notifier.call_telegram(session, "TOKEN", "getUpdates", {"timeout": 0}))
+    assert result == [{"update_id": 1}]
+    assert session.calls[0][0].endswith("/botTOKEN/getUpdates")
