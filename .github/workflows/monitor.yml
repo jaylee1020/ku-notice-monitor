@@ -4,7 +4,8 @@ on:
   schedule:
     # 매시간 확인: 긴급 공지는 즉시, 일반 공지는 설정 시각에 요약.
     # 정각(0분) 예약은 GitHub 부하로 자주 누락되어 하루 6~7회만 실행되었으므로
-    # 붐비지 않는 분에 실행한다.
+    # 붐비지 않는 분에 실행한다. 그래도 하루 4~6회만 실행되어, 외부 스케줄러가 매시간
+    # workflow_dispatch를 호출하고 이 예약은 예비로 둔다(docs/external-trigger.md).
     - cron: '17 * * * *'
   workflow_dispatch:
 

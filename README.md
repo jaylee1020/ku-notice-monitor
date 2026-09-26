@@ -91,7 +91,8 @@ uv run --no-sync python scripts/check_feeds.py --scan-konkuk 230-260
 - 키워드 폴백, 부분 실패 복구, 지수 백오프
 - 본문 수정 감지, 피드별 상태 검사와 중복 제거
 - AI 토큰·fallback·억제·전송 실패를 포함한 구조화 실행 요약
-- GitHub Actions 매시간 자동 실행(정각 예약은 GitHub 부하로 자주 누락되어 매시 17분에 실행)
+- GitHub Actions 매시간 자동 실행. GitHub 예약은 부하로 자주 누락되므로 외부 스케줄러가
+  매시간 `workflow_dispatch`를 호출하고, 매시 17분 예약은 예비로 남겨 둠
 
 ## 설정
 
@@ -142,6 +143,12 @@ uv run --no-sync python scripts/check_feeds.py --scan-konkuk 230-260
   "medium": ["취업", "인턴", "공모전", "해외"]
 }
 ```
+
+### 매시간 실행 보장
+
+GitHub Actions 예약(`schedule`)만으로는 하루 4~6회만 실행되고 간격이 최대 6시간까지
+벌어집니다. cron-job.org 같은 무료 외부 스케줄러가 매시간 워크플로를 실행하게 하는
+설정은 [`docs/external-trigger.md`](docs/external-trigger.md)에 있습니다.
 
 ### `config.yaml`
 
