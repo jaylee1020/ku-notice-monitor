@@ -3,8 +3,10 @@
 import logging
 import os
 import re
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from html import escape, unescape
+from typing import Any
+from urllib.parse import quote, urlencode
 
 import aiohttp
 
@@ -150,6 +152,44 @@ def _schedule_line(match: ClassifiedNotice) -> str | None:
     return f"{_DATE_KIND_LABELS[kind]} {_date_text(value, today)} · {_relative_day(value, today)}"
 
 
+def _calendar_target(match: ClassifiedNotice) -> tuple[str, date] | None:
+    """캘린더에 넣을 날짜 하나를 고른다: 지나지 않은 행동 마감, 없으면 가장 가까운 일정."""
+    today = now_kst().date()
+    deadline = _parse_date(match.deadline)
+    if deadline is not None:
+        return ("마감", deadline) if deadline >= today else None
+    upcoming = sorted(
+        value
+        for item in match.dates
+        if isinstance(item, dict)
+        and str(item.get("kind", "other")) in {"event_start", "other"}
+        and (value := _parse_date(item.get("date"))) is not None
+        and value >= today
+    )
+    return ("일정", upcoming[0]) if upcoming else None
+
+
+def calendar_url(match: ClassifiedNotice) -> str | None:
+    """Google Calendar 일정 추가 화면 주소. 계정 연동 없이 누르면 제목·날짜가 채워진다."""
+    target = _calendar_target(match)
+    if target is None:
+        return None
+    kind, day = target
+    title = clean_title(match.article.title, match.article.board_name)
+    text = f"[마감] {title}" if kind == "마감" else title
+    query = urlencode(
+        {
+            "action": "TEMPLATE",
+            "text": _compact(text, 120),
+            "dates": f"{day:%Y%m%d}/{day + timedelta(days=1):%Y%m%d}",
+            "details": match.article.link,
+        },
+        safe="/",
+        quote_via=quote,
+    )
+    return f"https://calendar.google.com/calendar/render?{query}"
+
+
 def _sort_key(match: ClassifiedNotice) -> tuple[int, date, str]:
     """마감·일정이 가까운 공지를 먼저 보여 준다. 지난 마감과 날짜 없는 공지는 뒤로."""
     today = now_kst().date()
@@ -207,7 +247,12 @@ def _is_redundant_summary(summary: str, title: str) -> bool:
     return not normalized_summary or normalized_summary == normalized_title
 
 
-def _build_item(match: ClassifiedNotice, index: int | None) -> str:
+def _build_item(
+    match: ClassifiedNotice,
+    index: int | None,
+    *,
+    calendar_links: bool = False,
+) -> str:
     """공지 하나를 '제목 → 날짜 → 요약 → 할 일 → 링크' 순서로 구성한다."""
     article = match.article
     title = clean_title(article.title, article.board_name)
@@ -235,6 +280,8 @@ def _build_item(match: ClassifiedNotice, index: int | None) -> str:
     link_line = f'<a href="{article_link}">공지 보기</a>'
     if article.attachments:
         link_line += f" · 첨부 {len(article.attachments)}개"
+    if calendar_links and (calendar := calendar_url(match)):
+        link_line += f' · <a href="{escape(calendar, quote=True)}">캘린더에 추가</a>'
     lines.append(link_line)
     return "\n".join(lines)
 
@@ -291,7 +338,11 @@ def _today_label() -> str:
     return _date_text(today, today)
 
 
-def build_urgent_messages(matched: list[ClassifiedNotice]) -> list[str]:
+def build_urgent_messages(
+    matched: list[ClassifiedNotice],
+    *,
+    calendar_links: bool = False,
+) -> list[str]:
     """즉시·검토 공지 알림. 공지마다 따로 보내므로 번호 없이 한 건씩 구성한다."""
     if not matched:
         return []
@@ -301,21 +352,139 @@ def build_urgent_messages(matched: list[ClassifiedNotice]) -> list[str]:
         header = "<b>[중요] 놓치면 안 되는 공지</b>"
     numbered = len(matched) > 1
     items = [
-        _build_item(match, index if numbered else None)
+        _build_item(match, index if numbered else None, calendar_links=calendar_links)
         for index, match in enumerate(sorted(matched, key=_sort_key), 1)
     ]
     return _paginate(header, items)
 
 
-def build_digest_messages(matched: list[ClassifiedNotice]) -> list[str]:
+def build_digest_messages(
+    matched: list[ClassifiedNotice],
+    *,
+    calendar_links: bool = False,
+) -> list[str]:
     """일일 요약. 마감·일정이 가까운 순으로 정렬한다."""
     ordered = sorted(matched, key=_sort_key)
-    items = [_build_item(match, index) for index, match in enumerate(ordered, 1)]
+    items = [
+        _build_item(match, index, calendar_links=calendar_links)
+        for index, match in enumerate(ordered, 1)
+    ]
     return _paginate(
         f"<b>{_today_label()} 관심 공지 {len(matched)}건</b>",
         items,
         subheader="마감·일정이 가까운 순",
     )
+
+
+def build_reminder_messages(
+    match: ClassifiedNotice,
+    days_left: int,
+    *,
+    calendar_links: bool = False,
+) -> list[str]:
+    """알림을 보냈던 공지의 행동 마감이 다가올 때 다시 보내는 알림."""
+    if days_left <= 0:
+        header = "<b>[마감 D-DAY] 오늘 마감입니다</b>"
+    else:
+        header = f"<b>[마감 D-{days_left}] 마감이 다가옵니다</b>"
+    return _paginate(header, [_build_item(match, None, calendar_links=calendar_links)])
+
+
+def notice_keyboard(
+    ref: str,
+    *,
+    with_done: bool,
+    done: bool = False,
+    feedback: str | None = None,
+) -> dict:
+    """공지 알림 아래에 다는 버튼. 누른 결과는 다음 실행에서 반영하고 표시를 바꾼다."""
+    row: list[dict[str, str]] = []
+    if with_done:
+        row.append({"text": "✅ 완료됨" if done else "✅ 완료", "callback_data": f"d:{ref}"})
+    row.append(
+        {"text": "👍 유용" + (" ✓" if feedback == "useful" else ""), "callback_data": f"u:{ref}"}
+    )
+    row.append(
+        {
+            "text": "👎 관련 없음" + (" ✓" if feedback == "not_relevant" else ""),
+            "callback_data": f"n:{ref}",
+        }
+    )
+    return {"inline_keyboard": [row]}
+
+
+def _count_text(value: int) -> str:
+    if value >= 10_000:
+        return f"{value / 10_000:.1f}만"
+    return f"{value:,}"
+
+
+def _duration_text(minutes: int) -> str:
+    hours, rest = divmod(max(minutes, 0), 60)
+    if hours and rest:
+        return f"{hours}시간 {rest}분"
+    return f"{hours}시간" if hours else f"{rest}분"
+
+
+def build_weekly_report(summary: dict[str, Any]) -> str:
+    """한 주의 실행·알림 결과와 알림하지 않은 공지, 다가오는 마감을 정리한다.
+
+    알림이 없던 주에도 보내므로 모니터가 살아 있다는 신호 역할도 한다.
+    """
+    today = now_kst().date()
+    start: datetime = summary["start"]
+    end: datetime = summary["end"]
+    lines = [
+        f"<b>[주간 리포트] {_date_text(start.date(), today)} ~ {_date_text(end.date(), today)}</b>"
+    ]
+    run_line = f"실행 {summary['runs']}회"
+    if summary.get("max_gap_minutes"):
+        run_line += f" · 가장 긴 실행 간격 {_duration_text(summary['max_gap_minutes'])}"
+    lines.append(run_line)
+    suppressed = summary.get("suppressed", [])
+    lines.append(
+        f"새 공지 {summary['new_articles']}건 → 즉시 {summary['immediate']} · "
+        f"확인 필요 {summary['review']} · 요약 {summary['digest']} · "
+        f"알림 안 함 {summary['suppressed_count']}"
+    )
+    if summary.get("outage_runs"):
+        lines.append(f"학교 서버 장애로 건너뛴 실행 {summary['outage_runs']}회")
+    if summary.get("useful") or summary.get("not_relevant"):
+        lines.append(f"피드백 👍 {summary.get('useful', 0)} · 👎 {len(summary.get('not_relevant', []))}")
+    if summary.get("input_tokens") or summary.get("output_tokens"):
+        lines.append(
+            f"AI 사용량 입력 {_count_text(summary.get('input_tokens', 0))} · "
+            f"출력 {_count_text(summary.get('output_tokens', 0))} 토큰"
+        )
+
+    upcoming: list[ClassifiedNotice] = summary.get("upcoming", [])
+    if upcoming:
+        lines.extend(["", "<b>다가오는 마감</b>"])
+        for match in upcoming:
+            deadline = _parse_date(match.deadline)
+            title = clean_title(match.article.title, match.article.board_name)
+            when = f"{_date_text(deadline, today)} {_relative_day(deadline, today)} · " if deadline else ""
+            link = escape(match.article.link, quote=True)
+            lines.append(f'· {when}<a href="{link}">{_html(title, 80)}</a>')
+
+    if suppressed:
+        lines.extend(["", "<b>알림 안 한 공지</b>"])
+        for item in suppressed:
+            link = escape(str(item.get("link", "")), quote=True)
+            title, board = str(item.get("title", "")), str(item.get("board", ""))
+            lines.append(
+                f"· [{_html(board, 20)}] "
+                f'<a href="{link}">{_html(clean_title(title, board), 80)}</a>'
+                f" — {_html(str(item.get('reason', '')), 80)}"
+            )
+        if (hidden := summary["suppressed_count"] - len(suppressed)) > 0:
+            lines.append(f"· 외 {hidden}건")
+
+    not_relevant = summary.get("not_relevant", [])
+    if not_relevant:
+        lines.extend(["", "<b>👎 관련 없다고 표시한 공지</b>"])
+        lines.extend(f"· {_html(title, 90)}" for title in not_relevant)
+    return "\n".join(lines)
 
 
 def build_no_new_message() -> str:
@@ -483,24 +652,16 @@ def _error_from_response(status: int, payload: dict) -> TelegramDeliveryError:
     )
 
 
-async def _post_message(
+async def call_telegram(
     session: aiohttp.ClientSession,
     token: str,
-    chat_id: str,
-    text: str,
-    *,
-    html: bool,
-) -> None:
-    payload: dict = {
-        "chat_id": chat_id,
-        "text": text,
-        "link_preview_options": {"is_disabled": True},
-    }
-    if html:
-        payload["parse_mode"] = "HTML"
+    method: str,
+    payload: dict,
+) -> Any:
+    """Bot API 메서드를 호출하고 ``result``를 반환한다. 실패는 분류해 예외로 올린다."""
     try:
         async with session.post(
-            f"{_TELEGRAM_API}/bot{token}/sendMessage",
+            f"{_TELEGRAM_API}/bot{token}/{method}",
             json=payload,
         ) as response:
             try:
@@ -508,7 +669,7 @@ async def _post_message(
             except ValueError:
                 body = {}
             if response.status == 200 and isinstance(body, dict) and body.get("ok"):
-                return
+                return body.get("result")
             raise _error_from_response(response.status, body if isinstance(body, dict) else {})
     except TelegramDeliveryError:
         raise
@@ -517,7 +678,38 @@ async def _post_message(
         raise TelegramDeliveryError(f"텔레그램 연결 실패: {type(exc).__name__}") from None
 
 
-async def send_telegram_part(text: str) -> None:
+async def _post_message(
+    session: aiohttp.ClientSession,
+    token: str,
+    chat_id: str,
+    text: str,
+    *,
+    html: bool,
+    reply_markup: dict | None = None,
+) -> None:
+    payload: dict = {
+        "chat_id": chat_id,
+        "text": text,
+        "link_preview_options": {"is_disabled": True},
+    }
+    if html:
+        payload["parse_mode"] = "HTML"
+    if reply_markup:
+        payload["reply_markup"] = reply_markup
+    await call_telegram(session, token, "sendMessage", payload)
+
+
+def telegram_session() -> aiohttp.ClientSession:
+    timeout = aiohttp.ClientTimeout(total=_TELEGRAM_TIMEOUT_SECONDS)
+    return aiohttp.ClientSession(timeout=timeout, trust_env=True)
+
+
+def telegram_credentials() -> tuple[str, str]:
+    """(봇 토큰, 채팅 ID). 설정되지 않았으면 TelegramNotConfiguredError."""
+    return _telegram_credentials()
+
+
+async def send_telegram_part(text: str, reply_markup: dict | None = None) -> None:
     """이미 분할된 텔레그램 메시지 한 조각을 전송한다.
 
     텔레그램이 HTML 서식을 거부하면 같은 내용을 일반 텍스트로 한 번 더 보낸다.
@@ -528,15 +720,17 @@ async def send_telegram_part(text: str) -> None:
             permanent=True,
         )
     token, chat_id = _telegram_credentials()
-    timeout = aiohttp.ClientTimeout(total=_TELEGRAM_TIMEOUT_SECONDS)
-    async with aiohttp.ClientSession(timeout=timeout, trust_env=True) as session:
+    extra: dict[str, Any] = {"reply_markup": reply_markup} if reply_markup else {}
+    async with telegram_session() as session:
         try:
-            await _post_message(session, token, chat_id, text, html=True)
+            await _post_message(session, token, chat_id, text, html=True, **extra)
         except TelegramDeliveryError as exc:
             if not (exc.permanent and "parse entities" in str(exc)):
                 raise
             logger.warning("텔레그램이 HTML 서식을 거부해 일반 텍스트로 다시 보냅니다: %s", exc)
-            await _post_message(session, token, chat_id, html_to_plain_text(text), html=False)
+            await _post_message(
+                session, token, chat_id, html_to_plain_text(text), html=False, **extra
+            )
 
 
 async def send_telegram(text: str) -> int:

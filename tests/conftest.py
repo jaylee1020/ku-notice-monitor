@@ -50,3 +50,10 @@ def make_classified(make_article):
         defaults.update(overrides)
         return ClassifiedNotice(**defaults)
     return _make
+
+
+@pytest.fixture(autouse=True)
+def _no_real_telegram(monkeypatch):
+    """개발자 환경의 실제 봇 설정으로 테스트가 텔레그램을 호출하지 않게 한다."""
+    monkeypatch.delenv("TELEGRAM_BOT_TOKEN", raising=False)
+    monkeypatch.delenv("TELEGRAM_CHAT_ID", raising=False)

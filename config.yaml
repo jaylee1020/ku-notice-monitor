@@ -87,6 +87,11 @@ classification:
 notifications:
   digest_hour_kst: 21          # 일반 공지 일일 요약 시각
   notify_empty_runs: false     # 매시간 "새 공지 없음" 메시지는 보내지 않음
+  reminder_days_before: [3, 1] # 알림을 보낸 공지의 행동 마감 D-3, D-1에 다시 알림 ([]이면 끔)
+  reminder_hour_kst: 9         # 리마인더를 보내기 시작하는 시각
+  weekly_report: true          # 일요일 요약 시각에 주간 리포트 전송
+  feedback_buttons: true       # 알림에 ✅ 완료 · 👍 · 👎 버튼 (다음 실행에서 반영)
+  calendar_links: true         # 마감·행사 날짜에 Google Calendar 추가 링크
 
 # === 설정 ===
 settings:

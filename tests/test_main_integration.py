@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+from datetime import timedelta
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -436,3 +437,157 @@ def test_main_marks_error_notified_so_workflow_does_not_repeat(tmp_path, monkeyp
 
     assert (tmp_path / main_module.ERROR_NOTIFIED_MARKER).exists()
     assert "건너뛰었습니다" in notify.await_args.kwargs["title"]
+
+
+# --- 알림 이후 기능 ---
+
+
+def _quiet_batch(state: dict, make_article) -> FeedBatch:
+    """이미 확인한 공지 하나만 있는 게시판: 새 공지 없이 한 번 실행된다."""
+    article = make_article(id="100", title="지난 공지", link="https://www.konkuk.ac.kr/notice/100")
+    mark_as_seen([article], state, fingerprints={article.key: article.fingerprint})
+    return FeedBatch([article], [FeedStatus("학사", 234, True, 1, 0.1)])
+
+
+def _future(days: int) -> str:
+    from ku_notice_monitor.util import now_kst
+
+    return (now_kst().date() + timedelta(days=days)).isoformat()
+
+
+def test_urgent_notice_is_tracked_and_sent_with_buttons(tmp_path, make_article, make_classified):
+    from ku_notice_monitor.followups import notice_ref
+
+    article = make_article(title="장학금 신청", link="https://www.konkuk.ac.kr/notice/7")
+    notice = make_classified(
+        article=article, delivery="immediate", deadline=_future(10), source="openai"
+    )
+    state_path = tmp_path / "state.json"
+    _write_state(state_path)
+    send = AsyncMock()
+
+    _run_with(
+        tmp_path,
+        FeedBatch([article], [FeedStatus("학사", 234, True, 1, 0.1)]),
+        enrich=AsyncMock(return_value={article.key}),
+        match=AsyncMock(return_value=MatchResult([notice], "openai", set(), 0, {})),
+        send=send,
+    )
+
+    stored = json.loads(state_path.read_text(encoding="utf-8"))
+    ref = notice_ref(article.key)
+    assert stored["tracked_notices"][ref]["key"] == article.key
+    text = send.await_args.args[0]
+    assert "캘린더에 추가" in text
+    markup = send.await_args.kwargs["reply_markup"]
+    assert markup["inline_keyboard"][0][0] == {"text": "✅ 완료", "callback_data": f"d:{ref}"}
+    assert stored["weekly_report"]["immediate"] == 1
+    assert stored["weekly_report"]["runs"] == 1
+
+
+def test_buttons_and_calendar_can_be_disabled(tmp_path, make_article, make_classified):
+    article = make_article(title="장학금 신청", link="https://www.konkuk.ac.kr/notice/7")
+    notice = make_classified(article=article, delivery="immediate", deadline=_future(10))
+    _write_state(tmp_path / "state.json")
+    config = _config()
+    config.notifications.feedback_buttons = False
+    config.notifications.calendar_links = False
+    send = AsyncMock()
+
+    _run_with(
+        tmp_path,
+        FeedBatch([article], [FeedStatus("학사", 234, True, 1, 0.1)]),
+        enrich=AsyncMock(return_value={article.key}),
+        match=AsyncMock(return_value=MatchResult([notice], "openai", set(), 0, {})),
+        send=send,
+        config=config,
+    )
+
+    assert "캘린더" not in send.await_args.args[0]
+    assert "reply_markup" not in send.await_args.kwargs
+
+
+def test_suppressed_new_notice_is_listed_for_weekly_report(tmp_path, make_article, make_classified):
+    article = make_article(title="대학원 논문 심사", link="https://www.konkuk.ac.kr/notice/8")
+    hidden = make_classified(article=article, delivery="suppress", reason="대학원생 대상")
+    _write_state(tmp_path / "state.json")
+
+    _run_with(
+        tmp_path,
+        FeedBatch([article], [FeedStatus("학사", 234, True, 1, 0.1)]),
+        enrich=AsyncMock(return_value={article.key}),
+        match=AsyncMock(
+            return_value=MatchResult([], "openai", set(), 1, {}, [hidden])
+        ),
+    )
+
+    stored = json.loads((tmp_path / "state.json").read_text(encoding="utf-8"))
+    weekly = stored["weekly_report"]
+    assert weekly["suppressed_count"] == 1
+    assert weekly["suppressed"][0]["reason"] == "대학원생 대상"
+
+
+def test_run_sends_due_reminder_and_weekly_report(tmp_path, make_article, make_classified):
+    from ku_notice_monitor.followups import notice_ref, track_notices
+    from ku_notice_monitor.util import now_kst
+
+    now = now_kst()
+    tracked = make_classified(
+        article=make_article(id="5", title="등록금 납부", link="https://www.konkuk.ac.kr/notice/5"),
+        delivery="immediate",
+        deadline=_future(1),
+    )
+    state = _initial_state()
+    track_notices(state, [tracked], now - timedelta(days=10))
+    state["weekly_report"] = {"period_start": (now - timedelta(days=8)).isoformat()}
+    batch = _quiet_batch(state, make_article)
+    state_path = tmp_path / "state.json"
+    state_path.write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
+    config = _config()
+    config.notifications.reminder_hour_kst = 0
+    send = AsyncMock()
+
+    _run_with(tmp_path, batch, enrich=AsyncMock(return_value=set()), send=send, config=config)
+
+    texts = [call.args[0] for call in send.await_args_list]
+    assert any(text.startswith("<b>[마감 D-1]") for text in texts)
+    assert any(text.startswith("<b>[주간 리포트]") and "등록금 납부" in text for text in texts)
+    stored = json.loads(state_path.read_text(encoding="utf-8"))
+    assert stored["tracked_notices"][notice_ref(tracked.article.key)]["reminded"]
+    assert stored["last_run_stats"]["reminders_queued"] == 1
+    assert stored["last_run_stats"]["weekly_report_queued"] is True
+    assert stored["weekly_report"]["runs"] == 0
+
+    # 다음 실행에서는 같은 리마인더와 리포트를 다시 보내지 않는다.
+    send.reset_mock()
+    _run_with(tmp_path, batch, enrich=AsyncMock(return_value=set()), send=send, config=config)
+    send.assert_not_awaited()
+
+
+def test_button_processing_failure_does_not_stop_monitoring(tmp_path, monkeypatch, make_article):
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "token")
+    monkeypatch.setenv("TELEGRAM_CHAT_ID", "42")
+    state = _initial_state()
+    batch = _quiet_batch(state, make_article)
+    (tmp_path / "state.json").write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
+    broken = AsyncMock(side_effect=TelegramDeliveryError("409 Conflict: webhook is active"))
+
+    with patch("ku_notice_monitor.main.process_button_presses", broken):
+        _run_with(tmp_path, batch, enrich=AsyncMock(return_value=set()))
+
+    broken.assert_awaited_once()
+    stored = json.loads((tmp_path / "state.json").read_text(encoding="utf-8"))
+    assert stored["last_run_stats"]["button_presses"] == 0
+
+
+def test_first_run_skips_buttons_so_failed_start_leaves_no_state(tmp_path, monkeypatch):
+    from ku_notice_monitor.main import SourceOutageError
+
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "token")
+    monkeypatch.setenv("TELEGRAM_CHAT_ID", "42")
+    presses = AsyncMock(return_value=0)
+    with patch("ku_notice_monitor.main.process_button_presses", presses):
+        with pytest.raises(SourceOutageError):
+            _run_with_batches(tmp_path, [_outage_batch(), _outage_batch()])
+    presses.assert_not_awaited()
+    assert not (tmp_path / "state.json").exists()

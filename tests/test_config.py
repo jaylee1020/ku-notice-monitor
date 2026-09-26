@@ -230,3 +230,22 @@ def test_load_config_applies_environment_profile(monkeypatch):
         config = load_config()
     assert config.profile_text == "나는 서울에 산다."
     assert config.keywords.high == ["장학"]
+
+
+def test_reminder_days_are_sorted_and_validated():
+    config = _make_valid_config()
+    config["notifications"]["reminder_days_before"] = [1, 7]
+    assert validate_config(config).notifications.reminder_days_before == [7, 1]
+
+    for invalid in ([1, 1], [-1], [31]):
+        config["notifications"]["reminder_days_before"] = invalid
+        with pytest.raises(ValueError, match="reminder_days_before"):
+            validate_config(config)
+
+
+def test_followup_features_default_on():
+    notifications = validate_config(_make_valid_config()).notifications
+    assert notifications.reminder_days_before == [3, 1]
+    assert notifications.weekly_report is True
+    assert notifications.feedback_buttons is True
+    assert notifications.calendar_links is True

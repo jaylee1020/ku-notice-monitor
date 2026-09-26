@@ -78,6 +78,24 @@ class ClassificationConfig(_Section):
 class NotificationConfig(_Section):
     digest_hour_kst: StrictInt = Field(default=21, ge=0, le=23)
     notify_empty_runs: StrictBool = False
+    # 알림을 보낸 공지의 행동 마감 며칠 전에 다시 알릴지. 빈 목록이면 리마인더를 끈다.
+    reminder_days_before: list[StrictInt] = Field(default_factory=lambda: [3, 1], max_length=5)
+    reminder_hour_kst: StrictInt = Field(default=9, ge=0, le=23)
+    # 일요일 요약 시각에 한 주의 실행·알림·알림 안 한 공지를 정리해 보낸다.
+    weekly_report: StrictBool = True
+    # 공지 알림에 완료·피드백 버튼을 달고 다음 실행에서 눌린 버튼을 반영한다.
+    feedback_buttons: StrictBool = True
+    # 마감·행사 날짜가 있는 공지에 Google Calendar 일정 추가 링크를 붙인다.
+    calendar_links: StrictBool = True
+
+    @field_validator("reminder_days_before")
+    @classmethod
+    def _valid_reminder_days(cls, value: list[int]) -> list[int]:
+        if any(day < 0 or day > 30 for day in value):
+            raise ValueError("0~30일 사이여야 합니다")
+        if len(set(value)) != len(value):
+            raise ValueError("같은 날짜를 두 번 넣을 수 없습니다")
+        return sorted(value, reverse=True)
 
 
 class RuntimeConfig(_Section):

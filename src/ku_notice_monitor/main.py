@@ -6,6 +6,8 @@
 2. RSS를 수집하고 신규·수정·재시도·재확인 대상 공지를 고른다.
 3. 대상 공지의 상세 본문을 보강하고 AI/규칙으로 분류한다.
 4. 즉시 알림과 일일 요약을 outbox에 넣고 상태를 저장한 뒤 전송한다.
+5. 알림 이후 기능: 눌린 텔레그램 버튼을 반영하고(1 직후), 마감 리마인더와 주간
+   리포트를 outbox에 넣는다(4 직전).
 
 모든 전송 결과는 즉시 상태 파일에 기록되므로, 실행이 중간에 실패해도 이미 보낸
 알림이 다시 전송되지 않는다.
@@ -30,6 +32,19 @@ from .feeds import (
     fetch_all_feeds_detailed,
     parse_pub_date,
 )
+from .followups import (
+    due_reminders,
+    keyboard_for,
+    mark_reminded,
+    notice_ref,
+    process_button_presses,
+    record_classification,
+    record_run,
+    start_new_week,
+    track_notices,
+    weekly_report_due,
+    weekly_summary,
+)
 from .matcher import match_articles
 from .models import Article, ClassifiedNotice
 from .notifier import (
@@ -40,9 +55,11 @@ from .notifier import (
     build_new_boards_message,
     build_no_new_message,
     build_no_relevant_message,
+    build_reminder_messages,
     build_source_outage_message,
     build_source_recovered_message,
     build_urgent_messages,
+    build_weekly_report,
     notify_error,
     send_telegram_part,
     split_message,
@@ -137,6 +154,9 @@ def _new_stats() -> dict[str, Any]:
         "profile_metrics": {},
         "method": "none",
         "timing": {},
+        "button_presses": 0,
+        "reminders_queued": 0,
+        "weekly_report_queued": False,
     }
 
 
@@ -312,9 +332,17 @@ def _queue_parts(
     kind: str,
     dedup_key: str,
     metadata: dict | None = None,
+    reply_markup: dict | None = None,
 ) -> int:
     before = len(state.setdefault("pending_deliveries", []))
-    enqueue_delivery(parts, state, kind=kind, dedup_key=dedup_key, metadata=metadata)
+    enqueue_delivery(
+        parts,
+        state,
+        kind=kind,
+        dedup_key=dedup_key,
+        metadata=metadata,
+        reply_markup=reply_markup,
+    )
     return len(state["pending_deliveries"]) - before
 
 
@@ -339,6 +367,7 @@ def _queue_urgent_notifications(
     state: dict,
     urgent: list[ClassifiedNotice],
     source_fingerprints: dict[str, str],
+    config: dict | None = None,
 ) -> int:
     """즉시·검토 공지를 공지별 메시지로 나누어 중복 없이 큐에 넣는다."""
     pending_notice_tokens = {
@@ -366,12 +395,22 @@ def _queue_urgent_notifications(
         key=lambda pair: (delivery_priority.get(pair[0].delivery, 2), pair[0].article.key)
     )
 
+    notifications = (config or {}).get("notifications", {})
+    tracked = state.get("tracked_notices", {})
     queued_parts = 0
     for item, notice_token in candidates:
         urgent_key = _batch_key("urgent", [notice_token])
+        ref = notice_ref(item.article.key)
+        markup = (
+            keyboard_for(ref, tracked[ref])
+            if notifications.get("feedback_buttons", False) and ref in tracked
+            else None
+        )
         queued_parts += _queue_parts(
             state,
-            build_urgent_messages([item]),
+            build_urgent_messages(
+                [item], calendar_links=notifications.get("calendar_links", False)
+            ),
             kind="urgent",
             dedup_key=urgent_key,
             metadata={
@@ -379,6 +418,7 @@ def _queue_urgent_notifications(
                 "notice_count": 1,
                 "notice_tokens": [notice_token],
             },
+            reply_markup=markup,
         )
     return queued_parts
 
@@ -418,7 +458,10 @@ async def _flush_pending_deliveries(state: dict, state_path: str) -> dict[str, A
             blocked_groups.add(group_id)
             continue
         try:
-            await send_telegram_part(item["text"])
+            if markup := item.get("reply_markup"):
+                await send_telegram_part(item["text"], reply_markup=markup)
+            else:
+                await send_telegram_part(item["text"])
         except Exception as exc:
             if isinstance(exc, TelegramNotConfiguredError):
                 logger.warning("%s", exc)
@@ -510,7 +553,10 @@ async def _flush_digest_if_due(
     group_id = f"digest:{digest_date}"
     _queue_parts(
         state,
-        build_digest_messages(pending),
+        build_digest_messages(
+            pending,
+            calendar_links=config["notifications"].get("calendar_links", False),
+        ),
         kind="digest",
         dedup_key=group_id,
         metadata={
@@ -537,6 +583,7 @@ async def _classify_and_queue(
     total_new: int,
     source_fingerprints: dict[str, str],
     stats: dict,
+    report_keys: set[str] | None = None,
 ) -> None:
     profile_metrics: dict[str, Any] = {}
     use_ai = True
@@ -572,10 +619,24 @@ async def _classify_and_queue(
     stats["review_articles"] = sum(item.delivery == "review" for item in urgent)
     stats["digest_queued"] = len(digest)
 
+    # 재확인 공지까지 세면 주간 리포트의 "새 공지 → 판정" 숫자가 맞지 않는다.
+    reported = report_keys if report_keys is not None else {item.key for item in articles}
+    now = now_kst()
+    track_notices(state, urgent + digest, now)
+    record_classification(
+        state,
+        now,
+        immediate=sum(i.delivery == "immediate" and i.article.key in reported for i in urgent),
+        review=sum(i.delivery == "review" and i.article.key in reported for i in urgent),
+        digest=sum(i.article.key in reported for i in digest),
+        suppressed=[i for i in result.suppressed if i.article.key in reported],
+    )
+
     stats["outbox_queued_parts"] += _queue_urgent_notifications(
         state,
         urgent,
         source_fingerprints,
+        config,
     )
     if digest:
         enqueue_digest(digest, state)
@@ -677,6 +738,7 @@ async def _handle_source_outage(
         "전송" if alerted else ("이미 보냄" if outage.get("alerted") else "보류"),
         exc,
     )
+    _queue_followups(state, config, stats)
     state["last_run_stats"] = stats
     save_state(state, state_path)
     _add_delivery_stats(stats, await _flush_pending_deliveries(state, state_path))
@@ -685,9 +747,72 @@ async def _handle_source_outage(
     _log_run_summary(stats)
 
 
+def _queue_followups(state: dict, config: dict, stats: dict) -> None:
+    """마감 리마인더와 주간 리포트를 outbox에 넣는다. 공지 수집 결과와 무관하다."""
+    notifications = config["notifications"]
+    now = now_kst()
+    calendar_links = notifications.get("calendar_links", False)
+    for reminder in due_reminders(
+        state,
+        notifications.get("reminder_days_before", []),
+        notifications.get("reminder_hour_kst", 9),
+        now,
+    ):
+        record = state["tracked_notices"][reminder.ref]
+        group_id = f"reminder:{reminder.ref}:{reminder.marker}"
+        stats["outbox_queued_parts"] += _queue_parts(
+            state,
+            build_reminder_messages(
+                reminder.notice, reminder.days_left, calendar_links=calendar_links
+            ),
+            kind="reminder",
+            dedup_key=group_id,
+            metadata={"group_id": group_id},
+            reply_markup=(
+                keyboard_for(reminder.ref, record)
+                if notifications.get("feedback_buttons", False)
+                else None
+            ),
+        )
+        mark_reminded(state, reminder)
+        stats["reminders_queued"] += 1
+
+    record_run(state, stats, now)
+    if weekly_report_due(state, notifications.get("digest_hour_kst", 21), now):
+        summary = weekly_summary(state, now)
+        if notifications.get("weekly_report", False):
+            group_id = f"weekly:{summary['period_start']}"
+            stats["outbox_queued_parts"] += _queue_message(
+                state,
+                build_weekly_report(summary),
+                kind="weekly",
+                dedup_key=group_id,
+                metadata={"group_id": group_id},
+            )
+            stats["weekly_report_queued"] = True
+        start_new_week(state, now)
+
+
+async def _process_buttons(state: dict, state_path: str, config: dict, stats: dict) -> None:
+    """버튼 처리는 부가 기능이라 실패해도 공지 확인을 막지 않는다."""
+    if not config["notifications"].get("feedback_buttons", False):
+        return
+    try:
+        stats["button_presses"] = await process_button_presses(state, now_kst())
+    except TelegramNotConfiguredError:
+        return
+    except Exception as exc:
+        logger.warning("텔레그램 버튼을 처리하지 못했습니다. 다음 실행에서 다시 봅니다: %s", exc)
+        return
+    if stats["button_presses"]:
+        logger.info("눌린 버튼 %d개를 반영했습니다.", stats["button_presses"])
+    save_state(state, state_path)
+
+
 async def _finish(
     state: dict,
     state_path: str,
+    config: dict,
     stats: dict,
     all_articles: list[Article],
     source_fingerprints: dict[str, str],
@@ -700,6 +825,7 @@ async def _finish(
         fingerprints=source_fingerprints,
         enriched_fingerprints=enriched_fingerprints,
     )
+    _queue_followups(state, config, stats)
     state["last_run_stats"] = stats
     save_state(state, state_path)
     _add_delivery_stats(stats, await _flush_pending_deliveries(state, state_path))
@@ -725,6 +851,9 @@ async def run() -> None:
     stats["profile_changed"] = profile_changed
 
     _add_delivery_stats(stats, await _flush_pending_deliveries(state, state_path))
+    if not first_run:
+        # 첫 실행에는 누를 버튼이 없고, 여기서 상태를 저장하면 아래 장애 처리가 깨진다.
+        await _process_buttons(state, state_path, config, stats)
 
     if not config["settings"].get("ssl_verify", True):
         await check_ssl_health(config)
@@ -754,7 +883,7 @@ async def run() -> None:
             metadata={"group_id": "first-run"},
         )
         state["profile_document_hash"] = current_profile_hash
-        await _finish(state, state_path, stats, all_articles, source_fingerprints)
+        await _finish(state, state_path, config, stats, all_articles, source_fingerprints)
         _raise_for_delivery_configuration(stats)
         return
 
@@ -831,6 +960,7 @@ async def run() -> None:
             total_new=len(new_articles),
             source_fingerprints=source_fingerprints,
             stats=stats,
+            report_keys={article.key for article in new_articles},
         )
     elif config["notifications"].get("notify_empty_runs", False):
         stats["outbox_queued_parts"] += _queue_message(
@@ -845,6 +975,7 @@ async def run() -> None:
     await _finish(
         state,
         state_path,
+        config,
         stats,
         all_articles,
         source_fingerprints,
