@@ -65,8 +65,6 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           PROFILE_TEXT: ${{ secrets.PROFILE_TEXT }}
-          PROFILE_JSON: ${{ secrets.PROFILE_JSON }}
-          KEYWORDS_JSON: ${{ secrets.KEYWORDS_JSON }}
         run: uv run --no-sync ku-notice-monitor
 
       # 상태는 전송 한 건마다 원자적으로 저장되므로 실행이 중간에 실패해도 일관적이다.

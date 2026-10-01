@@ -147,7 +147,7 @@ def classify_assessment(
     article: Article,
     assessment: NoticeAssessment,
     *,
-    source: Literal["openai", "rules", "legacy"],
+    source: Literal["openai", "rules"],
     today: date | None = None,
     action_window_days: int = 21,
     suppress_speculative_opportunities: bool = True,

@@ -101,7 +101,7 @@ class ClassifiedNotice:
     benefits: list[str] = field(default_factory=list)
     evidence: list[str] = field(default_factory=list)
     uncertainties: list[str] = field(default_factory=list)
-    source: Literal["openai", "rules", "legacy"] = "openai"
+    source: Literal["openai", "rules"] = "openai"
 
     def to_dict(self) -> dict:
         return {
@@ -127,12 +127,4 @@ class ClassifiedNotice:
     def from_dict(cls, value: dict) -> "ClassifiedNotice":
         data = dict(value)
         data["article"] = Article.from_dict(data["article"])
-        if "delivery" not in data:
-            urgency = data.pop("urgency", "digest")
-            data["delivery"] = "immediate" if urgency == "urgent" else "digest"
-            data.setdefault("category", "other")
-            data.setdefault("summary", data["article"].title)
-            data.setdefault("reason", "이전 분류 결과")
-            data.setdefault("source", "legacy")
-        data.pop("score", None)
         return cls(**data)

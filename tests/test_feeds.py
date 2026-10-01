@@ -37,7 +37,6 @@ from ku_notice_monitor.state import (
     filter_new_articles,
     load_state,
     mark_as_seen,
-    migrate_legacy_ids,
     save_state,
 )
 
@@ -195,24 +194,6 @@ def test_mark_as_seen(make_article):
     assert "234:20" in state["seen_ids"]
 
 
-# --- migrate_legacy_ids ---
-
-
-def test_migrate_legacy_ids(make_article):
-    articles = [make_article(id="1", board_id=243)]
-    seen = {"1": "2026-01-01T00:00:00"}
-    migrate_legacy_ids(articles, seen)
-    assert "243:1" in seen
-    assert "1" not in seen
-
-
-def test_migrate_legacy_ids_skips_already_migrated(make_article):
-    articles = [make_article(id="1", board_id=243)]
-    seen = {"243:1": "2026-01-01T00:00:00"}
-    migrate_legacy_ids(articles, seen)
-    assert "243:1" in seen
-
-
 # --- load_state ---
 
 
@@ -226,25 +207,9 @@ def test_load_state_missing_file(tmp_path):
 
 def test_load_state_existing_file(tmp_path):
     path = tmp_path / "state.json"
-    path.write_text('{"seen_ids": {"1": "2026-01-01"}, "last_run": "2026-01-01"}')
+    path.write_text('{"schema_version": 7, "seen_ids": {"1": "2026-01-01"}, "last_run": "2026-01-01"}')
     result = load_state(str(path))
     assert "1" in result["seen_ids"]
-
-
-def test_load_state_migrates_link_style_keys(tmp_path):
-    """ID 추출 실패로 링크가 키에 저장된 구형 항목을 'board_id:artcl_id'로 정규화한다."""
-    path = tmp_path / "state.json"
-    path.write_text(json.dumps({
-        "seen_ids": {
-            "4083:/bbs/job/4083/1168188/artclView.do?layout=unknown": "2026-01-01T00:00:00",
-            "234:1166860": "2026-01-01T00:00:00",
-        },
-        "last_run": None,
-    }), encoding="utf-8")
-    result = load_state(str(path))
-    assert "4083:1168188" in result["seen_ids"]
-    assert "4083:/bbs/job/4083/1168188/artclView.do?layout=unknown" not in result["seen_ids"]
-    assert "234:1166860" in result["seen_ids"]  # 정상 키는 그대로 유지
 
 
 def test_load_state_corrupted_file_stops_safely(tmp_path):
@@ -254,10 +219,11 @@ def test_load_state_corrupted_file_stops_safely(tmp_path):
         load_state(str(path))
 
 
-def test_load_state_rejects_future_schema(tmp_path):
+@pytest.mark.parametrize("version", [None, 6, 999])
+def test_load_state_rejects_unsupported_schema(tmp_path, version):
     path = tmp_path / "state.json"
-    path.write_text('{"schema_version": 999}', encoding="utf-8")
-    with pytest.raises(StateCorruptionError, match="새로운 state 스키마"):
+    path.write_text(json.dumps({"schema_version": version}), encoding="utf-8")
+    with pytest.raises(StateCorruptionError, match="지원하지 않는 state 스키마"):
         load_state(str(path))
 
 
@@ -592,15 +558,6 @@ def test_extract_attachments_absolute_url():
     attachments = _extract_attachments(soup, "https://www.konkuk.ac.kr")
     assert len(attachments) == 1
     assert attachments[0].url == "https://www.konkuk.ac.kr/bbs/konkuk/234/123/download.do"
-
-
-def test_filter_new_articles_migrates_legacy_id_key(make_article):
-    articles = [make_article(id="1", board_id=243)]
-    state = {"seen_ids": {"1": "2026-01-01T00:00:00"}}
-    result = filter_new_articles(articles, state)
-    assert result == []
-    assert "243:1" in state["seen_ids"]
-    assert "1" not in state["seen_ids"]
 
 
 def test_fetch_all_feeds_reports_partial_failure(make_article):

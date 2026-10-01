@@ -4,7 +4,6 @@ import json
 from datetime import datetime
 
 from ku_notice_monitor.state import (
-    STATE_SCHEMA_VERSION,
     clear_pending_digest,
     complete_delivery,
     due_classification_retry_keys,
@@ -188,65 +187,6 @@ def test_classification_retry_uses_bounded_backoff():
     ) == {"234:1"}
 
 
-def test_state_v3_migrates_profile_hash_without_personal_data(tmp_path):
-    path = tmp_path / "state.json"
-    path.write_text(
-        '{"schema_version":3,"seen_ids":{},"article_fingerprints":{},'
-        '"enriched_fingerprints":{},"pending_digest":[],'
-        '"pending_deliveries":[],"delivery_history":{},'
-        '"classification_retries":{}}',
-        encoding="utf-8",
-    )
-    state = load_state(str(path))
-    assert state["schema_version"] == STATE_SCHEMA_VERSION
-    assert state["profile_document_hash"] is None
-    assert state["urgent_notice_history"] == {}
-    assert "profile_snapshot" not in state
-
-
-def test_state_v6_rebaselines_detail_fingerprints_without_flagging_updates(
-    tmp_path,
-    make_article,
-):
-    """본문 병합 방식이 바뀌어도 기존 공지가 한꺼번에 '수정됨'으로 잡히지 않는다."""
-    article = make_article(id="1", description="RSS 요약")
-    path = tmp_path / "state.json"
-    path.write_text(
-        json.dumps(
-            {
-                "schema_version": 5,
-                "seen_ids": {article.key: datetime.now().isoformat()},
-                "article_fingerprints": {article.key: article.fingerprint},
-                "enriched_fingerprints": {article.key: "fingerprint-from-old-merge"},
-            }
-        ),
-        encoding="utf-8",
-    )
-
-    state = load_state(str(path))
-    result = filter_new_articles(
-        [article],
-        state,
-        source_fingerprints={article.key: article.fingerprint},
-        enriched_fingerprints={article.key: "fingerprint-from-new-merge"},
-    )
-
-    assert state["schema_version"] == STATE_SCHEMA_VERSION
-    assert state["enriched_fingerprints"] == {}
-    assert result == []
-    # 이번 실행에서 새 기준을 저장하면 다음 수정부터 정상 감지한다.
-    mark_as_seen(
-        [article],
-        state,
-        fingerprints={article.key: article.fingerprint},
-        enriched_fingerprints={article.key: "fingerprint-from-new-merge"},
-    )
-    assert state["enriched_fingerprints"][article.key] == "fingerprint-from-new-merge"
-
-
-# --- 새 게시판 시드 ---
-
-
 def test_seed_new_boards_marks_existing_posts_of_added_board(make_article):
     from ku_notice_monitor.state import seed_new_boards
 
@@ -320,12 +260,12 @@ def test_same_board_repost_and_updates_are_kept(make_article):
     assert drop_cross_board_duplicates([again, updated], state) == [again, updated]
 
 
-def test_state_v6_migrates_followup_records(tmp_path):
+def test_state_resets_malformed_followup_records(tmp_path):
     path = tmp_path / "state.json"
     path.write_text(
         json.dumps(
             {
-                "schema_version": 6,
+                "schema_version": 7,
                 "seen_ids": {},
                 "weekly_report": "broken",
                 "telegram_update_offset": "12",
@@ -334,7 +274,6 @@ def test_state_v6_migrates_followup_records(tmp_path):
         encoding="utf-8",
     )
     state = load_state(str(path))
-    assert state["schema_version"] == STATE_SCHEMA_VERSION
     assert state["tracked_notices"] == {}
     assert state["weekly_report"] is None
     assert state["telegram_update_offset"] is None
