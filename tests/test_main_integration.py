@@ -19,8 +19,6 @@ from ku_notice_monitor.state import _initial_state, mark_as_seen
 def _config() -> AppConfig:
     return AppConfig.model_validate(
         {
-            "profile": {},
-            "keywords": {},
             "feeds": {"학사": {"id": 234, "enabled": True}},
             "ai": {
                 "model": "gpt-6-luna",

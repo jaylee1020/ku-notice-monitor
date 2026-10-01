@@ -51,21 +51,6 @@ def _initial_state() -> dict:
     }
 
 
-def _normalize_seen_key(key: str) -> str:
-    """게시물 ID 대신 링크가 저장된 구형 키를 'board_id:artcl_id' 형식으로 정규화한다.
-
-    과거 extract_article_id()가 www.konkuk.ac.kr 외 게시판(예: kuinc)의 링크에서
-    ID를 추출하지 못해 '4083:/bbs/job/4083/1168188/artclView.do?...' 형태로
-    저장된 키를 '4083:1168188'로 변환한다. 변환하지 않으면 ID 추출 수정 후
-    해당 공지들이 전부 신규로 재인식되어 중복 알림이 발생한다.
-    """
-    board, sep, rest = key.partition(":")
-    if not sep:
-        return key
-    match = re.search(r"/(\d+)/artclView", rest)
-    return f"{board}:{match.group(1)}" if match else key
-
-
 def load_state(state_path: str) -> dict:
     """state.json을 로드한다.
 
@@ -87,43 +72,13 @@ def load_state(state_path: str) -> dict:
     if not isinstance(state, dict):
         raise StateCorruptionError("state 파일 최상위 값은 JSON 객체여야 합니다.")
 
-    schema_version = state.get("schema_version", 1)
-    if not isinstance(schema_version, int) or schema_version < 1:
-        raise StateCorruptionError("state.schema_version은 1 이상의 정수여야 합니다.")
-    if schema_version > STATE_SCHEMA_VERSION:
+    schema_version = state.get("schema_version")
+    if schema_version != STATE_SCHEMA_VERSION:
         raise StateCorruptionError(
-            f"현재 코드보다 새로운 state 스키마입니다: {schema_version} > "
-            f"{STATE_SCHEMA_VERSION}"
+            f"지원하지 않는 state 스키마입니다: {schema_version!r} "
+            f"(필요: {STATE_SCHEMA_VERSION})"
         )
 
-    # v1 → v2: 알림 outbox와 digest 전송일 추가
-    if schema_version < 2:
-        state.setdefault("pending_deliveries", [])
-        state.setdefault("last_digest_enqueued_date", None)
-        state.setdefault("last_digest_sent_date", None)
-    # v2 → v3: 상세 본문 지문·완료 기록·AI 재시도 추가
-    if schema_version < 3:
-        state.setdefault("enriched_fingerprints", {})
-        state.setdefault("delivery_history", {})
-        state.setdefault("classification_retries", {})
-        state.setdefault("last_detail_refresh_at", None)
-    # v3 → v4: 자연어 프로필 내용은 저장하지 않고 변경 감지 해시만 추가
-    if schema_version < 4:
-        state.setdefault("profile_document_hash", None)
-    # v4 → v5: 묶음이 달라져도 공지별 즉시 알림 중복을 막는 완료 기록 추가
-    if schema_version < 5:
-        state.setdefault("urgent_notice_history", {})
-    # v5 → v6: RSS 요약과 상세 본문 병합 방식이 바뀌어 상세 지문을 다시 기준으로 잡는다.
-    # 이전 지문과 비교하면 바뀐 게 없는 최근 공지가 모두 수정 공지로 잡힌다.
-    if schema_version < 6:
-        state["enriched_fingerprints"] = {}
-    # v6 → v7: 마감 리마인더·버튼 피드백용 공지 기록, 주간 리포트 집계, 텔레그램 버튼 처리 위치
-    if schema_version < 7:
-        state.setdefault("tracked_notices", {})
-        state.setdefault("weekly_report", None)
-        state.setdefault("telegram_update_offset", None)
-
-    state["schema_version"] = schema_version
     state.setdefault("seen_ids", {})
     state.setdefault("article_fingerprints", {})
     state.setdefault("enriched_fingerprints", {})
@@ -167,18 +122,16 @@ def load_state(state_path: str) -> dict:
                 f"state.{field}의 형식이 잘못되었습니다: {expected_type.__name__} 필요"
             )
 
-    normalized_seen: dict[str, str] = {}
-    for k, v in state["seen_ids"].items():
-        if isinstance(v, str):
-            normalized_seen[_normalize_seen_key(str(k))] = v
-    state["seen_ids"] = normalized_seen
+    state["seen_ids"] = {
+        str(k): v for k, v in state["seen_ids"].items() if isinstance(v, str)
+    }
     state["article_fingerprints"] = {
-        _normalize_seen_key(str(k)): str(v)
+        str(k): str(v)
         for k, v in state["article_fingerprints"].items()
         if isinstance(v, str)
     }
     state["enriched_fingerprints"] = {
-        _normalize_seen_key(str(k)): str(v)
+        str(k): str(v)
         for k, v in state["enriched_fingerprints"].items()
         if isinstance(v, str)
     }
@@ -212,7 +165,7 @@ def load_state(state_path: str) -> dict:
         if isinstance(v, str)
     }
     state["classification_retries"] = {
-        _normalize_seen_key(str(k)): value
+        str(k): value
         for k, value in state["classification_retries"].items()
         if isinstance(value, dict)
     }
@@ -221,7 +174,6 @@ def load_state(state_path: str) -> dict:
         for k, value in state["tracked_notices"].items()
         if isinstance(value, dict) and isinstance(value.get("key"), str)
     }
-    state["schema_version"] = STATE_SCHEMA_VERSION
 
     return state
 
@@ -279,13 +231,6 @@ def save_state(state: dict, state_path: str) -> None:
     logger.debug("상태 저장 완료: %s", state_path)
 
 
-def migrate_legacy_ids(articles: list[Article], seen: dict[str, str]) -> None:
-    """구형 포맷(id 단독) → 신규 포맷(board_id:id)으로 마이그레이션"""
-    for article in articles:
-        if article.id in seen and article.key not in seen:
-            seen[article.key] = seen.pop(article.id)
-
-
 def filter_new_articles(
     articles: list[Article],
     state: dict,
@@ -297,8 +242,6 @@ def filter_new_articles(
     seen = state.get("seen_ids", {})
     fingerprints = state.setdefault("article_fingerprints", {})
     stored_enriched = state.setdefault("enriched_fingerprints", {})
-
-    migrate_legacy_ids(articles, seen)
 
     result_by_key: dict[str, Article] = {}
     for article in articles:
@@ -495,15 +438,8 @@ def enqueue_delivery(
     for index, text in enumerate(parts):
         raw_id = f"{kind}\0{dedup_key}\0{index}".encode()
         delivery_id = hashlib.sha256(raw_id).hexdigest()
-        legacy_raw_id = f"{kind}\0{dedup_key}\0{index}\0{text}".encode()
-        legacy_delivery_id = hashlib.sha256(legacy_raw_id).hexdigest()
         ids.append(delivery_id)
-        if (
-            delivery_id in existing_ids
-            or delivery_id in history
-            or legacy_delivery_id in existing_ids
-            or legacy_delivery_id in history
-        ):
+        if delivery_id in existing_ids or delivery_id in history:
             continue
         new_items.append(
             {

@@ -38,18 +38,3 @@ def test_classified_notice_round_trip(make_article):
     )
     restored = ClassifiedNotice.from_dict(match.to_dict())
     assert restored == match
-
-
-def test_classified_notice_reads_legacy_state(make_article):
-    legacy = {
-        "article": make_article(title="옛 공지").to_dict(),
-        "score": 5,
-        "reason": "이전 결과",
-        "summary": "옛 요약",
-        "urgency": "urgent",
-        "deadline": None,
-        "actions": [],
-    }
-    restored = ClassifiedNotice.from_dict(legacy)
-    assert restored.delivery == "immediate"
-    assert restored.source == "legacy"

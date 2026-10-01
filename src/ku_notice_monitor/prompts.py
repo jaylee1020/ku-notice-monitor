@@ -104,22 +104,7 @@ def build_profile_text(config: dict) -> str:
             )
         return "\n".join(lines)
 
-    profile = config["profile"]
-    keywords = config.get("keywords", {})
-
-    fields = [
-        ("학과", profile.get("major")),
-        ("전공진입 전 소속", profile.get("previous_major")),
-        ("학년", f"{profile['year']}학년" if profile.get("year") else None),
-        ("캠퍼스", profile.get("campus")),
-        ("재학 상태", profile.get("status")),
-    ]
-    lines = [f"{label}: {value}" for label, value in fields if value]
-    if keywords.get("high"):
-        lines.append(f"우선 관심사: {', '.join(keywords['high'])}")
-    if keywords.get("medium"):
-        lines.append(f"일반 관심사: {', '.join(keywords['medium'])}")
-    return "\n".join(lines) if lines else "프로필 정보 없음"
+    return "프로필 정보 없음"
 
 
 def build_prompt(

@@ -12,7 +12,7 @@ from .eligibility import apply_profile_eligibility
 from .feeds import parse_pub_date
 from .models import Article, ClassifiedNotice
 from .openai_classifier import AnalysisOutcome, analyze_with_openai
-from .profile import legacy_profile_snapshot
+from .profile import empty_profile_snapshot
 from .profile_models import ProfileSnapshot
 from .util import is_grounded, normalize_for_match, now_kst
 
@@ -140,22 +140,12 @@ def _reference_year(article: Article) -> int:
 def keyword_fallback(article: Article, config: dict) -> NoticeAssessment:
     """API 장애 시 false negative를 줄이는 보수적 단일 공지 추출."""
     text = _text(article)
-    high = _find_keywords(text, config.get("keywords", {}).get("high", []))
-    medium = _find_keywords(text, config.get("keywords", {}).get("medium", []))
-    profile = config.get("profile", {})
-    profile_terms = [
-        str(value)
-        for key, value in profile.items()
-        if key in {"major", "previous_major", "campus", "status"} and value
-    ]
     raw_snapshot = config.get("profile_snapshot")
-    if raw_snapshot:
-        snapshot = ProfileSnapshot.model_validate(raw_snapshot)
-        profile_terms.extend(
-            fact.value
-            for fact in snapshot.facts
-            if fact.value not in profile_terms
-        )
+    profile_terms = (
+        list(dict.fromkeys(fact.value for fact in ProfileSnapshot.model_validate(raw_snapshot).facts))
+        if raw_snapshot
+        else []
+    )
     audience_matches = _find_keywords(text, profile_terms)
     category = _fallback_category(text)
     direct_academic_risk = any(term in text for term in _DIRECT_ACADEMIC_RISK_TERMS)
@@ -176,8 +166,7 @@ def keyword_fallback(article: Article, config: dict) -> NoticeAssessment:
         and consequence != "missed_opportunity"
     )
 
-    matched = high or medium
-    evidence = [f"키워드 일치: {item}" for item in (high + medium + audience_matches)[:5]]
+    evidence = [f"키워드 일치: {item}" for item in audience_matches[:5]]
     dates = _fallback_dates(text)
     actions = []
     if required:
@@ -206,13 +195,9 @@ def keyword_fallback(article: Article, config: dict) -> NoticeAssessment:
                 if audience_matches
                 else "규칙만으로 대상 조건을 확인할 수 없음"
             ),
-            "interest_fit": "high" if high else ("medium" if medium else "low"),
-            "interest_reason": (
-                f"관심 키워드 일치: {', '.join(matched)}"
-                if matched
-                else "설정된 관심 키워드와 일치하지 않음"
-            ),
-            "obligation": "required" if required else "optional" if matched else "none",
+            "interest_fit": "low",
+            "interest_reason": "규칙만으로 관심사 일치를 판단할 수 없음",
+            "obligation": "required" if required else "none",
             "consequence": consequence,
             "dates": dates,
             "actions": actions,
@@ -363,7 +348,7 @@ async def match_articles(
     snapshot = (
         ProfileSnapshot.model_validate(config["profile_snapshot"])
         if config.get("profile_snapshot")
-        else legacy_profile_snapshot(config)
+        else empty_profile_snapshot()
     )
     eligibility_overrides = 0
 

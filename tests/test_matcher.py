@@ -41,12 +41,6 @@ def _config(**ai_overrides):
     return {
         "ai": ai,
         "classification": {"action_window_days": 21},
-        "profile": {
-            "major": "컴퓨터공학부",
-            "previous_major": "KU자유전공학부",
-            "year": 2,
-        },
-        "keywords": {"high": ["장학", "수강신청"], "medium": ["인턴"]},
         "settings": {"ssl_verify": True},
     }
 
@@ -72,11 +66,8 @@ def _assessment(**overrides) -> NoticeAssessment:
     return NoticeAssessment.model_validate(data)
 
 
-def test_build_profile_text_contains_profile_and_keywords():
-    text = build_profile_text(_config())
-    assert "컴퓨터공학부" in text
-    assert "KU자유전공학부" in text
-    assert "장학" in text
+def test_build_profile_text_without_profile():
+    assert build_profile_text(_config()) == "프로필 정보 없음"
 
 
 def test_build_prompt_is_single_notice_and_marks_attachment_pass(make_article):
@@ -258,49 +249,31 @@ def test_keyword_fallback_is_conservative(make_article):
 def test_keyword_fallback_does_not_turn_application_requirements_into_duty(
     make_article,
 ):
-    config = _config()
-    config["keywords"]["medium"].append("채용")
     article = make_article(
         title="국제대학 행정지원직 채용 공고",
         description="지원서 필수 제출, 졸업예정자 지원 가능",
     )
 
-    assessment = keyword_fallback(article, config)
+    assessment = keyword_fallback(article, _config())
 
     assert assessment.category.value == "career"
-    assert assessment.obligation.value == "optional"
+    assert assessment.obligation.value == "none"
     assert assessment.consequence.value == "missed_opportunity"
     assert assessment.actions == []
     assert "OpenAI" not in " ".join(assessment.uncertainties)
     assert "실패" not in " ".join(assessment.uncertainties)
 
 
-def test_failed_optional_opportunity_analysis_goes_to_digest(make_article):
-    config = _config()
-    config["keywords"]["medium"].append("채용")
+@pytest.mark.parametrize(
+    "title",
+    [
+        "국제대학 행정지원직 채용 공고",
+        "(서울시) 2026 서울영커리언스 챌린지 실무형 직무혁신 성과 팀 공모전 모집",
+    ],
+)
+def test_failed_optional_opportunity_analysis_is_retried_not_escalated(make_article, title):
     article = make_article(
-        title="국제대학 행정지원직 채용 공고",
-        description="지원서 필수 제출",
-    )
-    with patch(
-        "ku_notice_monitor.matcher.analyze_with_openai",
-        new_callable=AsyncMock,
-        return_value={},
-    ):
-        result = asyncio.run(match_articles([article], config))
-
-    assert result.notices[0].delivery == "digest"
-    assert result.notices[0].source == "rules"
-
-
-def test_failed_contest_analysis_does_not_become_required_review(make_article):
-    config = _config()
-    config["keywords"]["medium"].append("공모전")
-    article = make_article(
-        title=(
-            "(서울시) 2026 서울영커리언스 챌린지 실무형 직무혁신 "
-            "성과 팀 공모전 모집"
-        ),
+        title=title,
         board_name="대학일자리플러스",
         description="졸업예정자 지원 가능, 참여 동의 필수",
     )
@@ -309,11 +282,12 @@ def test_failed_contest_analysis_does_not_become_required_review(make_article):
         new_callable=AsyncMock,
         return_value={},
     ):
-        result = asyncio.run(match_articles([article], config))
+        result = asyncio.run(match_articles([article], _config()))
 
-    assert result.notices[0].category == "event"
-    assert result.notices[0].obligation == "optional"
-    assert result.notices[0].delivery == "digest"
+    assert result.notices == []
+    assert result.suppressed[0].source == "rules"
+    assert result.suppressed[0].obligation == "none"
+    assert result.failed_keys == {article.key}
 
 
 def test_failed_high_impact_analysis_still_requires_review(make_article):

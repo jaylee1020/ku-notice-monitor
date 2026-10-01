@@ -1,10 +1,9 @@
 """설정 로딩 및 유효성 검증 모듈.
 
-config.yaml을 읽고 환경변수(PROFILE_TEXT/PROFILE_JSON/KEYWORDS_JSON)로 개인정보를
+config.yaml을 읽고 환경변수 PROFILE_TEXT로 개인정보를
 덮어쓴 뒤 Pydantic 모델 하나로 구조와 범위를 검증한다.
 """
 
-import json
 import logging
 import os
 from pathlib import Path
@@ -31,21 +30,6 @@ CONFIG_PATH = PROJECT_ROOT / "config.yaml"
 class _Section(BaseModel):
     # 오타 난 설정 키가 조용히 무시되지 않게 한다.
     model_config = ConfigDict(extra="forbid")
-
-
-class ProfileConfig(_Section):
-    model_config = ConfigDict(extra="allow")
-    major: str = ""
-    previous_major: str = ""
-    year: int = 0
-    campus: str = ""
-    status: str = ""
-
-
-class KeywordConfig(_Section):
-    model_config = ConfigDict(extra="allow")
-    high: list[str] = Field(default_factory=list)
-    medium: list[str] = Field(default_factory=list)
 
 
 class FeedConfig(_Section):
@@ -139,32 +123,11 @@ class RuntimeConfig(_Section):
 
 class AppConfig(_Section):
     profile_text: str = Field(default="", max_length=12_000)
-    profile: ProfileConfig
-    keywords: KeywordConfig
     feeds: dict[str, FeedConfig]
     ai: AIConfig
     classification: ClassificationConfig
     notifications: NotificationConfig
     settings: RuntimeConfig
-
-
-def _load_json_env(var_name: str, fallback: dict) -> dict:
-    """JSON 환경변수를 안전하게 로드하고, 파싱 실패 시 fallback을 반환한다."""
-    raw = os.environ.get(var_name, "")
-    if not raw:
-        return fallback
-
-    try:
-        value = json.loads(raw)
-    except json.JSONDecodeError as e:
-        logger.warning("%s 파싱 실패: %s. config.yaml 기본값을 사용합니다.", var_name, e)
-        return fallback
-
-    if not isinstance(value, dict):
-        logger.warning("%s는 JSON 객체여야 합니다. config.yaml 기본값을 사용합니다.", var_name)
-        return fallback
-
-    return value
 
 
 def _load_text_env(var_name: str, fallback: str = "") -> str:
@@ -191,10 +154,6 @@ def validate_config(config: dict[str, Any]) -> AppConfig:
 
 def _warn_runtime_environment(config: AppConfig) -> None:
     """구조 오류는 아니지만 운영상 주의가 필요한 항목을 경고 로그로 남긴다."""
-    year = config.profile.year
-    if year and not 1 <= year <= 10:
-        logger.warning("profile.year가 비정상 범위입니다 (1~10 권장): %r", year)
-
     for env_var, message in (
         ("OPENAI_API_KEY", "OPENAI_API_KEY가 설정되지 않았습니다. 키워드 매칭으로 대체됩니다."),
         ("TELEGRAM_BOT_TOKEN", "TELEGRAM_BOT_TOKEN이 설정되지 않았습니다. 알림은 outbox에 보존됩니다."),
@@ -215,8 +174,6 @@ def load_config() -> AppConfig:
         raw = yaml.safe_load(f) or {}
 
     raw["profile_text"] = _load_text_env("PROFILE_TEXT", str(raw.get("profile_text") or ""))
-    raw["profile"] = _load_json_env("PROFILE_JSON", raw.get("profile") or {})
-    raw["keywords"] = _load_json_env("KEYWORDS_JSON", raw.get("keywords") or {})
 
     config = validate_config(raw)
     _warn_runtime_environment(config)

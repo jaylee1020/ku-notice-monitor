@@ -5,14 +5,7 @@ import json
 import logging
 
 from .llm import make_client, openai_configured, parse_structured
-from .profile_models import (
-    FactCertainty,
-    PreferenceKind,
-    ProfileFact,
-    ProfileFactKey,
-    ProfilePreference,
-    ProfileSnapshot,
-)
+from .profile_models import ProfileSnapshot
 from .util import is_grounded, normalize_for_match
 
 logger = logging.getLogger(__name__)
@@ -48,14 +41,7 @@ class ProfileResolutionError(RuntimeError):
 def profile_document_fingerprint(config: dict) -> str:
     """개인정보를 노출하지 않는 프로필 변경 감지 해시."""
     document = str(config.get("profile_text", "")).strip()
-    if document:
-        payload = {"source": "natural_language", "document": document}
-    else:
-        payload = {
-            "source": "legacy",
-            "profile": config.get("profile", {}),
-            "keywords": config.get("keywords", {}),
-        }
+    payload = {"source": "natural_language", "document": document}
     encoded = json.dumps(
         payload,
         ensure_ascii=False,
@@ -87,46 +73,9 @@ def _ground_snapshot(document: str, snapshot: ProfileSnapshot) -> ProfileSnapsho
     return snapshot.model_copy(update={"facts": facts, "preferences": preferences})
 
 
-def legacy_profile_snapshot(config: dict) -> ProfileSnapshot:
-    """기존 PROFILE_JSON/KEYWORDS_JSON을 자연어 프로필 스냅샷으로 변환."""
-    profile = config.get("profile", {})
-    mapping = (
-        ("major", ProfileFactKey.MAJOR),
-        ("previous_major", ProfileFactKey.PREVIOUS_MAJOR),
-        ("year", ProfileFactKey.ACADEMIC_YEAR),
-        ("campus", ProfileFactKey.CAMPUS),
-        ("status", ProfileFactKey.ENROLLMENT_STATUS),
-    )
-    facts = [
-        ProfileFact(
-            key=fact_key,
-            value=str(profile[field]),
-            certainty=FactCertainty.EXPLICIT,
-            source_quote=f"{field}={profile[field]}",
-        )
-        for field, fact_key in mapping
-        if profile.get(field)
-    ]
-    preferences: list[ProfilePreference] = []
-    keywords = config.get("keywords", {})
-    for keyword in keywords.get("high", []):
-        preferences.append(
-            ProfilePreference(
-                kind=PreferenceKind.PRIORITY,
-                statement=str(keyword),
-                source_quote=f"high={keyword}",
-            )
-        )
-    for keyword in keywords.get("medium", []):
-        preferences.append(
-            ProfilePreference(
-                kind=PreferenceKind.PRIORITY,
-                statement=str(keyword),
-                source_quote=f"medium={keyword}",
-            )
-        )
-    summary = "기존 구조화 프로필"
-    return ProfileSnapshot(summary=summary, facts=facts, preferences=preferences)
+def empty_profile_snapshot() -> ProfileSnapshot:
+    """PROFILE_TEXT가 없을 때 쓰는, 개인화 근거가 없는 스냅샷."""
+    return ProfileSnapshot(summary="프로필 없음")
 
 
 async def resolve_profile_snapshot(
@@ -141,18 +90,17 @@ async def resolve_profile_snapshot(
     """
     document = str(config.get("profile_text", "")).strip()
     if not document:
-        snapshot = legacy_profile_snapshot(config)
         if metrics is not None:
             metrics.update(
                 {
-                    "source": "legacy_json",
+                    "source": "none",
                     "prompt_version": None,
-                    "fact_count": len(snapshot.facts),
-                    "preference_count": len(snapshot.preferences),
+                    "fact_count": 0,
+                    "preference_count": 0,
                     "total_tokens": 0,
                 }
             )
-        return snapshot
+        return empty_profile_snapshot()
 
     if not openai_configured():
         raise ProfileResolutionError(

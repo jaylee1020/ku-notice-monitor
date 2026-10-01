@@ -5,33 +5,7 @@ from unittest.mock import patch
 
 import pytest
 
-from ku_notice_monitor.config import AIConfig, _load_json_env, _load_text_env, load_config, validate_config
-
-# --- _load_json_env ---
-
-
-def test_load_json_env_empty():
-    with patch.dict(os.environ, {}, clear=True):
-        result = _load_json_env("TEST_VAR", {"default": True})
-    assert result == {"default": True}
-
-
-def test_load_json_env_valid():
-    with patch.dict(os.environ, {"TEST_VAR": '{"key": "value"}'}):
-        result = _load_json_env("TEST_VAR", {})
-    assert result == {"key": "value"}
-
-
-def test_load_json_env_invalid_json():
-    with patch.dict(os.environ, {"TEST_VAR": "not json"}):
-        result = _load_json_env("TEST_VAR", {"fallback": True})
-    assert result == {"fallback": True}
-
-
-def test_load_json_env_not_dict():
-    with patch.dict(os.environ, {"TEST_VAR": '["list"]'}):
-        result = _load_json_env("TEST_VAR", {"fallback": True})
-    assert result == {"fallback": True}
+from ku_notice_monitor.config import AIConfig, _load_text_env, load_config, validate_config
 
 
 def test_load_text_env_strips_natural_profile():
@@ -45,8 +19,6 @@ def test_load_text_env_strips_natural_profile():
 
 def _make_valid_config():
     return {
-        "profile": {},
-        "keywords": {},
         "feeds": {"테스트": {"id": 234, "enabled": True}},
         "ai": {
             "model": "gpt-6-luna",
@@ -214,8 +186,7 @@ def test_validate_config_invalid_digest_hour():
 
 
 def test_repository_config_yaml_is_valid(monkeypatch):
-    for name in ("PROFILE_TEXT", "PROFILE_JSON", "KEYWORDS_JSON"):
-        monkeypatch.delenv(name, raising=False)
+    monkeypatch.delenv("PROFILE_TEXT", raising=False)
     with patch("ku_notice_monitor.config.load_dotenv"):
         config = load_config()
     assert config.ai.model
@@ -225,11 +196,9 @@ def test_repository_config_yaml_is_valid(monkeypatch):
 
 def test_load_config_applies_environment_profile(monkeypatch):
     monkeypatch.setenv("PROFILE_TEXT", "  나는 서울에 산다.  ")
-    monkeypatch.setenv("KEYWORDS_JSON", '{"high": ["장학"]}')
     with patch("ku_notice_monitor.config.load_dotenv"):
         config = load_config()
     assert config.profile_text == "나는 서울에 산다."
-    assert config.keywords.high == ["장학"]
 
 
 def test_reminder_days_are_sorted_and_validated():

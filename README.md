@@ -126,7 +126,7 @@ uv run --no-sync python scripts/check_feeds.py --scan-konkuk 230-260
 - 이미지와 첨부 분석, 격리 변환된 HWP/HWPX 입력
 - 텍스트 PDF는 `pdf-inspector`로 로컬 Markdown 변환하고 스캔·혼합 PDF는 원본 입력
 - 허용 도메인·공인 IP·리디렉션 검증과 스트리밍 다운로드 상한
-- 키워드 폴백, 부분 실패 복구, 지수 백오프
+- 규칙 폴백, 부분 실패 복구, 지수 백오프
 - 본문 수정 감지, 피드별 상태 검사와 중복 제거
 - AI 토큰·fallback·억제·전송 실패를 포함한 구조화 실행 요약
 - GitHub Actions 매시간 자동 실행. GitHub 예약은 부하로 자주 누락되므로 외부 스케줄러가
@@ -144,8 +144,6 @@ uv run --no-sync python scripts/check_feeds.py --scan-konkuk 230-260
 | `TELEGRAM_BOT_TOKEN` | BotFather에서 발급한 텔레그램 봇 토큰 | 필수 |
 | `TELEGRAM_CHAT_ID` | 알림을 받을 텔레그램 채팅 ID | 필수 |
 | `PROFILE_TEXT` | 자연어로 작성한 사용자 사실·알림 선호 문서 | 권장 |
-| `PROFILE_JSON` | 기존 학생 프로필 JSON(마이그레이션 호환) | 선택 |
-| `KEYWORDS_JSON` | 폴백용 관심 키워드 JSON | 선택 |
 
 `PROFILE_TEXT` 예시:
 
@@ -158,29 +156,7 @@ uv run --no-sync python scripts/check_feeds.py --scan-konkuk 230-260
 
 사용자가 쓴 문서는 실행 중에만 구조화되며 원문과 프로필 스냅샷은
 `monitor-state` 브랜치에 저장하지 않습니다. 내용이 바뀌었는지 확인하는 해시만
-상태에 보관합니다. `PROFILE_TEXT`가 없으면 기존 `PROFILE_JSON`과
-`KEYWORDS_JSON`을 사용합니다.
-
-기존 `PROFILE_JSON` 예시:
-
-```json
-{
-  "major": "컴퓨터공학부",
-  "previous_major": "KU자유전공학부",
-  "year": 2,
-  "campus": "서울",
-  "status": "재학"
-}
-```
-
-`KEYWORDS_JSON` 예시:
-
-```json
-{
-  "high": ["장학", "등록금", "수강신청"],
-  "medium": ["취업", "인턴", "공모전", "해외"]
-}
-```
+상태에 보관합니다. `PROFILE_TEXT`가 없으면 개인화 없이 판정합니다.
 
 ### 매시간 실행 보장
 

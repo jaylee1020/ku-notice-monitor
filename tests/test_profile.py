@@ -9,7 +9,6 @@ import pytest
 from ku_notice_monitor.profile import (
     ProfileResolutionError,
     _ground_snapshot,
-    legacy_profile_snapshot,
     profile_document_fingerprint,
     resolve_profile_snapshot,
 )
@@ -19,28 +18,12 @@ from ku_notice_monitor.profile_models import ProfileSnapshot
 def _config(profile_text=""):
     return {
         "profile_text": profile_text,
-        "profile": {
-            "major": "컴퓨터공학부",
-            "previous_major": "KU자유전공학부",
-            "year": 2,
-            "campus": "서울",
-            "status": "재학",
-        },
-        "keywords": {"high": ["장학"], "medium": ["인턴"]},
         "ai": {
             "model": "gpt-6-luna",
             "reasoning_effort": "medium",
             "request_timeout_seconds": 45,
         },
     }
-
-
-def test_legacy_profile_snapshot_preserves_existing_settings():
-    snapshot = legacy_profile_snapshot(_config())
-    facts = {(fact.key.value, fact.value) for fact in snapshot.facts}
-    assert ("major", "컴퓨터공학부") in facts
-    assert ("campus", "서울") in facts
-    assert any(item.statement == "장학" for item in snapshot.preferences)
 
 
 def test_profile_fingerprint_changes_without_containing_plaintext():
